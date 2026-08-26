@@ -62,8 +62,18 @@ impl AuditEngine {
 
     pub fn evaluate(&self, content: &str, caller_epoch: u64) -> Result<GuardVerdict> {
         self.rules.check_epoch(caller_epoch)?;
-        let hits = self.rules.evaluate(content);
+        let hits = self.rules.evaluate_full(content);
         let mut verdict = verdict_from_hits(&hits, self.rules.epoch());
+
+        let inferred = RuleEngine::infer_category(content);
+        if verdict.inferred_category == "clean" {
+            verdict.inferred_category = inferred.clone();
+        }
+        tracing::debug!(
+            inferred_category = %inferred,
+            rule_category = %verdict.inferred_category,
+            "category inference (H9)"
+        );
 
         if self.redactor.has_sensitive(content) {
             if verdict.action == SafetyAction::Allow {

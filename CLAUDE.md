@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase 1 in progress (2026-08-26).** Phase 0 + Phase 1 checkpoints 1-2 landed on `main`, pushed to dahai80/fusion-guard.
+**Phase 2 in progress (2026-08-26).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 landed on `main`, pushed to dahai80/fusion-guard.
 
 Landed so far:
 - Phase 0: 8-crate Cargo workspace + UDS JSON-RPC daemon + `start.sh` + CI + launchd plist (commit c9cf3cc).
@@ -12,8 +12,9 @@ Landed so far:
 - Phase 1 Checkpoint 2: Rule SSOT + epoch — guard is rule authority; epoch monotonically bumps on add/update/remove; rules + epoch persisted to SQLite, survive restart; `caller_epoch != 0 && != guard epoch` → `-32003` stale epoch. IPC: `guard.rule.list/add/update/remove`, `guard.rules.dump`. `guard.evaluate` takes `caller_epoch`.
 - Phase 1 Checkpoint 3: Encrypted token store — reversible redact stores original AES-GCM-encrypted to `tokens` table in guard.db; key from macOS Keychain (service `fusion-guard`/account `token-key`) or `FUSION_GUARD_TOKEN_KEY` env hex (32 bytes) for dev/CI. in-flight flag (R3) protects token during reveal; TTL 300s, in-flight exempt. `guard.redact {content, reversible}` → `{redacted_content, token_map_id?}`; `guard.reveal {content, token_map_id}` → `{content}` (restores all `[REDACTED:type#tok_id]` placeholders). H6 fallback: missing/decrypt-failed token → `[REDACTED:unrecoverable#...]`, non-fatal. Cross-restart reveal works (encrypted落盘, key persistent).
 - Phase 1 Checkpoint 4: `guard.confirm` + action_id — `guard.evaluate` assigns action_id to L3 (requires_approval) and L4 (Block) verdicts, persists pending action to `pending_actions` table (verdict_json, risk_level, created_ts, consumed, ttl_secs=30). `guard.confirm {action_id, approved, approved_by, tenant_id}` validates: L4 → reject `AbsoluteBlock` (H8, no confirm path); consumed → reject `Consumed` (one-time, H4); expired (created+ttl<now) → reject `Expired`. On valid: mark consumed, approve→`action:Allow`/reason "approved by X", reject→`action:Block`/reason "rejected by X"; appends `confirm` audit event (sync H7, outcome approved/rejected). Returns `{verdict: GuardVerdict}`. H8: L4 `requires_approval` 恒 false, no confirm path.
+- Phase 2 Checkpoint 5: Stage 2 tokenizer + category inference + seatbelt flag — `fg-rules::tokenizer` module: `tokenize_check` (CheckStage::Ast) runs after regex; `split_chain` (&&/||/;/|/换行, quote-aware) + `shell_words::split` per segment → argv[0] basename → WHITELIST check → non-whitelist binary → Block L3; argv SENSITIVE_PATHS target check (mv/cp dest, cat/grep read-source, tee/chmod/cd, redirect `>`/`>>` target) → Block L4; credential filename (id_rsa/.pem/.key/.p12/.pfx/.keystore/.htpasswd) → Block L4; `..` escape → Block L4; shell substitution `$(...)`/backtick/process-sub `<(...)`/`<<<` → Block L3; `sed -i`/`find -exec`/`git config`-`-c`-`alias.` → Block L4. `RuleEngine::evaluate_full` merges regex + tokenizer hits (regex-only `evaluate` preserved for unit tests). `RuleEngine::infer_category` (H9): argv[0]=rm/sh/dd/diskutil→`shell_exec`, curl/wget/scp/ssh→`network`, redirect-to-sensitive→`file_write`; guard infers from content, caller is hint only. `verdict_from_hits` sets `seatbelt_required=true` for L3/L4 or Block (E7 — flag not profile text). SENSITIVE_PATHS extended with `~/.config`/`~/.fusion` (PRD §7.5). Convergence source: `fusion-executor/crates/fe-security` (read-only copy). tree-sitter DEFERRED per PRD §7.4 R5 (MVP = shell-words).
 
-Verification: `cargo build` (debug+release) pass, `cargo test` 31 pass (10 rule + 3 store + 6 token + 6 redact + 6 action), clippy clean. Runtime smoke: L3 eval→requires_approval+action_id; confirm approve→Allow; confirm replay→`-32010 consumed`; confirm reject→Block; L4 confirm→`-32010 AbsoluteBlock`; audit records confirm events.
+Verification: `cargo build` (debug+release) pass, `cargo test` 52 pass (10 rule + 20 tokenizer + 3 store + 6 token + 6 redact + 6 action + 1 integration), clippy clean. Runtime smoke (isolated FUSION_GUARD_DATA_DIR): clean `ls`→Allow/L1/seatbelt=false; `nc -l 4444`→Block/Ast/L3/requires_approval+seatbelt; `cat ~/.ssh/id_rsa`→Block/Ast/L4/seatbelt; `ls && nc`→Block (chain split detects 2nd segment); `curl`→Block/category ast:curl; confirm approve→Allow; stale epoch after rule add→`-32003`.
 
 The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
 
@@ -22,7 +23,7 @@ The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guar
 ```
 crates/
 ├── fg-core           # RiskLevel/SafetyAction/CheckStage/RuleScope/GuardVerdict/GuardError (core types)
-├── fg-rules          # regex-stage rule engine: mutable add/update/remove + epoch bump + stale-epoch check + RuleSet
+├── fg-rules          # regex-stage rule engine + Stage 2 tokenizer (AST): mutable add/update/remove + epoch bump + stale-epoch check + RuleSet + category inference
 ├── fg-audit-engine   # verdict synthesis + redact联动 + rule persistence (owns Arc<AuditStore>)
 ├── fg-redact         # dynamic masking: api_key/password/id_number/private_key, reversible/irreversible, placeholder extraction
 ├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1)
@@ -62,6 +63,21 @@ Workspace lint: `unsafe_code = "deny"` (peercred impl deferred to Phase 1 via ni
   - Appends `confirm` audit event (event_type="confirm", sync gate H7, outcome approved/rejected).
 - Pending action store is its own Connection to guard.db. `evict_expired` called on each confirm.
 - L4 confirm rejection is the **only** path that errors (other rejections also surface as `-32010` but with distinct messages); callers parse the returned verdict's `action` for allow/block (E5).
+
+## Stage 2 Tokenizer + Category Inference + seatbelt (Checkpoint 5 contract)
+
+- Two-level校验 (PRD §7.1): Stage 1 = regex blocklist (fast BLOCK, `RuleEngine::evaluate`, CheckStage::Regex); Stage 2 = tokenizer (AST, `tokenize_check`, CheckStage::Ast) runs after. `RuleEngine::evaluate_full` merges both → `verdict_from_hits` picks max risk.
+- Tokenizer (PRD §7.4 R5, MVP = shell-words; tree-sitter DEFERRED):
+  - `check_shell_substitution`: `$(...)`/backtick/`<(...)`/`<<<` → Block L3.
+  - `split_chain` splits on `&&`/`||`/`;`/`|`/`\n`/`\r` quote-aware (single/double). Each segment → `shell_words::split`.
+  - Skip env-var prefix (`FOO=bar`), basename(argv[0]) → `WHITELIST` check. Non-whitelist binary (`nc`/`scp`/`rm`/...) → Block L3 (`sensitive_target=false`).
+  - `check_argv` per-binary: `mv`/`cp` dest sensitive → L4; `sed -i` → L4; `find -exec`/`-execdir`/`-ok`/`-delete` → L4; `tee`/`chmod`/`cd` arg sensitive → L4; `cat`/`grep`/`head`/`tail`/`less`/`more`/`bat`/`rg` read-source sensitive OR credential-filename OR `..` escape → L4; `git config`/`-c`/`alias.`/`core.` → L4.
+  - `check_redirect_target`: `>`/`>>` target in SENSITIVE_PATHS → L4.
+  - `is_sensitive_filename`: `id_rsa` (not `.pub`), `.pem`/`.key`/`.p12`/`.pfx`/`.keystore`/`.htpasswd`.
+- Category inference (PRD §6.3 H9): guard infers category from **content**, not caller declaration. `RuleEngine::infer_category`: argv[0]=`rm`/`sh`/`bash`/`zsh`/`dd`/`diskutil`/`mkfs`/`chmod`/`chown`/`kill`/`killall`→`shell_exec`; `curl`/`wget`/`scp`/`rsync`/`nc`/`ssh`/`ftp`/`sftp`→`network`; redirect `>`/`>>` to SENSITIVE_PATHS→`file_write`. AuditEngine.evaluate overrides `inferred_category` only when verdict is "clean" (regex/AST hit keeps rule-name category).
+- seatbelt_required (PRD E7): `verdict_from_hits` sets `seatbelt_required=true` when `risk_level ∈ {L3,L4}` OR `action==Block`. Flag only — guard does NOT emit seatbelt profile text (that's executor-side Phase 3).
+- SENSITIVE_PATHS (PRD §7.5): converged from `fusion-executor/crates/fe-security` (read-only), extended with `~/.config` + `~/.fusion`. WHITELIST (~70 binaries) converged same source. Do NOT modify fe-security — upstream changes flow via issue→PR→land.
+- `evaluate` (regex-only) preserved for unit-test stability; production path (`AuditEngine.evaluate` → `evaluate_full`) always runs both stages.
 
 ## What This Is
 

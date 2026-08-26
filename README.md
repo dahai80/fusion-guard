@@ -23,6 +23,10 @@ Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL �
 | guard.confirm + action_id 一次性兑现 (H4 TTL) | ✅ |
 | L4 绝对拦截无 confirm 路径 (H8) | ✅ |
 | confirm 审计 (approved/rejected) | ✅ |
+| Stage 2 tokenizer (shell-words, AST 阶段白名单+敏感路径) | ✅ |
+| category 推断 (H9: argv[0]→shell_exec/network/file_write) | ✅ |
+| seatbelt_required flag (E7: L3+ / Block 标记) | ✅ |
+| SENSITIVE_PATHS/WHITELIST 收敛 (含 ~/.config/~/.fusion) | ✅ |
 
 ## 架构
 
@@ -31,7 +35,7 @@ Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL �
 ```
 crates/
 ├── fg-core           # 核心类型: RiskLevel/SafetyAction/GuardVerdict/GuardError
-├── fg-rules          # 规则引擎: regex 阶段 + epoch + RuleSet
+├── fg-rules          # 规则引擎: regex 阶段 + AST tokenizer 阶段 + epoch + RuleSet + category 推断
 ├── fg-audit-engine   # 审计引擎: 规则评估 + 脱敏联动 + verdict 合成
 ├── fg-redact         # 动态脱敏: api_key/password/id_number/private_key, 可逆/不可逆, placeholder 提取
 ├── fg-tcc            # TCC 状态聚合 (status-only, 不 brokering — H1)
@@ -48,6 +52,35 @@ crates/
 | L2 | Preview/Redact | 含敏感字段内容 |
 | L3 | Gateway 人工确认 | 删除文件、HTTP 请求 |
 | L4 | **Block (绝对,无确认路径 — H8)** | `rm -rf` 递归删除 |
+
+## 两级校验 (Stage 1 Regex + Stage 2 Tokenizer)
+
+```
+content
+  │
+  ▼
+Stage 1 (Regex, fg-rules::evaluate)
+  ├── 命中 blocklist 规则 (rm -rf / curl|sh / sudo / dd / git force-push 等) → 直接 Block (L4)
+  └── 未命中 → 进 Stage 2
+  │
+  ▼
+Stage 2 (Tokenizer, fg-rules::tokenizer::tokenize_check, shell-words MVP)
+  ├── 命令替换 $(...)/反引号 / 进程替换 <(...) → Block (L3)
+  ├── split_chain 按 &&/||/;/|/换行 分段 (尊重单/双引号)
+  ├── shell_words::split 每段 → argv[0] basename → WHITELIST 检查
+  │     └── 非白名单二进制 (nc/scp/rm 等) → Block (L3, sensitive_target=false)
+  ├── argv 敏感路径检查 (mv/cp 目的地 / cat/grep 读源 / tee/chmod/cd 参数 / 重定向目标)
+  │     └── 命中 SENSITIVE_PATHS → Block (L4, sensitive_target=true)
+  ├── 凭据文件名 (id_rsa / .pem / .key / .p12 / .pfx / .keystore / .htpasswd) → Block (L4)
+  ├── .. 路径逃逸 (cat/grep 读源含 .. 组件) → Block (L4)
+  └── sed -i / find -exec / git config/-c/alias → Block (L4)
+```
+
+**Category 推断 (H9)**: guard 从内容推断 category, 非依赖 caller 声明。argv[0]=rm/sh/dd/diskutil→`shell_exec`, curl/wget/scp/ssh→`network`, 重定向到敏感路径→`file_write`。最终级别 = max(推断, 规则命中, hint)。
+
+**seatbelt_required (E7)**: verdict 对 L3/L4 或 Block 标记 `seatbelt_required:true` (flag, 非 profile 文本)。executor 据此决定是否编译 seatbelt profile。
+
+**收敛源**: SENSITIVE_PATHS/WHITELIST/分词逻辑对齐 `fusion-executor/crates/fe-security` (只读收敛, 扩展 `~/.config`/`~/.fusion` per PRD §7.5)。tree-sitter DEFERRED (PRD §7.4 R5 MVP = shell-words only)。
 
 ## IPC 协议
 
@@ -104,7 +137,8 @@ make check    # lint + test
 - **Phase 0** ✅ 工程骨架: workspace + 8 crate + start.sh + CI + launchd
 - **Phase -1** ✅ 门控: fusion-security 决策 A (只收敛重叠能力, SAST 独立保留) — issue #23
 - **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ✅ encrypted token store (redact/reveal), ✅ confirm + action_id (H4/H8)
-- **Phase 2** AST 阶段: tree-sitter (与 executor 同锁), TOCTOU 防护
+- **Phase 2** AST 阶段: ✅ Stage 2 tokenizer (shell-words MVP), ✅ category 推断 (H9), ✅ seatbelt_required (E7), ✅ SENSITIVE_PATHS/WHITELIST 收敛
+- **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
 - **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
 - **Phase 5** Swift tcc-bridge (status query, 独立 CI lane — E1)
 

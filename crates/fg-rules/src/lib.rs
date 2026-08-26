@@ -1,3 +1,5 @@
+pub mod tokenizer;
+
 use fg_core::{CheckStage, GuardVerdict, RiskLevel, RuleScope, SafetyAction};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -136,6 +138,82 @@ impl RuleEngine {
         hits
     }
 
+    pub fn evaluate_full(&self, content: &str) -> Vec<RuleHit> {
+        let mut hits = self.evaluate(content);
+        if let Some(tok) = tokenizer::tokenize_check(content) {
+            let risk = if tok.sensitive_target {
+                RiskLevel::L4
+            } else {
+                RiskLevel::L3
+            };
+            let binary_name = tok.binary.clone();
+            let sensitive = tok.sensitive_target;
+            tracing::info!(
+                binary = %binary_name,
+                sensitive = sensitive,
+                "ast stage token hit"
+            );
+            hits.push(RuleHit {
+                rule: GuardRule {
+                    name: format!("ast:{}", binary_name),
+                    pattern: binary_name.clone(),
+                    stage: CheckStage::Ast,
+                    action: SafetyAction::Block,
+                    risk_level: risk,
+                    reason: tok.reason,
+                    scope: RuleScope::Command,
+                },
+                matched_text: binary_name,
+                stage: CheckStage::Ast,
+            });
+        }
+        hits
+    }
+
+    pub fn infer_category(content: &str) -> String {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return "unknown".to_string();
+        }
+        for seg in tokenizer::split_chain_pub(trimmed) {
+            let words = match shell_words::split(&seg) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            if words.is_empty() {
+                continue;
+            }
+            let mut idx = 0;
+            while idx < words.len()
+                && words[idx].contains('=')
+                && !words[idx].starts_with('=')
+            {
+                idx += 1;
+            }
+            if idx >= words.len() {
+                continue;
+            }
+            let bin = tokenizer::basename_pub(&words[idx]);
+            match bin {
+                "rm" | "sh" | "bash" | "zsh" | "dd" | "diskutil" | "mkfs" | "chmod"
+                | "chown" | "kill" | "killall" => return "shell_exec".to_string(),
+                "curl" | "wget" | "scp" | "rsync" | "nc" | "ssh" | "ftp" | "sftp" => {
+                    return "network".to_string()
+                }
+                _ => {}
+            }
+            for (i, w) in words.iter().enumerate() {
+                if (w == ">" || w == ">>")
+                    && i + 1 < words.len()
+                    && tokenizer::is_sensitive_path(&words[i + 1])
+                {
+                    return "file_write".to_string();
+                }
+            }
+        }
+        "shell_exec".to_string()
+    }
+
     pub fn check_epoch(&self, caller_epoch: u64) -> Result<(), fg_core::GuardError> {
         let g = self.inner.read().expect("rule rwlock poisoned");
         if caller_epoch != 0 && caller_epoch != g.epoch {
@@ -171,19 +249,25 @@ pub fn default_ruleset() -> RuleSet {
 pub fn verdict_from_hits(hits: &[RuleHit], epoch: u64) -> GuardVerdict {
     let top = hits.iter().max_by_key(|h| h.rule.risk_level as u8);
     match top {
-        Some(h) => GuardVerdict {
-            action: h.rule.action,
-            risk_level: h.rule.risk_level,
-            reason: h.rule.reason.clone(),
-            stage: h.stage,
-            requires_approval: matches!(h.rule.risk_level, RiskLevel::L3),
-            redacted_content: None,
-            seatbelt_required: false,
-            action_id: None,
-            verdict_epoch: epoch,
-            verdict_ttl_secs: 30,
-            inferred_category: h.rule.name.clone(),
-        },
+        Some(h) => {
+            let seatbelt = matches!(
+                h.rule.risk_level,
+                RiskLevel::L3 | RiskLevel::L4
+            ) || h.rule.action == SafetyAction::Block;
+            GuardVerdict {
+                action: h.rule.action,
+                risk_level: h.rule.risk_level,
+                reason: h.rule.reason.clone(),
+                stage: h.stage,
+                requires_approval: matches!(h.rule.risk_level, RiskLevel::L3),
+                redacted_content: None,
+                seatbelt_required: seatbelt,
+                action_id: None,
+                verdict_epoch: epoch,
+                verdict_ttl_secs: 30,
+                inferred_category: h.rule.name.clone(),
+            }
+        }
         None => GuardVerdict {
             action: SafetyAction::Allow,
             risk_level: RiskLevel::L1,
