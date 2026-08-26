@@ -23,6 +23,14 @@ pub enum CheckStage {
     Semantic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleScope {
+    Command,
+    Content,
+    Network,
+    Filesystem,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardVerdict {
     pub action: SafetyAction,

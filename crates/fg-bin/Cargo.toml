@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 fg-core.workspace = true
 fg-audit-engine.workspace = true
-fg-rules.workspace = true
 fg-ipc.workspace = true
 fg-store.workspace = true
 tokio.workspace = true

@@ -10,6 +10,7 @@ authors.workspace = true
 fg-core.workspace = true
 fg-rules.workspace = true
 fg-redact.workspace = true
+fg-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

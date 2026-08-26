@@ -1,4 +1,4 @@
-use fg_core::{GuardVerdict, RiskLevel, SafetyAction, CheckStage};
+use fg_core::{CheckStage, GuardVerdict, RiskLevel, SafetyAction};
 use fg_store::AuditStore;
 
 fn verdict(action: SafetyAction, risk: RiskLevel, cat: &str) -> GuardVerdict {
@@ -58,7 +58,11 @@ async fn low_risk_async_batch() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let recs = store.list_events(Some("beta"), 10).unwrap();
-    assert_eq!(recs.len(), 5, "all low-risk events persisted via async batch");
+    assert_eq!(
+        recs.len(),
+        5,
+        "all low-risk events persisted via async batch"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -68,7 +72,9 @@ async fn tenant_isolation() {
     let store = AuditStore::open(&path).unwrap();
     let block = verdict(SafetyAction::Block, RiskLevel::L4, "rm-rf");
     let allow = verdict(SafetyAction::Allow, RiskLevel::L1, "clean");
-    store.append_event("t1", &block, "rm -rf".into(), "r").unwrap();
+    store
+        .append_event("t1", &block, "rm -rf".into(), "r")
+        .unwrap();
     store.append_event("t2", &allow, "ls".into(), "r").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

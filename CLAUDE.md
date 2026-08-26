@@ -4,7 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase 0 landed (2026-08-26).** 8-crate Cargo workspace + UDS JSON-RPC daemon committed to `main` (commit c9cf3cc), pushed to dahai80/fusion-guard. Verification: `cargo build` (debug+release) pass, `./start.sh start` runs UDS server, `guard.ping` roundtrip returns `{pong, version, rules_epoch}`.
+**Phase 1 in progress (2026-08-26).** Phase 0 + Phase 1 checkpoints 1-2 landed on `main`, pushed to dahai80/fusion-guard.
+
+Landed so far:
+- Phase 0: 8-crate Cargo workspace + UDS JSON-RPC daemon + `start.sh` + CI + launchd plist (commit c9cf3cc).
+- Phase 1 Checkpoint 1: SQLite WAL audit store — L3+/Block sync gate (H7, fail-closed), L1-L2 async batch (E4), multi-tenant isolation. Cross-restart durable.
+- Phase 1 Checkpoint 2: Rule SSOT + epoch — guard is rule authority; epoch monotonically bumps on add/update/remove; rules + epoch persisted to SQLite, survive restart; `caller_epoch != 0 && != guard epoch` → `-32003` stale epoch. IPC: `guard.rule.list/add/update/remove`, `guard.rules.dump`. `guard.evaluate` takes `caller_epoch`.
+
+Verification: `cargo build` (debug+release) pass, `cargo test` 13 pass, runtime smoke test (rule add → restart → rule survives → evaluate hits persisted rule), stale-epoch reject confirmed.
 
 The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
 
@@ -12,17 +19,25 @@ The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guar
 
 ```
 crates/
-├── fg-core           # RiskLevel/SafetyAction/GuardVerdict/GuardError (core types)
-├── fg-rules          # regex-stage rule engine + epoch + RuleSet
-├── fg-audit-engine   # verdict synthesis + redact联动
+├── fg-core           # RiskLevel/SafetyAction/CheckStage/RuleScope/GuardVerdict/GuardError (core types)
+├── fg-rules          # regex-stage rule engine: mutable add/update/remove + epoch bump + stale-epoch check + RuleSet
+├── fg-audit-engine   # verdict synthesis + redact联动 + rule persistence (owns Arc<AuditStore>)
 ├── fg-redact         # dynamic masking: api_key/password/id_number/private_key
 ├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1)
-├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit
-├── fg-store          # audit store (Phase 0 in-mem stub; Phase 1 → SQLite WAL)
+├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc/audit
+├── fg-store          # SQLite WAL: audit_events append-only + rules/rule_meta persistence
 └── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
 Workspace lint: `unsafe_code = "deny"` (peercred impl deferred to Phase 1 via nix crate with scoped allow).
+
+## Rule SSOT + Epoch (Checkpoint 2 contract)
+
+- guard holds the authoritative `RuleSet` (epoch + compiled rules). `RuleEngine` is `Arc<RwLock<Inner>>` (cloneable, shared across IPC conns).
+- Epoch starts at 1 (default ruleset) and **monotonically increments** on every `add_rule`/`update_rule`/`remove_rule`. Never resets on restart — persisted to `rule_meta.epoch`.
+- Rules persist to `rules` table (name PK, rule_json). `AuditEngine::new` bootstraps from store if rules exist, else seeds default + saves.
+- Callers pass `caller_epoch` to `guard.evaluate`. Semantics: `0` = unknown (skip check); any other value must equal guard's current epoch or → `GuardError::StaleEpoch` → IPC `-32003`. This forces callers to refetch rules after any change.
+- `guard.rule.list` / `guard.rules.dump` return `{rules, epoch}`. Mutation methods return `{new_epoch}` — callers must store the returned epoch for subsequent calls.
 
 ## What This Is
 

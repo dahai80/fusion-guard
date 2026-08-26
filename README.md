@@ -6,13 +6,16 @@ Fusion local AI OS 的零信任动作授权守护进程 (zero-trust action autho
 
 ## 状态
 
-Phase 0 — 工程骨架已落地。8-crate Cargo workspace + UDS JSON-RPC daemon。
+Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。
 
 | 验收项 | 状态 |
 |--------|------|
 | `cargo build` (debug + release) | ✅ |
 | `./start.sh start` 起 UDS server | ✅ |
 | `guard.ping` roundtrip | ✅ |
+| SQLite WAL 审计 (L3+ 同步 / L1-L2 异步) | ✅ |
+| 规则 SSOT + epoch 持久化 (跨重启) | ✅ |
+| stale epoch 拒绝 (-32003) | ✅ |
 
 ## 架构
 
@@ -46,12 +49,21 @@ UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
 
 方法:
 - `guard.ping` — `{pong, version, rules_epoch}`
-- `guard.evaluate` — `{action, content, caller_epoch?, category_hint?}` → GuardVerdict
+- `guard.evaluate` — `{action, content, caller_epoch?, tenant_id?, requester?}` → GuardVerdict (caller_epoch != 0 且 != guard epoch → `-32003` stale epoch)
+- `guard.rule.list` — `{rules: [GuardRule], epoch}`
+- `guard.rules.dump` — `{rules, epoch}` (同 rule.list)
+- `guard.rule.add` — `{rule: GuardRule}` → `{new_epoch}`
+- `guard.rule.update` — `{name, rule}` → `{new_epoch}`
+- `guard.rule.remove` — `{name}` → `{new_epoch}`
 - `guard.tcc.status` — `{statuses: [TccStatus]}`
-- `guard.audit.list` — `{records: [AuditRecord]}`
-- `guard.confirm` / `guard.redact` / `guard.reveal` / `guard.rule.*` — Phase 1+
+- `guard.audit.list` — `{tenant_id?, limit?}` → `{records: [AuditRecord]}`
+- `guard.confirm` / `guard.redact` / `guard.reveal` — Phase 1 (pending)
 
-错误码: `-32700` parse / `-32600` invalid / `-32601` not found / `-32001` unauthorized / `-32002` rate limit / `-32010` internal (BLOCK = `result.action="block"`, 非错误码 — E5)
+GuardRule 字段: `name, pattern, stage(Regex|Ast|Semantic), action(Allow|Preview|Redact|Block), risk_level(L1-L4), reason, scope(Command|Content|Network|Filesystem)`
+
+规则 SSOT: guard 是规则权威源, epoch 单调递增。caller 持 caller_epoch, 规则变更后 guard 拒绝 stale epoch。规则持久化到 SQLite, 跨重启不丢失。
+
+错误码: `-32700` parse / `-32600` invalid / `-32601` not found / `-32001` unauthorized / `-32002` rate limit / `-32003` stale epoch / `-32010` internal (BLOCK = `result.action="block"`, 非错误码 — E5)
 
 ## 使用
 
@@ -80,9 +92,9 @@ make check    # lint + test
 
 ## 路线图 (PRD §17)
 
-- **Phase 0** ✅ 工程骨架: workspace + 7 crate + start.sh + CI + launchd
-- **Phase -1** ⏳ 门控: fusion-security A/B/C 决策 (去/留/分段)
-- **Phase 1** 规则收敛: SSOT + epoch, SQLite WAL 审计, encrypted token store
+- **Phase 0** ✅ 工程骨架: workspace + 8 crate + start.sh + CI + launchd
+- **Phase -1** ✅ 门控: fusion-security 决策 A (只收敛重叠能力, SAST 独立保留) — issue #23
+- **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ⏳ encrypted token store, ⏳ confirm + action_id
 - **Phase 2** AST 阶段: tree-sitter (与 executor 同锁), TOCTOU 防护
 - **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
 - **Phase 5** Swift tcc-bridge (status query, 独立 CI lane — E1)

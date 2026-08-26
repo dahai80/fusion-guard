@@ -230,6 +230,7 @@ dependencies = [
  "fg-core",
  "fg-redact",
  "fg-rules",
+ "fg-store",
  "serde",
  "serde_json",
  "thiserror",
@@ -246,7 +247,6 @@ dependencies = [
  "fg-audit-engine",
  "fg-core",
  "fg-ipc",
- "fg-rules",
  "fg-store",
  "serde",
  "serde_json",
@@ -314,6 +314,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "fg-core",
+ "fg-rules",
  "rusqlite",
  "serde",
  "serde_json",

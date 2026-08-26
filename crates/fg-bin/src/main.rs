@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand};
 use fg_audit_engine::AuditEngine;
 use fg_ipc::{IpcServer, DEFAULT_SOCK};
-use fg_rules::{RuleEngine, default_ruleset};
 use fg_store::AuditStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "fusion-guard", version, about = "Fusion zero-trust guard daemon")]
+#[command(
+    name = "fusion-guard",
+    version,
+    about = "Fusion zero-trust guard daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -25,8 +29,8 @@ enum Cmd {
 }
 
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
     let log_file = dir.join("fusion-guard.log");
@@ -49,7 +53,9 @@ fn log_dir() -> PathBuf {
     if let Ok(d) = std::env::var("FUSION_GUARD_LOG_DIR") {
         return PathBuf::from(d);
     }
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
     home.join(".fusion-guard").join("logs")
 }
 
@@ -57,7 +63,9 @@ fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("FUSION_GUARD_DATA_DIR") {
         return PathBuf::from(d);
     }
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
     home.join(".fusion-guard")
 }
 
@@ -75,11 +83,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_server(sock: PathBuf) -> anyhow::Result<()> {
     tracing::info!(sock = %sock.display(), "fusion-guard daemon starting");
-    let ruleset = default_ruleset();
-    let engine = RuleEngine::new(ruleset)?;
-    let engine = AuditEngine::new(engine);
     let db_path = data_dir().join("guard.db");
-    let audit = AuditStore::open(&db_path)?;
+    let audit = Arc::new(AuditStore::open(&db_path)?);
+    let engine = AuditEngine::new(audit.clone())?;
     let server = IpcServer::new(engine, audit);
 
     let server_task = tokio::spawn(async move {

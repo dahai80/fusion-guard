@@ -1,5 +1,6 @@
-use fg_core::{CheckStage, GuardVerdict, RiskLevel, SafetyAction};
+use fg_core::{CheckStage, GuardVerdict, RiskLevel, RuleScope, SafetyAction};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardRule {
@@ -9,6 +10,7 @@ pub struct GuardRule {
     pub action: SafetyAction,
     pub risk_level: RiskLevel,
     pub reason: String,
+    pub scope: RuleScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,44 +26,130 @@ pub struct RuleSet {
     pub rules: Vec<GuardRule>,
 }
 
-pub struct RuleEngine {
+struct Inner {
     rules: Vec<GuardRule>,
-    compiled: Vec<regex::Regex>,
+    compiled: Vec<Option<regex::Regex>>,
     epoch: u64,
 }
 
+#[derive(Clone)]
+pub struct RuleEngine {
+    inner: Arc<RwLock<Inner>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuleError {
+    #[error("regex compile failed: {0}")]
+    Regex(#[from] regex::Error),
+    #[error("rule not found: {0}")]
+    NotFound(String),
+    #[error("duplicate rule name: {0}")]
+    Duplicate(String),
+}
+
 impl RuleEngine {
-    pub fn new(ruleset: RuleSet) -> Result<Self, regex::Error> {
+    pub fn new(ruleset: RuleSet) -> Result<Self, RuleError> {
         let mut compiled = Vec::with_capacity(ruleset.rules.len());
         for r in &ruleset.rules {
-            compiled.push(regex::Regex::new(&r.pattern)?);
+            compiled.push(Some(regex::Regex::new(&r.pattern)?));
         }
         Ok(Self {
-            rules: ruleset.rules,
-            compiled,
-            epoch: ruleset.epoch,
+            inner: Arc::new(RwLock::new(Inner {
+                rules: ruleset.rules,
+                compiled,
+                epoch: ruleset.epoch,
+            })),
         })
     }
 
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.inner.read().expect("rule rwlock poisoned").epoch
+    }
+
+    pub fn list(&self) -> RuleSet {
+        let g = self.inner.read().expect("rule rwlock poisoned");
+        RuleSet {
+            epoch: g.epoch,
+            rules: g.rules.clone(),
+        }
+    }
+
+    pub fn add(&self, rule: GuardRule) -> Result<u64, RuleError> {
+        let re = regex::Regex::new(&rule.pattern)?;
+        let mut g = self.inner.write().expect("rule rwlock poisoned");
+        if g.rules.iter().any(|r| r.name == rule.name) {
+            return Err(RuleError::Duplicate(rule.name.clone()));
+        }
+        g.rules.push(rule);
+        g.compiled.push(Some(re));
+        g.epoch += 1;
+        tracing::info!(epoch = g.epoch, "rule added");
+        Ok(g.epoch)
+    }
+
+    pub fn update(&self, name: &str, rule: GuardRule) -> Result<u64, RuleError> {
+        let re = regex::Regex::new(&rule.pattern)?;
+        let mut g = self.inner.write().expect("rule rwlock poisoned");
+        let idx = g
+            .rules
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| RuleError::NotFound(name.to_string()))?;
+        g.rules[idx] = rule;
+        g.compiled[idx] = Some(re);
+        g.epoch += 1;
+        tracing::info!(epoch = g.epoch, name = name, "rule updated");
+        Ok(g.epoch)
+    }
+
+    pub fn remove(&self, name: &str) -> Result<u64, RuleError> {
+        let mut g = self.inner.write().expect("rule rwlock poisoned");
+        let idx = g
+            .rules
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| RuleError::NotFound(name.to_string()))?;
+        g.rules.remove(idx);
+        g.compiled.remove(idx);
+        g.epoch += 1;
+        tracing::info!(epoch = g.epoch, name = name, "rule removed");
+        Ok(g.epoch)
     }
 
     pub fn evaluate(&self, content: &str) -> Vec<RuleHit> {
+        let g = self.inner.read().expect("rule rwlock poisoned");
         let mut hits = Vec::new();
-        for (rule, re) in self.rules.iter().zip(self.compiled.iter()) {
+        for (rule, re) in g.rules.iter().zip(g.compiled.iter()) {
             if rule.stage != CheckStage::Regex {
                 continue;
             }
-            if let Some(m) = re.find(content) {
-                hits.push(RuleHit {
-                    rule: rule.clone(),
-                    matched_text: m.as_str().to_string(),
-                    stage: CheckStage::Regex,
-                });
+            if let Some(re) = re {
+                if let Some(m) = re.find(content) {
+                    hits.push(RuleHit {
+                        rule: rule.clone(),
+                        matched_text: m.as_str().to_string(),
+                        stage: CheckStage::Regex,
+                    });
+                }
             }
         }
         hits
+    }
+
+    pub fn check_epoch(&self, caller_epoch: u64) -> Result<(), fg_core::GuardError> {
+        let g = self.inner.read().expect("rule rwlock poisoned");
+        if caller_epoch != 0 && caller_epoch != g.epoch {
+            tracing::warn!(
+                caller_epoch = caller_epoch,
+                guard_epoch = g.epoch,
+                "stale epoch rejected"
+            );
+            return Err(fg_core::GuardError::StaleEpoch {
+                caller: caller_epoch,
+                guard: g.epoch,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -75,6 +163,7 @@ pub fn default_ruleset() -> RuleSet {
             action: SafetyAction::Block,
             risk_level: RiskLevel::L4,
             reason: "destructive recursive delete".to_string(),
+            scope: RuleScope::Command,
         }],
     }
 }

@@ -1,5 +1,6 @@
 use fg_core::{GuardVerdict, RiskLevel, SafetyAction};
-use rusqlite::{Connection, params};
+use fg_rules::{GuardRule, RuleSet};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -67,7 +68,7 @@ impl AuditStore {
                     break;
                 }
                 let w = writer.clone();
-                let batch: Vec<AuditEvent> = buf.drain(..).collect();
+                let batch: Vec<AuditEvent> = std::mem::take(&mut buf);
                 let res = std::thread::spawn(move || {
                     let g = w.lock().expect("writer mutex poisoned");
                     for ev in &batch {
@@ -134,7 +135,11 @@ impl AuditStore {
         Ok(ev)
     }
 
-    pub fn list_events(&self, tenant_id: Option<&str>, limit: usize) -> Result<Vec<AuditEvent>, rusqlite::Error> {
+    pub fn list_events(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>, rusqlite::Error> {
         let g = self.db.lock().expect("audit mutex poisoned");
         let mut stmt = if tenant_id.is_some() {
             g.prepare(
@@ -151,9 +156,11 @@ impl AuditStore {
             )?
         };
         let rows = if let Some(t) = tenant_id {
-            stmt.query_map(params![t, limit as i64], row_to_event)?.collect::<Result<Vec<_>, _>>()?
+            stmt.query_map(params![t, limit as i64], row_to_event)?
+                .collect::<Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(params![limit as i64], row_to_event)?.collect::<Result<Vec<_>, _>>()?
+            stmt.query_map(params![limit as i64], row_to_event)?
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(rows)
     }
@@ -177,6 +184,73 @@ impl AuditStore {
             }
         }
     }
+
+    pub fn load_rules(&self) -> Result<Option<RuleSet>, rusqlite::Error> {
+        let g = self.db.lock().expect("audit mutex poisoned");
+        let epoch: i64 = g
+            .query_row("SELECT value FROM rule_meta WHERE key='epoch'", [], |r| {
+                r.get(0)
+            })
+            .ok()
+            .unwrap_or(0);
+        let mut stmt = g.prepare("SELECT rule_json FROM rules ORDER BY name ASC")?;
+        let rules: Vec<GuardRule> = stmt
+            .query_map([], |row| {
+                let j: String = row.get(0)?;
+                Ok(serde_json::from_str(&j).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "corrupt rule json skipped");
+                    GuardRule {
+                        name: "__corrupt__".into(),
+                        pattern: "never".into(),
+                        stage: fg_core::CheckStage::Regex,
+                        action: SafetyAction::Allow,
+                        risk_level: RiskLevel::L1,
+                        reason: "corrupt".into(),
+                        scope: fg_core::RuleScope::Command,
+                    }
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|r| r.name != "__corrupt__")
+            .collect();
+        if epoch == 0 {
+            return Ok(None);
+        }
+        tracing::info!(
+            epoch = epoch,
+            count = rules.len(),
+            "rules loaded from store"
+        );
+        Ok(Some(RuleSet {
+            epoch: epoch as u64,
+            rules,
+        }))
+    }
+
+    pub fn save_rule(&self, rule: &GuardRule) -> Result<(), rusqlite::Error> {
+        let g = self.db.lock().expect("audit mutex poisoned");
+        let j = serde_json::to_string(rule).unwrap_or_default();
+        g.execute(
+            "INSERT OR REPLACE INTO rules (name, rule_json) VALUES (?1, ?2)",
+            params![rule.name, j],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_rule(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let g = self.db.lock().expect("audit mutex poisoned");
+        g.execute("DELETE FROM rules WHERE name=?1", params![name])?;
+        Ok(())
+    }
+
+    pub fn save_epoch(&self, epoch: u64) -> Result<(), rusqlite::Error> {
+        let g = self.db.lock().expect("audit mutex poisoned");
+        g.execute(
+            "INSERT OR REPLACE INTO rule_meta (key, value) VALUES ('epoch', ?1)",
+            params![epoch as i64],
+        )?;
+        Ok(())
+    }
 }
 
 const SCHEMA: &str = "
@@ -195,6 +269,15 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id);
+
+CREATE TABLE IF NOT EXISTS rules (
+    name TEXT PRIMARY KEY,
+    rule_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 ";
 
 fn insert_audit_event(conn: &Connection, ev: &AuditEvent) -> rusqlite::Result<()> {
@@ -254,5 +337,5 @@ fn event_to_record(ev: AuditEvent) -> Option<AuditRecord> {
 }
 
 fn io_err(e: rusqlite::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }

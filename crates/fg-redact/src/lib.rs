@@ -9,9 +9,15 @@ impl Redactor {
         Self {
             patterns: vec![
                 ("api_key", Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap()),
-                ("password", Regex::new(r"(?i)password\s*[:=]\s*\S+").unwrap()),
+                (
+                    "password",
+                    Regex::new(r"(?i)password\s*[:=]\s*\S+").unwrap(),
+                ),
                 ("id_number", Regex::new(r"\b\d{15,18}[Xx]?\b").unwrap()),
-                ("private_key", Regex::new(r"-----BEGIN [A-Z ]+PRIVATE KEY-----").unwrap()),
+                (
+                    "private_key",
+                    Regex::new(r"-----BEGIN [A-Z ]+PRIVATE KEY-----").unwrap(),
+                ),
             ],
         }
     }
@@ -19,7 +25,9 @@ impl Redactor {
     pub fn redact(&self, content: &str) -> String {
         let mut out = content.to_string();
         for (name, re) in &self.patterns {
-            out = re.replace_all(&out, format!("[REDACTED:{}]", name)).to_string();
+            out = re
+                .replace_all(&out, format!("[REDACTED:{}]", name))
+                .to_string();
         }
         out
     }

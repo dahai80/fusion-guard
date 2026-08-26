@@ -48,10 +48,10 @@ struct RpcError {
 }
 
 impl IpcServer {
-    pub fn new(engine: AuditEngine, audit: AuditStore) -> Self {
+    pub fn new(engine: AuditEngine, audit: Arc<AuditStore>) -> Self {
         Self {
             engine: Arc::new(engine),
-            audit: Arc::new(audit),
+            audit,
             conn_sem: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             req_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_REQS)),
         }
@@ -85,7 +85,9 @@ impl IpcServer {
     }
 
     async fn handle_conn(self: Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
-        tracing::debug!("peercred check stubbed (unsafe_code=deny; real impl P1 via nix crate allow)");
+        tracing::debug!(
+            "peercred check stubbed (unsafe_code=deny; real impl P1 via nix crate allow)"
+        );
 
         let (rd, mut wr) = stream.into_split();
         let mut reader = BufReader::with_capacity(8 * 1024, rd);
@@ -150,8 +152,16 @@ impl IpcServer {
                 "rules_epoch": self.engine.epoch(),
             })),
             "guard.evaluate" => {
-                let action = req.params.get("action").and_then(Value::as_str).unwrap_or("");
-                let content = req.params.get("content").and_then(Value::as_str).unwrap_or("");
+                let action = req
+                    .params
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = req
+                    .params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let requester = req
                     .params
                     .get("requester")
@@ -164,9 +174,17 @@ impl IpcServer {
                     .and_then(Value::as_str)
                     .unwrap_or(fg_store::DEFAULT_TENANT)
                     .to_string();
-                let verdict = self.engine.evaluate(content);
+                let caller_epoch = req
+                    .params
+                    .get("caller_epoch")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let verdict = self.engine.evaluate(content, caller_epoch)?;
                 let redacted = verdict.redacted_content.clone().unwrap_or_default();
-                if let Err(e) = self.audit.append_event(&tenant_id, &verdict, redacted, &requester) {
+                if let Err(e) = self
+                    .audit
+                    .append_event(&tenant_id, &verdict, redacted, &requester)
+                {
                     tracing::error!(error = %e, "audit append failed (fail-closed for high-risk)");
                 }
                 tracing::info!(
@@ -178,19 +196,72 @@ impl IpcServer {
                 );
                 Ok(serde_json::to_value(&verdict)?)
             }
+            "guard.rule.list" => {
+                let rs = self.engine.list_rules();
+                Ok(serde_json::json!({ "rules": rs.rules, "epoch": rs.epoch }))
+            }
+            "guard.rules.dump" => {
+                let rs = self.engine.list_rules();
+                Ok(serde_json::json!({ "rules": rs.rules, "epoch": rs.epoch }))
+            }
+            "guard.rule.add" => {
+                let rule: fg_rules::GuardRule =
+                    serde_json::from_value(req.params.get("rule").cloned().unwrap_or(Value::Null))?;
+                let new_epoch = self
+                    .engine
+                    .add_rule(rule)
+                    .map_err(|e| GuardError::Engine(e.to_string()))?;
+                tracing::info!(new_epoch = new_epoch, "guard.rule.add handled");
+                Ok(serde_json::json!({ "new_epoch": new_epoch }))
+            }
+            "guard.rule.update" => {
+                let name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
+                let rule: fg_rules::GuardRule =
+                    serde_json::from_value(req.params.get("rule").cloned().unwrap_or(Value::Null))?;
+                let new_epoch = self
+                    .engine
+                    .update_rule(name, rule)
+                    .map_err(|e| GuardError::Engine(e.to_string()))?;
+                tracing::info!(
+                    new_epoch = new_epoch,
+                    name = name,
+                    "guard.rule.update handled"
+                );
+                Ok(serde_json::json!({ "new_epoch": new_epoch }))
+            }
+            "guard.rule.remove" => {
+                let name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
+                let new_epoch = self
+                    .engine
+                    .remove_rule(name)
+                    .map_err(|e| GuardError::Engine(e.to_string()))?;
+                tracing::info!(
+                    new_epoch = new_epoch,
+                    name = name,
+                    "guard.rule.remove handled"
+                );
+                Ok(serde_json::json!({ "new_epoch": new_epoch }))
+            }
             "guard.tcc.status" => {
                 let statuses = fg_tcc::query_status();
                 Ok(serde_json::json!({ "statuses": statuses }))
             }
             "guard.audit.list" => {
-                let limit = req.params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+                let limit = req
+                    .params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50) as usize;
                 let recs = match req.params.get("tenant_id").and_then(Value::as_str) {
                     Some(t) => self.audit.list_by_tenant(t, limit),
                     None => self.audit.list(limit),
                 };
                 Ok(serde_json::json!({ "records": recs }))
             }
-            _ => Err(GuardError::Engine(format!("unknown method: {}", req.method))),
+            _ => Err(GuardError::Engine(format!(
+                "unknown method: {}",
+                req.method
+            ))),
         }
     }
 }
@@ -231,4 +302,3 @@ fn err_resp_bytes(id: Value, code: i32, msg: &str) -> Vec<u8> {
     bytes.push(FRAMING_BYTE);
     bytes
 }
-
