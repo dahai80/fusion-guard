@@ -1,0 +1,24 @@
+[package]
+name = "fg-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+fg-core.workspace = true
+fg-audit-engine.workspace = true
+fg-rules.workspace = true
+fg-store.workspace = true
+fg-tcc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+nix.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

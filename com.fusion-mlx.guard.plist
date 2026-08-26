@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fusion-mlx.guard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GUARD_BIN__</string>
+        <string>start</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FUSION_GUARD_SOCK</key>
+        <string>/tmp/fusion-guard.sock</string>
+        <key>FUSION_GUARD_LOG_DIR</key>
+        <string>__HOME__/.fusion-guard/logs</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.fusion-guard/logs/fusion-guard.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.fusion-guard/logs/fusion-guard.launchd.err</string>
+</dict>
+</plist>

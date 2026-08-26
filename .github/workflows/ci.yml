@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --all-targets
+      - name: test
+        run: cargo test
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: build release
+        run: cargo build --release
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-guard
+          path: target/release/fusion-guard
+
+  swift-bridge:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check tcc-bridge scaffolding
+        run: |
+          echo "Phase 0: Swift tcc-bridge deferred to Phase 5 (E1 scope-narrowed to status query)"
+          echo "Job reserved for independent Swift CI lane per PRD §15"
+          test -f Cargo.toml || { echo "missing Cargo.toml"; exit 1; }
