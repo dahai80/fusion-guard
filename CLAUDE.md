@@ -4,7 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Greenfield.** No source code yet — only `.claude/` settings and `.remember/` runtime. The product contract lives in the monorepo PRD: `/Users/dahai/fusion/architecture/fusion-guard-prd-0826.md`. Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
+**Phase 0 landed (2026-08-26).** 8-crate Cargo workspace + UDS JSON-RPC daemon committed to `main` (commit c9cf3cc), pushed to dahai80/fusion-guard. Verification: `cargo build` (debug+release) pass, `./start.sh start` runs UDS server, `guard.ping` roundtrip returns `{pong, version, rules_epoch}`.
+
+The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
+
+## Crate Layout (landed)
+
+```
+crates/
+├── fg-core           # RiskLevel/SafetyAction/GuardVerdict/GuardError (core types)
+├── fg-rules          # regex-stage rule engine + epoch + RuleSet
+├── fg-audit-engine   # verdict synthesis + redact联动
+├── fg-redact         # dynamic masking: api_key/password/id_number/private_key
+├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1)
+├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit
+├── fg-store          # audit store (Phase 0 in-mem stub; Phase 1 → SQLite WAL)
+└── fg-bin            # fusion-guard binary: start/ping subcommands
+```
+
+Workspace lint: `unsafe_code = "deny"` (peercred impl deferred to Phase 1 via nix crate with scoped allow).
 
 ## What This Is
 
