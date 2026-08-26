@@ -152,10 +152,21 @@ impl IpcServer {
             "guard.evaluate" => {
                 let action = req.params.get("action").and_then(Value::as_str).unwrap_or("");
                 let content = req.params.get("content").and_then(Value::as_str).unwrap_or("");
+                let tenant_id = req
+                    .params
+                    .get("tenant_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fg_store::DEFAULT_TENANT)
+                    .to_string();
                 let verdict = self.engine.evaluate(content);
                 let redacted = verdict.redacted_content.clone().unwrap_or_default();
-                self.audit.append(verdict.clone(), redacted);
-                tracing::info!(action = action, category = %verdict.inferred_category, "guard.evaluate handled");
+                self.audit.append(&tenant_id, verdict.clone(), redacted);
+                tracing::info!(
+                    action = action,
+                    tenant = %tenant_id,
+                    category = %verdict.inferred_category,
+                    "guard.evaluate handled"
+                );
                 Ok(serde_json::to_value(&verdict)?)
             }
             "guard.tcc.status" => {
@@ -164,7 +175,10 @@ impl IpcServer {
             }
             "guard.audit.list" => {
                 let limit = req.params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-                let recs = self.audit.list(limit);
+                let recs = match req.params.get("tenant_id").and_then(Value::as_str) {
+                    Some(t) => self.audit.list_by_tenant(t, limit),
+                    None => self.audit.list(limit),
+                };
                 Ok(serde_json::json!({ "records": recs }))
             }
             _ => Err(GuardError::Engine(format!("unknown method: {}", req.method))),
