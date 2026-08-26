@@ -240,4 +240,28 @@ impl AuditEngine {
         let _ = self.persist(new_epoch);
         Ok(new_epoch)
     }
+
+    pub fn tcc_status(&self) -> Vec<fg_tcc::TccStatus> {
+        fg_tcc::query_status()
+    }
+
+    pub fn report_tcc(
+        &self,
+        permission: &str,
+        requester: &str,
+        result: &str,
+        reason: &str,
+    ) -> Result<uuid::Uuid> {
+        let id = self
+            .store
+            .report_tcc_event(permission, requester, result, reason)
+            .map_err(|e| fg_core::GuardError::Engine(e.to_string()))?;
+        Ok(id)
+    }
+
+    pub fn list_tcc_events(&self, limit: usize) -> Result<Vec<fg_store::TccEventRecord>> {
+        self.store
+            .list_tcc_events(limit)
+            .map_err(|e| fg_core::GuardError::Engine(e.to_string()))
+    }
 }

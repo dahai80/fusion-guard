@@ -1,6 +1,14 @@
 use fg_core::{CheckStage, GuardVerdict, RiskLevel, SafetyAction};
 use fg_store::AuditStore;
 
+const TEST_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn ensure_env_key() {
+    if std::env::var("FUSION_GUARD_TOKEN_KEY").is_err() {
+        std::env::set_var("FUSION_GUARD_TOKEN_KEY", TEST_KEY_HEX);
+    }
+}
+
 fn verdict(action: SafetyAction, risk: RiskLevel, cat: &str) -> GuardVerdict {
     GuardVerdict {
         action,
@@ -18,6 +26,7 @@ fn verdict(action: SafetyAction, risk: RiskLevel, cat: &str) -> GuardVerdict {
 }
 
 fn temp_db() -> std::path::PathBuf {
+    ensure_env_key();
     let dir = std::env::temp_dir().join(format!(
         "fg-store-test-{}-{}",
         std::process::id(),

@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 fg-core.workspace = true
+fg-tcc-bridge.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

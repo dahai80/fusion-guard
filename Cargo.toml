@@ -6,6 +6,7 @@ members = [
     "crates/fg-audit-engine",
     "crates/fg-redact",
     "crates/fg-tcc",
+    "crates/fg-tcc-bridge",
     "crates/fg-ipc",
     "crates/fg-store",
     "crates/fg-bin",
@@ -55,11 +56,13 @@ fg-rules = { path = "crates/fg-rules" }
 fg-audit-engine = { path = "crates/fg-audit-engine" }
 fg-redact = { path = "crates/fg-redact" }
 fg-tcc = { path = "crates/fg-tcc" }
+fg-tcc-bridge = { path = "crates/fg-tcc-bridge" }
 fg-ipc = { path = "crates/fg-ipc" }
 fg-store = { path = "crates/fg-store" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)'] }
 
 [profile.release]
 strip = true

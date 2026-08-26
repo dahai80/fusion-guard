@@ -315,6 +315,7 @@ dependencies = [
  "fg-redact",
  "fg-rules",
  "fg-store",
+ "fg-tcc",
  "serde",
  "serde_json",
  "thiserror",
@@ -358,7 +359,6 @@ dependencies = [
  "fg-core",
  "fg-rules",
  "fg-store",
- "fg-tcc",
  "libc",
  "nix",
  "serde",
@@ -418,11 +418,16 @@ name = "fg-tcc"
 version = "0.1.0"
 dependencies = [
  "fg-core",
+ "fg-tcc-bridge",
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
 ]
+
+[[package]]
+name = "fg-tcc-bridge"
+version = "0.1.0"
 
 [[package]]
 name = "find-msvc-tools"

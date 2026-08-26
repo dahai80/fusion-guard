@@ -307,8 +307,53 @@ impl IpcServer {
                 Ok(serde_json::to_value(&res)?)
             }
             "guard.tcc.status" => {
-                let statuses = fg_tcc::query_status();
+                let statuses = self.engine.tcc_status();
                 Ok(serde_json::json!({ "statuses": statuses }))
+            }
+            "guard.tcc.report" => {
+                let permission = req
+                    .params
+                    .get("permission")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let requester = req
+                    .params
+                    .get("requester")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let result = req
+                    .params
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let reason = req
+                    .params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let audit_id = self
+                    .engine
+                    .report_tcc(&permission, &requester, &result, &reason)?;
+                tracing::info!(
+                    permission = %permission,
+                    requester = %requester,
+                    result = %result,
+                    "guard.tcc.report handled (audit aggregation H1)"
+                );
+                Ok(serde_json::json!({ "audit_id": audit_id }))
+            }
+            "guard.tcc.events" => {
+                let limit = req
+                    .params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50) as usize;
+                let events = self.engine.list_tcc_events(limit)?;
+                Ok(serde_json::json!({ "events": events }))
             }
             "guard.audit.list" => {
                 let limit = req

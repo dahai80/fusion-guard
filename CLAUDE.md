@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase 2 in progress (2026-08-26).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 landed on `main`, pushed to dahai80/fusion-guard.
+**Phase 5 complete (2026-08-27).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 + Phase 5 (TCC audit aggregation + Swift bridge) landed on `main`, pushed to dahai80/fusion-guard. Phases 3/4/6 blocked-on-upstream-PR (E2 — executor/agent-studio/studio integration, issue→PR→land flow). Phase 7 optional.
 
 Landed so far:
 - Phase 0: 8-crate Cargo workspace + UDS JSON-RPC daemon + `start.sh` + CI + launchd plist (commit c9cf3cc).
@@ -13,8 +13,9 @@ Landed so far:
 - Phase 1 Checkpoint 3: Encrypted token store — reversible redact stores original AES-GCM-encrypted to `tokens` table in guard.db; key from macOS Keychain (service `fusion-guard`/account `token-key`) or `FUSION_GUARD_TOKEN_KEY` env hex (32 bytes) for dev/CI. in-flight flag (R3) protects token during reveal; TTL 300s, in-flight exempt. `guard.redact {content, reversible}` → `{redacted_content, token_map_id?}`; `guard.reveal {content, token_map_id}` → `{content}` (restores all `[REDACTED:type#tok_id]` placeholders). H6 fallback: missing/decrypt-failed token → `[REDACTED:unrecoverable#...]`, non-fatal. Cross-restart reveal works (encrypted落盘, key persistent).
 - Phase 1 Checkpoint 4: `guard.confirm` + action_id — `guard.evaluate` assigns action_id to L3 (requires_approval) and L4 (Block) verdicts, persists pending action to `pending_actions` table (verdict_json, risk_level, created_ts, consumed, ttl_secs=30). `guard.confirm {action_id, approved, approved_by, tenant_id}` validates: L4 → reject `AbsoluteBlock` (H8, no confirm path); consumed → reject `Consumed` (one-time, H4); expired (created+ttl<now) → reject `Expired`. On valid: mark consumed, approve→`action:Allow`/reason "approved by X", reject→`action:Block`/reason "rejected by X"; appends `confirm` audit event (sync H7, outcome approved/rejected). Returns `{verdict: GuardVerdict}`. H8: L4 `requires_approval` 恒 false, no confirm path.
 - Phase 2 Checkpoint 5: Stage 2 tokenizer + category inference + seatbelt flag — `fg-rules::tokenizer` module: `tokenize_check` (CheckStage::Ast) runs after regex; `split_chain` (&&/||/;/|/换行, quote-aware) + `shell_words::split` per segment → argv[0] basename → WHITELIST check → non-whitelist binary → Block L3; argv SENSITIVE_PATHS target check (mv/cp dest, cat/grep read-source, tee/chmod/cd, redirect `>`/`>>` target) → Block L4; credential filename (id_rsa/.pem/.key/.p12/.pfx/.keystore/.htpasswd) → Block L4; `..` escape → Block L4; shell substitution `$(...)`/backtick/process-sub `<(...)`/`<<<` → Block L3; `sed -i`/`find -exec`/`git config`-`-c`-`alias.` → Block L4. `RuleEngine::evaluate_full` merges regex + tokenizer hits (regex-only `evaluate` preserved for unit tests). `RuleEngine::infer_category` (H9): argv[0]=rm/sh/dd/diskutil→`shell_exec`, curl/wget/scp/ssh→`network`, redirect-to-sensitive→`file_write`; guard infers from content, caller is hint only. `verdict_from_hits` sets `seatbelt_required=true` for L3/L4 or Block (E7 — flag not profile text). SENSITIVE_PATHS extended with `~/.config`/`~/.fusion` (PRD §7.5). Convergence source: `fusion-executor/crates/fe-security` (read-only copy). tree-sitter DEFERRED per PRD §7.4 R5 (MVP = shell-words).
+- Phase 5: TCC audit aggregation (H1, PRD §9) + Swift bridge — guard does NOT broker TCC (macOS per-app model; each subproject self-requests). guard does two things: (1) `guard.tcc.status` queries 6 services (Accessibility/ScreenRecording/FullDiskAccess/Microphone/Camera/AppleEvents) via Swift bridge `@_cdecl` FFI compiled to static lib (`fg-tcc-bridge`, the workspace's only `unsafe_code = "allow"` crate; `fg-tcc` stays `deny`); Swift unavailable → C stub fallback (`cfg(tcc_bridge_stub)`, build.rs emits via `cargo:rustc-cfg`). `source` field tags `swift-bridge:live` vs `tccutil:stub`. (2) `guard.tcc.report {permission, requester, result, reason}` persists TCC request result to `tcc_events` table (audit aggregation only, not authorization) → `{audit_id}`; `guard.tcc.events {limit?}` queries. fg-store adds `report_tcc_event`/`list_tcc_events` + `TccEventRecord` + `tcc_events` table + indexes. fg-tcc adds `TccService` enum (`as_str`/`parse`), `TccStatus`, `TccEvent`, `query_status`. build.rs uses `std::env::var` (runtime, not `env!` compile-time); links ApplicationServices/CoreGraphics/AVFoundation/Foundation frameworks on live path. **CRITICAL**: tests must set `FUSION_GUARD_TOKEN_KEY` env (hex, 32 bytes) or `AuditStore::open` → `TokenStore::load_or_create_key` → macOS Keychain `SecItemCopyMatching` BLOCKS (hangs 60s+ in non-interactive env). `ensure_env_key()` helper in store_test.rs/tcc_store_test.rs.
 
-Verification: `cargo build` (debug+release) pass, `cargo test` 52 pass (10 rule + 20 tokenizer + 3 store + 6 token + 6 redact + 6 action + 1 integration), clippy clean. Runtime smoke (isolated FUSION_GUARD_DATA_DIR): clean `ls`→Allow/L1/seatbelt=false; `nc -l 4444`→Block/Ast/L3/requires_approval+seatbelt; `cat ~/.ssh/id_rsa`→Block/Ast/L4/seatbelt; `ls && nc`→Block (chain split detects 2nd segment); `curl`→Block/category ast:curl; confirm approve→Allow; stale epoch after rule add→`-32003`.
+Verification: `cargo build` (debug+release) pass, `cargo test` 60 pass (10 rule + 21 tokenizer + 3 store + 2 tcc_store + 6 token + 6 redact + 6 action + 6 tcc), clippy clean (0 warning). Runtime smoke (isolated FUSION_GUARD_DATA_DIR+SOCK+TOKEN_KEY): `guard.tcc.status`→6 services, source `swift-bridge:live`, real authorized states (Camera/AppleEvents=false, rest=true); `guard.tcc.report`→audit_id persisted; `guard.tcc.events`→retrieves by audit_id, all fields intact.
 
 The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
 
@@ -24,15 +25,16 @@ The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guar
 crates/
 ├── fg-core           # RiskLevel/SafetyAction/CheckStage/RuleScope/GuardVerdict/GuardError (core types)
 ├── fg-rules          # regex-stage rule engine + Stage 2 tokenizer (AST): mutable add/update/remove + epoch bump + stale-epoch check + RuleSet + category inference
-├── fg-audit-engine   # verdict synthesis + redact联动 + rule persistence (owns Arc<AuditStore>)
+├── fg-audit-engine   # verdict synthesis + redact联动 + rule persistence + TCC audit aggregation orchestration (owns Arc<AuditStore>)
 ├── fg-redact         # dynamic masking: api_key/password/id_number/private_key, reversible/irreversible, placeholder extraction
-├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1)
-├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc/audit/redact/reveal/confirm
-├── fg-store          # SQLite WAL: audit_events append-only + rules/rule_meta + encrypted token store (AES-GCM) + pending action store (H4)
+├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1) + TccService/TccStatus/TccEvent types
+├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC status queries, compiled to static lib via build.rs, C stub fallback (only crate with unsafe_code=allow)
+├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc.status/tcc.report/tcc.events/audit/redact/reveal/confirm
+├── fg-store          # SQLite WAL: audit_events append-only + rules/rule_meta + encrypted token store (AES-GCM) + pending action store (H4) + tcc_events table
 └── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
-Workspace lint: `unsafe_code = "deny"` (peercred impl deferred to Phase 1 via nix crate with scoped allow).
+Workspace lint: `unsafe_code = "deny"` (fg-tcc-bridge is the sole `allow` — FFI requires it; fg-tcc stays deny). Workspace-level `[workspace.lints.rust] unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)'] }` for the stub cfg.
 
 ## Rule SSOT + Epoch (Checkpoint 2 contract)
 

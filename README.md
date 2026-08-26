@@ -6,7 +6,7 @@ Fusion local AI OS 的零信任动作授权守护进程 (zero-trust action autho
 
 ## 状态
 
-Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。
+Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成。9-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。
 
 | 验收项 | 状态 |
 |--------|------|
@@ -27,20 +27,24 @@ Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL �
 | category 推断 (H9: argv[0]→shell_exec/network/file_write) | ✅ |
 | seatbelt_required flag (E7: L3+ / Block 标记) | ✅ |
 | SENSITIVE_PATHS/WHITELIST 收敛 (含 ~/.config/~/.fusion) | ✅ |
+| TCC 状态聚合 (Swift bridge, status-only — H1) | ✅ |
+| guard.tcc.report (审计聚合持久化) | ✅ |
+| guard.tcc.events (TCC 审计查询) | ✅ |
 
 ## 架构
 
-8-crate Rust workspace (对齐 fusion-executor 布局):
+9-crate Rust workspace (对齐 fusion-executor 布局):
 
 ```
 crates/
 ├── fg-core           # 核心类型: RiskLevel/SafetyAction/GuardVerdict/GuardError
 ├── fg-rules          # 规则引擎: regex 阶段 + AST tokenizer 阶段 + epoch + RuleSet + category 推断
-├── fg-audit-engine   # 审计引擎: 规则评估 + 脱敏联动 + verdict 合成
+├── fg-audit-engine   # 审计引擎: 规则评估 + 脱敏联动 + verdict 合成 + TCC 审计聚合编排
 ├── fg-redact         # 动态脱敏: api_key/password/id_number/private_key, 可逆/不可逆, placeholder 提取
-├── fg-tcc            # TCC 状态聚合 (status-only, 不 brokering — H1)
+├── fg-tcc            # TCC 状态聚合 (status-only, 不 brokering — H1) + 事件类型
+├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC 状态查询, 编译为 static lib, C stub 兜底 (unsafe allow)
 ├── fg-ipc            # UDS JSON-RPC server + 2s timeout + 64 conn + rate limit
-├── fg-store          # SQLite WAL: 审计 append-only + 规则持久化 + 加密 token store (AES-GCM) + pending action store (H4)
+├── fg-store          # SQLite WAL: 审计 append-only + 规则持久化 + 加密 token store (AES-GCM) + pending action store (H4) + tcc_events
 └── fg-bin            # fusion-guard 二进制: start/ping 子命令
 ```
 
@@ -82,6 +86,22 @@ Stage 2 (Tokenizer, fg-rules::tokenizer::tokenize_check, shell-words MVP)
 
 **收敛源**: SENSITIVE_PATHS/WHITELIST/分词逻辑对齐 `fusion-executor/crates/fe-security` (只读收敛, 扩展 `~/.config`/`~/.fusion` per PRD §7.5)。tree-sitter DEFERRED (PRD §7.4 R5 MVP = shell-words only)。
 
+## TCC 审计聚合 (H1, PRD §9)
+
+guard **不 brokering** TCC — macOS per-app 模型, 各子项目自请求权限。guard 只两件事:
+- **状态查询**: `guard.tcc.status` 经 Swift bridge (`@_cdecl` FFI, 编译为 static lib) 查 6 服务 (Accessibility/ScreenRecording/FullDiskAccess/Microphone/Camera/AppleEvents)。Swift 不可用时 C stub 兜底 (`cfg(tcc_bridge_stub)`)。
+- **审计聚合**: `guard.tcc.report` 记录各项目 TCC 请求结果到 `tcc_events` 表, `guard.tcc.events` 查询。`source` 字段标记来源 (`swift-bridge:live` / `tccutil:stub`)。
+
+```
+子项目自请求 TCC (macOS per-app)
+        │  结果上报
+        ▼
+guard.tcc.report → tcc_events 表 (审计聚合, 非授权)
+guard.tcc.status → Swift bridge → 状态 (6 服务)
+```
+
+fg-tcc-bridge 是 workspace 唯一 `unsafe_code = "allow"` crate (FFI 必须); fg-tcc 保持 `deny`。Swift 编译失败自动降级 stub, build.rs emit `cargo:rustc-cfg=tcc_bridge_stub`。
+
 ## IPC 协议
 
 UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
@@ -95,7 +115,9 @@ UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
 - `guard.rule.add` — `{rule: GuardRule}` → `{new_epoch}`
 - `guard.rule.update` — `{name, rule}` → `{new_epoch}`
 - `guard.rule.remove` — `{name}` → `{new_epoch}`
-- `guard.tcc.status` — `{statuses: [TccStatus]}`
+- `guard.tcc.status` — `{statuses: [TccStatus]}` (Swift bridge, source `swift-bridge:live` 或 `tccutil:stub`)
+- `guard.tcc.report` — `{permission, requester, result, reason}` → `{audit_id}` (审计聚合 H1, 各子项目自请求 TCC, guard 只聚合)
+- `guard.tcc.events` — `{limit?}` → `{events: [TccEventRecord]}`
 - `guard.audit.list` — `{tenant_id?, limit?}` → `{records: [AuditRecord]}`
 - `guard.redact` — `{content, reversible:bool}` → `{redacted_content, token_map_id?}` (可逆: token AES-GCM 加密落盘, in-flight 标记 R3; 不可逆: `[REDACTED:type#last4]`)
 - `guard.reveal` — `{content, token_map_id}` → `{content}` (还原; token 丢失回退 `[REDACTED:unrecoverable#...]` H6)
@@ -138,9 +160,9 @@ make check    # lint + test
 - **Phase -1** ✅ 门控: fusion-security 决策 A (只收敛重叠能力, SAST 独立保留) — issue #23
 - **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ✅ encrypted token store (redact/reveal), ✅ confirm + action_id (H4/H8)
 - **Phase 2** AST 阶段: ✅ Stage 2 tokenizer (shell-words MVP), ✅ category 推断 (H9), ✅ seatbelt_required (E7), ✅ SENSITIVE_PATHS/WHITELIST 收敛
-- **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
-- **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
-- **Phase 5** Swift tcc-bridge (status query, 独立 CI lane — E1)
+- **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联 (blocked-on-upstream-PR: executor E2)
+- **Phase 5** ✅ TCC 审计聚合 (H1) + Swift tcc-bridge (status query, C stub 兜底, 独立 CI lane — E1)
+- **Phase 6** agent-studio/studio 集成 (blocked-on-upstream-PR: E2)
 
 ## Monorepo 上下文
 
