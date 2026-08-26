@@ -11,8 +11,9 @@ Landed so far:
 - Phase 1 Checkpoint 1: SQLite WAL audit store — L3+/Block sync gate (H7, fail-closed), L1-L2 async batch (E4), multi-tenant isolation. Cross-restart durable.
 - Phase 1 Checkpoint 2: Rule SSOT + epoch — guard is rule authority; epoch monotonically bumps on add/update/remove; rules + epoch persisted to SQLite, survive restart; `caller_epoch != 0 && != guard epoch` → `-32003` stale epoch. IPC: `guard.rule.list/add/update/remove`, `guard.rules.dump`. `guard.evaluate` takes `caller_epoch`.
 - Phase 1 Checkpoint 3: Encrypted token store — reversible redact stores original AES-GCM-encrypted to `tokens` table in guard.db; key from macOS Keychain (service `fusion-guard`/account `token-key`) or `FUSION_GUARD_TOKEN_KEY` env hex (32 bytes) for dev/CI. in-flight flag (R3) protects token during reveal; TTL 300s, in-flight exempt. `guard.redact {content, reversible}` → `{redacted_content, token_map_id?}`; `guard.reveal {content, token_map_id}` → `{content}` (restores all `[REDACTED:type#tok_id]` placeholders). H6 fallback: missing/decrypt-failed token → `[REDACTED:unrecoverable#...]`, non-fatal. Cross-restart reveal works (encrypted落盘, key persistent).
+- Phase 1 Checkpoint 4: `guard.confirm` + action_id — `guard.evaluate` assigns action_id to L3 (requires_approval) and L4 (Block) verdicts, persists pending action to `pending_actions` table (verdict_json, risk_level, created_ts, consumed, ttl_secs=30). `guard.confirm {action_id, approved, approved_by, tenant_id}` validates: L4 → reject `AbsoluteBlock` (H8, no confirm path); consumed → reject `Consumed` (one-time, H4); expired (created+ttl<now) → reject `Expired`. On valid: mark consumed, approve→`action:Allow`/reason "approved by X", reject→`action:Block`/reason "rejected by X"; appends `confirm` audit event (sync H7, outcome approved/rejected). Returns `{verdict: GuardVerdict}`. H8: L4 `requires_approval` 恒 false, no confirm path.
 
-Verification: `cargo build` (debug+release) pass, `cargo test` 25 pass (10 rule + 3 store + 6 token + 6 redact), clippy clean. Runtime smoke: redact reversible → reveal restores original; cross-restart reveal (stop → start → reveal) restores; H6 fallback on missing token.
+Verification: `cargo build` (debug+release) pass, `cargo test` 31 pass (10 rule + 3 store + 6 token + 6 redact + 6 action), clippy clean. Runtime smoke: L3 eval→requires_approval+action_id; confirm approve→Allow; confirm replay→`-32010 consumed`; confirm reject→Block; L4 confirm→`-32010 AbsoluteBlock`; audit records confirm events.
 
 The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
 
@@ -25,8 +26,8 @@ crates/
 ├── fg-audit-engine   # verdict synthesis + redact联动 + rule persistence (owns Arc<AuditStore>)
 ├── fg-redact         # dynamic masking: api_key/password/id_number/private_key, reversible/irreversible, placeholder extraction
 ├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1)
-├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc/audit/redact/reveal
-├── fg-store          # SQLite WAL: audit_events append-only + rules/rule_meta persistence + encrypted token store (AES-GCM, Keychain/env key)
+├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc/audit/redact/reveal/confirm
+├── fg-store          # SQLite WAL: audit_events append-only + rules/rule_meta + encrypted token store (AES-GCM) + pending action store (H4)
 └── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
@@ -49,6 +50,18 @@ Workspace lint: `unsafe_code = "deny"` (peercred impl deferred to Phase 1 via ni
 - Key: macOS Keychain `get_generic_password("fusion-guard","token-key")` (prod); `FUSION_GUARD_TOKEN_KEY` env (hex, 32 bytes) for dev/CI (skips Keychain prompt). Key auto-generated on first start if absent.
 - Cross-restart: tokens encrypted to guard.db (not memory), survive restart as long as key persists (Keychain/env).
 - Token store is its own Connection to guard.db (avoids lock contention with audit writer).
+
+## Confirm + action_id (Checkpoint 4 contract)
+
+- `guard.evaluate` assigns `action_id` (Uuid v4) to verdicts where `requires_approval || action==Block` (i.e. L3 and L4), and persists the verdict to `pending_actions` table (action_id PK, verdict_json, risk_level, created_ts, consumed=0, ttl_secs=30).
+- `guard.confirm {action_id, approved:bool, approved_by, tenant_id?}` → `{verdict: GuardVerdict}`:
+  - **H8**: L4 verdict → reject `AbsoluteBlock` (L4 = absolute BLOCK, `requires_approval` 恒 false, no confirm path).
+  - **H4 one-time**: already-consumed action_id → reject `Consumed` (no replay).
+  - **H4 TTL**: `created_ts + ttl_secs < now` → reject `Expired` (verdict valid 30s, re-evaluate after).
+  - Valid: mark `consumed=1`, mutate verdict — `approved` → `action:Allow`, reason "approved by X"; `!approved` → `action:Block`, reason "rejected by X"; `requires_approval=false`.
+  - Appends `confirm` audit event (event_type="confirm", sync gate H7, outcome approved/rejected).
+- Pending action store is its own Connection to guard.db. `evict_expired` called on each confirm.
+- L4 confirm rejection is the **only** path that errors (other rejections also surface as `-32010` but with distinct messages); callers parse the returned verdict's `action` for allow/block (E5).
 
 ## What This Is
 

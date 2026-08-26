@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+pub mod action_store;
 pub mod token_store;
+pub use action_store::{ActionError, ActionStore, PendingAction};
 pub use token_store::{TokenError, TokenStore};
 
 pub const DEFAULT_TENANT: &str = "default";
@@ -39,6 +41,7 @@ pub struct AuditStore {
     db: Mutex<Connection>,
     low_queue: mpsc::UnboundedSender<AuditEvent>,
     tokens: Arc<TokenStore>,
+    actions: Arc<ActionStore>,
 }
 
 pub struct StoreError;
@@ -71,6 +74,14 @@ impl AuditStore {
             tracing::error!(error = %e, "token store open failed");
             std::io::Error::other(e.to_string())
         })?;
+        let action_conn = Connection::open(db_path).map_err(io_err)?;
+        action_conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .map_err(io_err)?;
+        let actions = ActionStore::open(action_conn).map_err(|e| {
+            tracing::error!(error = %e, "action store open failed");
+            std::io::Error::other(e.to_string())
+        })?;
         let writer = Arc::new(Mutex::new(writer_conn));
         tokio::spawn(async move {
             let mut buf: Vec<AuditEvent> = Vec::with_capacity(100);
@@ -101,11 +112,47 @@ impl AuditStore {
             db: Mutex::new(conn),
             low_queue: tx,
             tokens: Arc::new(tokens),
+            actions: Arc::new(actions),
         })
     }
 
     pub fn tokens(&self) -> Arc<TokenStore> {
         self.tokens.clone()
+    }
+
+    pub fn actions(&self) -> Arc<ActionStore> {
+        self.actions.clone()
+    }
+
+    pub fn append_confirm_event(
+        &self,
+        tenant_id: &str,
+        verdict: &GuardVerdict,
+        approved_by: &str,
+        outcome: &str,
+    ) -> Result<AuditEvent, rusqlite::Error> {
+        let ev = AuditEvent {
+            audit_id: uuid::Uuid::new_v4(),
+            ts: chrono::Utc::now(),
+            event_type: "confirm".to_string(),
+            tenant_id: tenant_id.to_string(),
+            requester: approved_by.to_string(),
+            action: verdict.reason.clone(),
+            inferred_category: verdict.inferred_category.clone(),
+            verdict_json: serde_json::to_string(verdict).unwrap_or_default(),
+            approved_by: Some(approved_by.to_string()),
+            seatbelt_required: verdict.seatbelt_required,
+            outcome: outcome.to_string(),
+        };
+        let g = self.db.lock().expect("audit mutex poisoned");
+        insert_audit_event(&g, &ev)?;
+        tracing::info!(
+            audit_id = %ev.audit_id,
+            tenant = %ev.tenant_id,
+            outcome = %ev.outcome,
+            "confirm audit event persisted (sync H7)"
+        );
+        Ok(ev)
     }
 
     pub fn append_event(

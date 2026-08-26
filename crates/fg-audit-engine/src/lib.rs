@@ -12,6 +12,11 @@ pub struct RedactResult {
     pub token_map_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmResult {
+    pub verdict: GuardVerdict,
+}
+
 pub struct AuditEngine {
     rules: RuleEngine,
     redactor: Redactor,
@@ -70,6 +75,9 @@ impl AuditEngine {
 
         if verdict.requires_approval || verdict.action == SafetyAction::Block {
             verdict.action_id = Some(Uuid::new_v4());
+            if let Err(e) = self.store.actions().put(&verdict) {
+                tracing::warn!(error = %e, "pending action store put failed");
+            }
         }
 
         tracing::info!(
@@ -141,6 +149,47 @@ impl AuditEngine {
         }
         tracing::info!(recovered = recovered, failed = failed, "guard.reveal done");
         Ok(restored)
+    }
+
+    pub fn confirm(
+        &self,
+        action_id: &str,
+        approved: bool,
+        approved_by: &str,
+        tenant_id: &str,
+    ) -> Result<ConfirmResult> {
+        let _ = self.store.actions().evict_expired();
+        let verdict = self
+            .store
+            .actions()
+            .confirm(action_id, approved, approved_by)
+            .map_err(|e| {
+                tracing::warn!(error = %e, action_id = action_id, "confirm failed");
+                match e {
+                    fg_store::ActionError::AbsoluteBlock(_) => {
+                        fg_core::GuardError::Engine(e.to_string())
+                    }
+                    _ => fg_core::GuardError::Engine(e.to_string()),
+                }
+            })?;
+        let outcome = match verdict.action {
+            SafetyAction::Allow => "approved",
+            SafetyAction::Block => "rejected",
+            _ => "confirmed",
+        };
+        if let Err(e) = self
+            .store
+            .append_confirm_event(tenant_id, &verdict, approved_by, outcome)
+        {
+            tracing::error!(error = %e, "confirm audit append failed");
+        }
+        tracing::info!(
+            action_id = action_id,
+            approved = approved,
+            outcome = outcome,
+            "guard.confirm handled"
+        );
+        Ok(ConfirmResult { verdict })
     }
 
     fn persist(&self, new_epoch: u64) -> Result<()> {

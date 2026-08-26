@@ -277,6 +277,35 @@ impl IpcServer {
                 tracing::info!(token_map_id = %token_map_id, "guard.reveal handled");
                 Ok(serde_json::json!({ "content": restored }))
             }
+            "guard.confirm" => {
+                let action_id = req
+                    .params
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let approved = req
+                    .params
+                    .get("approved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let approved_by = req
+                    .params
+                    .get("approved_by")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let tenant_id = req
+                    .params
+                    .get("tenant_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fg_store::DEFAULT_TENANT)
+                    .to_string();
+                let res = self
+                    .engine
+                    .confirm(&action_id, approved, &approved_by, &tenant_id)?;
+                Ok(serde_json::to_value(&res)?)
+            }
             "guard.tcc.status" => {
                 let statuses = fg_tcc::query_status();
                 Ok(serde_json::json!({ "statuses": statuses }))

@@ -20,6 +20,9 @@ Phase 1 进行中。8-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL �
 | guard.redact / guard.reveal 往返还原 | ✅ |
 | 跨重启 reveal (加密落盘 H6) | ✅ |
 | reveal 容错回退 (H6) | ✅ |
+| guard.confirm + action_id 一次性兑现 (H4 TTL) | ✅ |
+| L4 绝对拦截无 confirm 路径 (H8) | ✅ |
+| confirm 审计 (approved/rejected) | ✅ |
 
 ## 架构
 
@@ -33,7 +36,7 @@ crates/
 ├── fg-redact         # 动态脱敏: api_key/password/id_number/private_key, 可逆/不可逆, placeholder 提取
 ├── fg-tcc            # TCC 状态聚合 (status-only, 不 brokering — H1)
 ├── fg-ipc            # UDS JSON-RPC server + 2s timeout + 64 conn + rate limit
-├── fg-store          # SQLite WAL: 审计 append-only + 规则持久化 + 加密 token store (AES-GCM, Keychain/env 密钥)
+├── fg-store          # SQLite WAL: 审计 append-only + 规则持久化 + 加密 token store (AES-GCM) + pending action store (H4)
 └── fg-bin            # fusion-guard 二进制: start/ping 子命令
 ```
 
@@ -63,7 +66,7 @@ UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
 - `guard.audit.list` — `{tenant_id?, limit?}` → `{records: [AuditRecord]}`
 - `guard.redact` — `{content, reversible:bool}` → `{redacted_content, token_map_id?}` (可逆: token AES-GCM 加密落盘, in-flight 标记 R3; 不可逆: `[REDACTED:type#last4]`)
 - `guard.reveal` — `{content, token_map_id}` → `{content}` (还原; token 丢失回退 `[REDACTED:unrecoverable#...]` H6)
-- `guard.confirm` — Phase 1 (pending)
+- `guard.confirm` — `{action_id, approved:bool, approved_by?, tenant_id?}` → `{verdict: GuardVerdict}` (L3 人机确认; L4 拒绝 H8; action_id 一次性兑现 H4; TTL 30s 过期拒绝; approve→Allow, reject→Block)
 
 GuardRule 字段: `name, pattern, stage(Regex|Ast|Semantic), action(Allow|Preview|Redact|Block), risk_level(L1-L4), reason, scope(Command|Content|Network|Filesystem)`
 
@@ -100,7 +103,7 @@ make check    # lint + test
 
 - **Phase 0** ✅ 工程骨架: workspace + 8 crate + start.sh + CI + launchd
 - **Phase -1** ✅ 门控: fusion-security 决策 A (只收敛重叠能力, SAST 独立保留) — issue #23
-- **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ✅ encrypted token store (redact/reveal), ⏳ confirm + action_id
+- **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ✅ encrypted token store (redact/reveal), ✅ confirm + action_id (H4/H8)
 - **Phase 2** AST 阶段: tree-sitter (与 executor 同锁), TOCTOU 防护
 - **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联
 - **Phase 5** Swift tcc-bridge (status query, 独立 CI lane — E1)
