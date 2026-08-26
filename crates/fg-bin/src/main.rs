@@ -53,6 +53,14 @@ fn log_dir() -> PathBuf {
     home.join(".fusion-guard").join("logs")
 }
 
+fn data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("FUSION_GUARD_DATA_DIR") {
+        return PathBuf::from(d);
+    }
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    home.join(".fusion-guard")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -70,7 +78,8 @@ async fn run_server(sock: PathBuf) -> anyhow::Result<()> {
     let ruleset = default_ruleset();
     let engine = RuleEngine::new(ruleset)?;
     let engine = AuditEngine::new(engine);
-    let audit = AuditStore::new();
+    let db_path = data_dir().join("guard.db");
+    let audit = AuditStore::open(&db_path)?;
     let server = IpcServer::new(engine, audit);
 
     let server_task = tokio::spawn(async move {

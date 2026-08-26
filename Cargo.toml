@@ -44,6 +44,11 @@ shell-words = "1"
 nix = { version = "0.27", features = ["socket"] }
 libc = "0.2"
 
+# 持久化 (§13.2 SQLite WAL) + 加密 token store (§8.2 H6)
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+security-framework = "2"
+
 # 内部 crate
 fg-core = { path = "crates/fg-core" }
 fg-rules = { path = "crates/fg-rules" }

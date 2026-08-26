@@ -14,6 +14,13 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+uuid.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

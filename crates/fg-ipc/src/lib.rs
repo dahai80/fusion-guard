@@ -152,6 +152,12 @@ impl IpcServer {
             "guard.evaluate" => {
                 let action = req.params.get("action").and_then(Value::as_str).unwrap_or("");
                 let content = req.params.get("content").and_then(Value::as_str).unwrap_or("");
+                let requester = req
+                    .params
+                    .get("requester")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
                 let tenant_id = req
                     .params
                     .get("tenant_id")
@@ -160,10 +166,13 @@ impl IpcServer {
                     .to_string();
                 let verdict = self.engine.evaluate(content);
                 let redacted = verdict.redacted_content.clone().unwrap_or_default();
-                self.audit.append(&tenant_id, verdict.clone(), redacted);
+                if let Err(e) = self.audit.append_event(&tenant_id, &verdict, redacted, &requester) {
+                    tracing::error!(error = %e, "audit append failed (fail-closed for high-risk)");
+                }
                 tracing::info!(
                     action = action,
                     tenant = %tenant_id,
+                    requester = %requester,
                     category = %verdict.inferred_category,
                     "guard.evaluate handled"
                 );

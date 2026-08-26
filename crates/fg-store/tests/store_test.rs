@@ -1,0 +1,82 @@
+use fg_core::{GuardVerdict, RiskLevel, SafetyAction, CheckStage};
+use fg_store::AuditStore;
+
+fn verdict(action: SafetyAction, risk: RiskLevel, cat: &str) -> GuardVerdict {
+    GuardVerdict {
+        action,
+        risk_level: risk,
+        reason: "test".into(),
+        stage: CheckStage::Regex,
+        requires_approval: false,
+        redacted_content: None,
+        seatbelt_required: false,
+        action_id: None,
+        verdict_epoch: 1,
+        verdict_ttl_secs: 30,
+        inferred_category: cat.into(),
+    }
+}
+
+fn temp_db() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "fg-store-test-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("guard-test.db")
+}
+
+#[tokio::test]
+async fn high_risk_sync_persist() {
+    let path = temp_db();
+    let store = AuditStore::open(&path).unwrap();
+    let v = verdict(SafetyAction::Block, RiskLevel::L4, "rm-rf");
+    store
+        .append_event("alpha", &v, "rm -rf /x".into(), "tester")
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let recs = store.list_events(Some("alpha"), 10).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].outcome, "blocked");
+    assert_eq!(recs[0].tenant_id, "alpha");
+    assert_eq!(recs[0].requester, "tester");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn low_risk_async_batch() {
+    let path = temp_db();
+    let store = AuditStore::open(&path).unwrap();
+    let v = verdict(SafetyAction::Allow, RiskLevel::L1, "clean");
+    for i in 0..5 {
+        store
+            .append_event("beta", &v, format!("ls {}", i), "tester")
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let recs = store.list_events(Some("beta"), 10).unwrap();
+    assert_eq!(recs.len(), 5, "all low-risk events persisted via async batch");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn tenant_isolation() {
+    let path = temp_db();
+    let store = AuditStore::open(&path).unwrap();
+    let block = verdict(SafetyAction::Block, RiskLevel::L4, "rm-rf");
+    let allow = verdict(SafetyAction::Allow, RiskLevel::L1, "clean");
+    store.append_event("t1", &block, "rm -rf".into(), "r").unwrap();
+    store.append_event("t2", &allow, "ls".into(), "r").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let t1 = store.list_events(Some("t1"), 10).unwrap();
+    let t2 = store.list_events(Some("t2"), 10).unwrap();
+    let all = store.list_events(None, 10).unwrap();
+    assert_eq!(t1.len(), 1);
+    assert_eq!(t2.len(), 1);
+    assert_eq!(all.len(), 2);
+    std::fs::remove_file(&path).ok();
+}
