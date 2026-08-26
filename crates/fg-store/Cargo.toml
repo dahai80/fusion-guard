@@ -17,6 +17,9 @@ chrono.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
+aes-gcm.workspace = true
+security-framework.workspace = true
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

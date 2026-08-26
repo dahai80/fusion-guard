@@ -2,8 +2,15 @@ use fg_core::{GuardVerdict, Result, RiskLevel, SafetyAction};
 use fg_redact::Redactor;
 use fg_rules::{default_ruleset, verdict_from_hits, GuardRule, RuleEngine, RuleError, RuleSet};
 use fg_store::AuditStore;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactResult {
+    pub redacted_content: String,
+    pub token_map_id: Option<String>,
+}
 
 pub struct AuditEngine {
     rules: RuleEngine,
@@ -77,6 +84,63 @@ impl AuditEngine {
 
     pub fn list_rules(&self) -> RuleSet {
         self.rules.list()
+    }
+
+    pub fn redact(&self, content: &str, reversible: bool) -> Result<RedactResult> {
+        let _ = self.store.tokens().evict_expired();
+        if reversible {
+            let (redacted, matches) = self.redactor.redact_reversible(content);
+            let tokens = self.store.tokens();
+            for m in &matches {
+                if let Err(e) = tokens.put(&m.token_id, &m.original) {
+                    tracing::warn!(error = %e, token_id = %m.token_id, "token store put failed");
+                }
+            }
+            tracing::info!(
+                redacted_len = redacted.len(),
+                token_count = matches.len(),
+                "guard.redact reversible"
+            );
+            Ok(RedactResult {
+                redacted_content: redacted,
+                token_map_id: matches.first().map(|m| m.token_id.clone()),
+            })
+        } else {
+            let redacted = self.redactor.redact_irreversible(content);
+            tracing::info!(redacted_len = redacted.len(), "guard.redact irreversible");
+            Ok(RedactResult {
+                redacted_content: redacted,
+                token_map_id: None,
+            })
+        }
+    }
+
+    pub fn reveal(&self, content: &str, _token_map_id: &str) -> Result<String> {
+        let tokens = self.store.tokens();
+        let placeholders = self.redactor.extract_placeholders(content);
+        let mut restored = content.to_string();
+        let mut recovered = 0usize;
+        let mut failed = 0usize;
+        for (kind, token_id) in &placeholders {
+            let _ = tokens.set_in_flight(token_id, true);
+            match tokens.get(token_id) {
+                Ok(original) => {
+                    let ph = format!("[REDACTED:{}#{}]", kind, token_id);
+                    restored = restored.replace(&ph, &original);
+                    recovered += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, token_id = token_id, "token reveal failed (H6 fallback)");
+                    let ph = format!("[REDACTED:{}#{}]", kind, token_id);
+                    let fb = format!("[REDACTED:unrecoverable#{}]", &token_id[..8]);
+                    restored = restored.replace(&ph, &fb);
+                    failed += 1;
+                }
+            }
+            let _ = tokens.set_in_flight(token_id, false);
+        }
+        tracing::info!(recovered = recovered, failed = failed, "guard.reveal done");
+        Ok(restored)
     }
 
     fn persist(&self, new_epoch: u64) -> Result<()> {

@@ -6,6 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+pub mod token_store;
+pub use token_store::{TokenError, TokenStore};
+
 pub const DEFAULT_TENANT: &str = "default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,7 @@ pub struct AuditEvent {
 pub struct AuditStore {
     db: Mutex<Connection>,
     low_queue: mpsc::UnboundedSender<AuditEvent>,
+    tokens: Arc<TokenStore>,
 }
 
 pub struct StoreError;
@@ -59,6 +63,14 @@ impl AuditStore {
         writer_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(io_err)?;
+        let token_conn = Connection::open(db_path).map_err(io_err)?;
+        token_conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .map_err(io_err)?;
+        let tokens = TokenStore::open(token_conn).map_err(|e| {
+            tracing::error!(error = %e, "token store open failed");
+            std::io::Error::other(e.to_string())
+        })?;
         let writer = Arc::new(Mutex::new(writer_conn));
         tokio::spawn(async move {
             let mut buf: Vec<AuditEvent> = Vec::with_capacity(100);
@@ -88,7 +100,12 @@ impl AuditStore {
         Ok(Self {
             db: Mutex::new(conn),
             low_queue: tx,
+            tokens: Arc::new(tokens),
         })
+    }
+
+    pub fn tokens(&self) -> Arc<TokenStore> {
+        self.tokens.clone()
     }
 
     pub fn append_event(

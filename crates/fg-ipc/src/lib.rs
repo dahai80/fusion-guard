@@ -242,6 +242,41 @@ impl IpcServer {
                 );
                 Ok(serde_json::json!({ "new_epoch": new_epoch }))
             }
+            "guard.redact" => {
+                let content = req
+                    .params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let reversible = req
+                    .params
+                    .get("reversible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let res = self.engine.redact(content, reversible)?;
+                tracing::info!(
+                    reversible = reversible,
+                    token_map_id = ?res.token_map_id,
+                    "guard.redact handled"
+                );
+                Ok(serde_json::to_value(&res)?)
+            }
+            "guard.reveal" => {
+                let content = req
+                    .params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let token_map_id = req
+                    .params
+                    .get("token_map_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let restored = self.engine.reveal(content, &token_map_id)?;
+                tracing::info!(token_map_id = %token_map_id, "guard.reveal handled");
+                Ok(serde_json::json!({ "content": restored }))
+            }
             "guard.tcc.status" => {
                 let statuses = fg_tcc::query_status();
                 Ok(serde_json::json!({ "statuses": statuses }))
