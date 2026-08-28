@@ -1,6 +1,6 @@
 [project]
 name = "fusion-guard"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fusion-Guard — zero-trust action authorization + DLP firewall daemon"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }

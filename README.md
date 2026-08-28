@@ -6,7 +6,7 @@ Fusion local AI OS 的零信任动作授权守护进程 (zero-trust action autho
 
 ## 状态
 
-Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审计链式 hash + PyO3 + Endpoint Security + tree-sitter 语义阶段) 完成。13-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。当前版本 **v0.1.1** (patch: fusion-event `guard.audit` 契约 + PII 脱敏扩展 + Python wheel 打包)。
+Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审计链式 hash + PyO3 + Endpoint Security + tree-sitter 语义阶段) 完成。14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。当前版本 **v0.1.2** (minor: 跨节点集群消费方 fg-cluster + guard.cluster.* 3 原语, issue #4 闭合)。
 
 | 验收项 | 状态 |
 |--------|------|
@@ -41,10 +41,12 @@ Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审�
 | guard.audit_result (challenge 回调回执) | ✅ |
 | PII 脱敏扩展 (email/ipv4/银行卡, issue #2) | ✅ |
 | Python wheel 打包 (maturin pyproject.toml, issue #5) | ✅ |
+| 跨节点集群消费方 fg-cluster (HKDF 域分离 3 MAC key + federated 链验证, issue #4 / multi-nodes#52) | ✅ |
+| guard.cluster.audit.fetch / epoch.sync / confirm.relay / confirm.list (4 IPC) | ✅ |
 
 ## 架构
 
-13-crate Rust workspace (对齐 fusion-executor 布局):
+14-crate Rust workspace (对齐 fusion-executor 布局):
 
 ```
 crates/
@@ -59,8 +61,20 @@ crates/
 ├── fg-ipc            # UDS JSON-RPC server + 2s timeout + 64 conn + rate limit
 ├── fg-store          # SQLite WAL: 审计 append-only (链式 hash) + 规则持久化 + 加密 token store (AES-GCM) + pending action store (H4) + tcc_events
 ├── fg-pyo3           # PyO3 绑定: UDS JSON-RPC 客户端暴露 Python (NativeGuardClient), maturin 目标, 对齐 fe-pyo3 (cdylib+rlib)
+├── fg-cluster        # 跨节点消费方 (issue #4 / multi-nodes#52): HKDF 域分离 3 MAC key + federated 链验证 (MAC+prev_hash 双重篡改检出) + reqwest::blocking HTTP 客户端 (5s, Bearer, fail-closed); per-host 非 broker
 └── fg-bin            # fusion-guard 二进制: start/ping 子命令
 ```
+
+## 跨节点集群消费方 (issue #4 / multi-nodes#52, PRD §4.1/§8.2)
+
+fusion-multi-node 定义 TRANSPORT + IDENTITY + KEY SCHEME (PR #54 MERGED); fusion-guard 实现**消费方** (per-host, 非 broker)。100% 本地/LAN, 无云。
+
+- **密钥方案** (`fg-cluster::key`): HKDF-SHA256 从 `cluster_token` (env `FUSION_GUARD_CLUSTER_TOKEN`) 域分离派生 3 个 MAC 密钥, info label `b"fusion-multinode-{audit-chain,rule-epoch,confirm-relay}-v1"` (KEY_LEN=32, salt=None)。`canonical_json` (排序键 + compact + `ensure_ascii=False`) 保 MAC 输入确定性。`mac_payload` (HMAC-SHA256→hex), `verify_mac` (常量时间, 空→false)。
+- **原语 1 — federated 审计链验证** (`fg-cluster::verify`): 每记录带 `seq` / `prev_hash` (= 含 mac 的完整前序记录 sha256) / `mac` (= HMAC over 记录减 mac)。双重篡改检出: 字段翻转→MAC 不匹配 + 下条 prev_hash 断链。降级记录 (缺链字段) → 基线跳过。`verify_chain_segment` → `{total_records, verified_links, broken_links, baseline_records, tampered, first_broken_at}`。
+- **原语 2 — 集群规则纪元 reconcile**: `guard.cluster.epoch.sync` — local>cluster→推进集群纪元对齐 (leader-only, 非 leader 409 best-effort); local<cluster→`local_behind`; equal→`in_sync`。Checkpoint 2 SSOT 扩展集群域。
+- **原语 3 — confirm 中继聚合**: `guard.cluster.confirm.relay` 构 MAC 中继到 master; `guard.cluster.confirm.list` 查聚合。
+- **IPC**: `guard.cluster.audit.fetch {since_seq}` / `epoch.sync` / `confirm.relay` / `confirm.list`。无 `FUSION_GUARD_CLUSTER_TOKEN` (单节点) → `-32011` cluster-not-configured, 非静默。
+- **HTTP 客户端**: `reqwest::blocking` (handle_method 跑 spawn_blocking 独立线程, 非 tokio worker, 阻塞 IO 安全), 5s 超时, Bearer `cluster_token` 鉴权, 非 2xx fail-closed。
 
 ## Stage 3 语义阶段 (tree-sitter, PRD §7.4 R5)
 

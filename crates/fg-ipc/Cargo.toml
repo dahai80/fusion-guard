@@ -13,6 +13,7 @@ fg-rules.workspace = true
 fg-store.workspace = true
 fg-tcc.workspace = true
 fg-peercred.workspace = true
+fg-cluster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

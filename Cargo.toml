@@ -13,11 +13,12 @@ members = [
     "crates/fg-ipc",
     "crates/fg-store",
     "crates/fg-pyo3",
+    "crates/fg-cluster",
     "crates/fg-bin",
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -93,6 +94,7 @@ fg-peercred = { path = "crates/fg-peercred" }
 fg-ipc = { path = "crates/fg-ipc" }
 fg-store = { path = "crates/fg-store" }
 fg-pyo3 = { path = "crates/fg-pyo3" }
+fg-cluster = { path = "crates/fg-cluster" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

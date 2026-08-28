@@ -1,4 +1,5 @@
 use fg_audit_engine::AuditEngine;
+use fg_cluster::{derive_audit_chain_key, verify_chain_segment, ClusterClient, ClusterConfig};
 use fg_core::{GuardError, Result, RiskLevel, SafetyAction};
 use fg_peercred::{our_uid, peer_uid};
 use fg_store::AuditStore;
@@ -829,10 +830,130 @@ impl IpcServer {
                 tracing::info!(count = events.len(), "guard.es.events handled (P0-7)");
                 Ok(serde_json::json!({ "events": events }))
             }
+            // issue #4 / multi-nodes#52 — 跨节点消费方 3 原语 (guard.cluster.*)。
+            // 多节点定义 TRANSPORT+KEY SCHEME, guard 消费: federated 链验证 / epoch reconcile / confirm 中继。
+            // 无 cluster_token (单节点模式) → -32011 cluster-not-configured, 非静默。
+            "guard.cluster.audit.fetch" => {
+                let cfg = cluster_cfg_or_err()?;
+                let client = ClusterClient::new(cfg)
+                    .map_err(|e| GuardError::Engine(format!("cluster client: {e}")))?;
+                let since_seq = u_param(&req.params, "since_seq", 0).unwrap_or(0);
+                let chain_resp = client
+                    .fetch_audit_chain(since_seq)
+                    .map_err(|e| GuardError::Engine(format!("cluster audit fetch: {e}")))?;
+                // federated 链验证 — MAC + prev_hash 双重篡改检出。
+                let chain_key = derive_audit_chain_key(&client.cfg_ref().cluster_token);
+                let verify =
+                    verify_chain_segment(&chain_resp.node_id, &chain_resp.records, &chain_key);
+                tracing::info!(
+                    node_id = %chain_resp.node_id,
+                    total = verify.total_records,
+                    verified = verify.verified_links,
+                    broken = verify.broken_links,
+                    tampered = verify.tampered,
+                    "guard.cluster.audit.fetch handled (issue #4 federated chain verify)"
+                );
+                Ok(serde_json::json!({
+                    "node_id": chain_resp.node_id,
+                    "fetched_at": chain_resp.fetched_at,
+                    "records": chain_resp.records,
+                    "verify": verify,
+                }))
+            }
+            "guard.cluster.epoch.sync" => {
+                let cfg = cluster_cfg_or_err()?;
+                let client = ClusterClient::new(cfg)
+                    .map_err(|e| GuardError::Engine(format!("cluster client: {e}")))?;
+                let cluster_epoch = client
+                    .get_rule_epoch()
+                    .map_err(|e| GuardError::Engine(format!("cluster epoch get: {e}")))?;
+                let local_epoch = self.engine.epoch();
+                // reconcile: local < cluster → 本地落后 (caller 须 refetch rules, stale);
+                //             local > cluster → 推进集群纪元对齐 (leader-only, 非 leader 409 可接受);
+                //             equal → 一致。
+                let mut advanced_to: Option<u64> = None;
+                let mut action = "in_sync".to_string();
+                if local_epoch > cluster_epoch.epoch {
+                    match client.advance_rule_epoch("guard local epoch ahead") {
+                        Ok(r) => {
+                            advanced_to = Some(r.epoch);
+                            action = "advanced_cluster".to_string();
+                        }
+                        Err(e) => {
+                            // 非 leader 409 或网络错 — 记 warn, 不阻断 (best-effort 对齐)。
+                            tracing::warn!(error = %e, "cluster epoch advance failed (非 leader 或网络), best-effort 跳过");
+                            action = "advance_failed".to_string();
+                        }
+                    }
+                } else if local_epoch < cluster_epoch.epoch {
+                    action = "local_behind".to_string();
+                }
+                tracing::info!(
+                    local_epoch, cluster_epoch = cluster_epoch.epoch,
+                    action = %action, advanced_to = ?advanced_to,
+                    "guard.cluster.epoch.sync handled (issue #4 cluster epoch reconcile, Checkpoint 2 SSOT 扩展集群域)"
+                );
+                Ok(serde_json::json!({
+                    "local_epoch": local_epoch,
+                    "cluster_epoch": cluster_epoch.epoch,
+                    "advanced_at": cluster_epoch.advanced_at,
+                    "action": action,
+                    "advanced_to": advanced_to,
+                }))
+            }
+            "guard.cluster.confirm.relay" => {
+                let cfg = cluster_cfg_or_err()?;
+                let client = ClusterClient::new(cfg)
+                    .map_err(|e| GuardError::Engine(format!("cluster client: {e}")))?;
+                let confirm_id = s_param(&req.params, "confirm_id", 0)
+                    .ok_or(GuardError::InvalidParams)?
+                    .to_string();
+                let node_id = s_param(&req.params, "node_id", 1)
+                    .ok_or(GuardError::InvalidParams)?
+                    .to_string();
+                let action = s_param(&req.params, "action", 2)
+                    .ok_or(GuardError::InvalidParams)?
+                    .to_string();
+                let epoch = u_param(&req.params, "epoch", 3).ok_or(GuardError::InvalidParams)?;
+                let ts = s_param(&req.params, "ts", 4)
+                    .ok_or(GuardError::InvalidParams)?
+                    .to_string();
+                let result = client
+                    .relay_confirm(&confirm_id, &node_id, &action, epoch, &ts)
+                    .map_err(|e| GuardError::Engine(format!("cluster confirm relay: {e}")))?;
+                tracing::info!(
+                    confirm_id = %confirm_id, node_id = %node_id,
+                    status = %result.status,
+                    "guard.cluster.confirm.relay handled (issue #4 cross-node confirm 中继, MAC 鉴集群成员)"
+                );
+                Ok(serde_json::to_value(&result)?)
+            }
+            "guard.cluster.confirm.list" => {
+                let cfg = cluster_cfg_or_err()?;
+                let client = ClusterClient::new(cfg)
+                    .map_err(|e| GuardError::Engine(format!("cluster client: {e}")))?;
+                let epoch = u_param(&req.params, "epoch", 0);
+                let resp = client
+                    .list_confirms(epoch)
+                    .map_err(|e| GuardError::Engine(format!("cluster confirm list: {e}")))?;
+                tracing::info!(
+                    count = resp.count,
+                    epoch_filter = ?epoch,
+                    "guard.cluster.confirm.list handled (issue #4 confirm 聚合查询)"
+                );
+                Ok(serde_json::to_value(&resp)?)
+            }
             // M2/P1: 未知方法 → -32601 (MethodNotFound), 不泄露方法名 (Display 通用)。
             _ => Err(GuardError::MethodNotFound),
         }
     }
+}
+
+// issue #4 / multi-nodes#52 — 从 env 构 cluster 配置。无 cluster_token (单节点模式) → -32011,
+// 非静默: 调用方据此知未配置跨节点消费, 不误以为已 federated。
+fn cluster_cfg_or_err() -> Result<ClusterConfig> {
+    ClusterConfig::from_env()
+        .ok_or_else(|| GuardError::Engine("cluster not configured: FUSION_GUARD_CLUSTER_TOKEN env 未设 (单节点模式, 跨节点原语不可用)".into()))
 }
 
 // L8/P1: JSON-RPC params 既可对象 (named) 也可数组 (positional)。

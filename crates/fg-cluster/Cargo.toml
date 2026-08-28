@@ -1,0 +1,28 @@
+[package]
+name = "fg-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "fusion-guard cluster consumer — cross-node transport primitives (audit chain verify / rule-epoch reconcile / confirm relay), issue #4 / multi-nodes#52"
+
+[dependencies]
+fg-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+
+[lints.rust]
+unsafe_code = "deny"
