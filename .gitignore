@@ -6,10 +6,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-# Issue #5: maturin 构建产物 (wheel) 不入库
+# Issue #5: maturin 构建产物 (wheel + 编译扩展模块) 不入库
 *.whl
 dist/
 build/
+python/fusion_guard/_native.*.so
+python/fusion_guard/*.so
 
 # IDE
 .vscode/
