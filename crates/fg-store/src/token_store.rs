@@ -48,6 +48,19 @@ pub enum TokenError {
 
 impl TokenStore {
     pub fn open(conn: Connection) -> Result<Self, TokenError> {
+        // H-E (product-audit §5): allow_mint = token.db 是否全新 (无 token 行 + key_versions
+        // 仅种子 v1)。非全新 (已有加密 token) 而 Keychain 主密钥丢失 → 拒启动明确报错,
+        // 非静默生成新主密钥致全量历史 token 不可恢复 + 历史校验失效。
+        let allow_mint = token_db_is_virgin(&conn);
+        Self::open_checked(conn, allow_mint)
+    }
+
+    // H-E: AuditStore.open 调此 —— allow_mint 由审计行存在性传入 (audit.db 有行 = 历史已用主密钥,
+    // 丢失不可静默重生成)。再叠加 token.db 自身存在性: 两库任一非全新 → allow_mint=false。
+    // token.db 全新但 audit.db 有行 (写入审计但尚无可逆脱敏 token) 也须拒绝; 反之亦然。
+    pub(crate) fn open_checked(conn: Connection, allow_mint: bool) -> Result<Self, TokenError> {
+        // H-E: token.db 自身非全新 → 强制 allow_mint=false (审计侧传入的 true 仅在 token 侧也全新时生效)。
+        let allow_mint = allow_mint && token_db_is_virgin(&conn);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tokens (
                 token_id TEXT PRIMARY KEY,
@@ -77,7 +90,7 @@ impl TokenStore {
             "ALTER TABLE tokens ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1",
             [],
         );
-        let key = load_or_create_key()?;
+        let key = load_or_create_key(allow_mint)?;
         let current_version = max_key_version(&conn);
         Ok(Self {
             db: Mutex::new(conn),
@@ -324,7 +337,10 @@ fn allow_env_flag_set() -> bool {
         .unwrap_or(false)
 }
 
-fn load_or_create_key() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
+// H-E (product-audit §5): allow_mint=false 时, Keychain 主密钥缺失 → 拒启动明确报错,
+// 非静默生成新主密钥。allow_mint=true 仅首次启动 (DB 全新) 允许生成 + 存 Keychain。
+// env key 路径不受 allow_mint 影响 —— env 显式提供即视为运维知晓密钥 (dev/CI 姿态)。
+fn load_or_create_key(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
     let env_present = std::env::var("FUSION_GUARD_TOKEN_KEY").is_ok();
     match resolve_key_source(cfg!(debug_assertions), allow_env_flag_set(), env_present) {
         KeySource::EnvDebug => {
@@ -345,7 +361,50 @@ fn load_or_create_key() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
             );
             Ok(key)
         }
-        KeySource::KeychainRequired => load_keychain_or_err(),
+        KeySource::KeychainRequired => load_keychain_or_err(allow_mint),
+    }
+}
+
+// H-E: token.db 是否全新 (无 token 行 + key_versions 仅种子 v1)。全新 → 允许首次生成主密钥;
+// 非全新 (已有加密 token) → Keychain 缺密钥 = 密钥丢失, 拒静默重生成。
+fn token_db_is_virgin(conn: &Connection) -> bool {
+    let token_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0))
+        .unwrap_or(0);
+    if token_count > 0 {
+        return false;
+    }
+    // key_versions 仅种子 (1,0) = 从未轮换 = 全新。有 v2+ 或 created_ts>0 → 历史用过密钥。
+    let kv_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_versions WHERE version > 1 OR created_ts > 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    kv_count == 0
+}
+
+// H-E test-helpers: 暴露 virgin 检测 + allow_mint 决策供单元测试验证密钥丢失门控逻辑。
+#[cfg(feature = "test-helpers")]
+pub fn test_token_db_is_virgin(conn: &Connection) -> bool {
+    token_db_is_virgin(conn)
+}
+
+// H-E test-helpers: 模拟 Keychain 缺密钥时 allow_mint=false 的拒绝决策 (不触真实 Keychain)。
+// 返回 Err 表示会拒启动, Ok 表示会静默生成。env 路径不受 allow_mint 影响 (env 显式提供即放行)。
+// env_present 显式传入 (非读 env) —— 避免测试修改进程级 env 干扰并行测试 (store_test/token_test
+// 依赖 FUSION_GUARD_TOKEN_KEY 防 Keychain 挂起)。
+#[cfg(feature = "test-helpers")]
+pub fn test_key_loss_refuses(allow_mint: bool, env_present: bool) -> Result<(), &'static str> {
+    if env_present {
+        return Ok(()); // env 路径绕过 allow_mint (dev/CI 姿态)
+    }
+    // KeychainRequired 路径: allow_mint=false → 拒; true → 生成 (首次启动)。
+    if allow_mint {
+        Ok(())
+    } else {
+        Err("master key lost: Keychain missing but data exists — refusing to remint (H-E)")
     }
 }
 
@@ -364,7 +423,7 @@ fn decode_env_key() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
 }
 
 #[cfg(target_os = "macos")]
-fn load_keychain_or_err() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
+fn load_keychain_or_err(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
     if let Some(k) = keychain_get()? {
         if k.len() == KEY_LEN {
             tracing::info!("guard token key loaded from Keychain");
@@ -374,19 +433,36 @@ fn load_keychain_or_err() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
         }
         return Err(TokenError::KeyInit("keychain key not 32 bytes".to_string()));
     }
+    // H-E (product-audit §5): Keychain 主密钥缺失。allow_mint=false (DB 已有历史数据) = 密钥丢失,
+    // 拒启动明确报错 —— 非静默生成新主密钥 (新 key 解密全历史 token 失败 + verify 全链报篡改,
+    // 且无法区分真篡改 vs 密钥丢失)。allow_mint=true (DB 全新首次启动) → 生成 + 存 Keychain。
+    if !allow_mint {
+        tracing::error!(
+            "H-E: Keychain master key missing but data exists — refusing to start \
+             (silent remint would invalidate all historical token decryption + audit chain verification). \
+             Restore the Keychain key (service=fusion-guard, account=token-key) or provide FUSION_GUARD_TOKEN_KEY env."
+        );
+        return Err(TokenError::KeyInit(
+            "master key lost: Keychain key missing but historical data exists — refusing to remint \
+             (restore Keychain key fusion-guard/token-key or set FUSION_GUARD_TOKEN_KEY)"
+                .to_string(),
+        ));
+    }
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut *key);
     keychain_store(&key[..]).map_err(|e| {
         tracing::error!(error = %e, "keychain store failed — refusing to start (no ephemeral key)");
         TokenError::Keychain(format!("store failed: {e}"))
     })?;
-    tracing::info!("guard token key generated + stored to Keychain");
+    tracing::info!("guard token key generated + stored to Keychain (first start)");
     Ok(key)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn load_keychain_or_err() -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
+fn load_keychain_or_err(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
     // P2-1: 非 macOS 无 Keychain, env key 未放行 → 拒启动 (fail-closed, 不回退弱密钥)。
+    // H-E: allow_mint 此分支无关 (非 macOS 无 Keychain 路径, 永不可 mint)。
+    let _ = allow_mint;
     Err(TokenError::KeyInit(
         "non-macOS requires FUSION_GUARD_TOKEN_KEY env (debug build, or FUSION_GUARD_ALLOW_ENV_KEY=1, or --insecure-env-key)"
             .to_string(),

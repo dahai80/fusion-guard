@@ -64,5 +64,16 @@ required-features = ["test-helpers"]
 name = "p21_env_key_gating_test"
 required-features = ["test-helpers"]
 
+# H-D: confirm 跨库事务崩溃恢复级一次性 (restart-replay) + H-A: 审计链并发混合风险单写者。
+# 复用已有 action_test.rs / chain_test.rs (不需 test-helpers, 仅调公开 API)。
+[[test]]
+name = "hd_confirm_restart_replay_test"
+required-features = ["test-helpers"]
+
+# H-E: 主密钥丢失检测 (token_db_is_virgin) + allow_mint 拒绝决策门控 (不触真实 Keychain)。
+[[test]]
+name = "he_key_loss_test"
+required-features = ["test-helpers"]
+
 [lints]
 workspace = true

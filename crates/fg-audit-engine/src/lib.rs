@@ -36,6 +36,12 @@ pub struct AuditEngine {
     rules: RuleEngine,
     redactor: Redactor,
     store: Arc<AuditStore>,
+    // P1-5 (audit §P1-5): 规则突变编排层互斥锁。
+    // add/update/remove 三步 (落盘 rule → 内存 add → 落盘 epoch) 非原子, 并发 add_rule 两线程
+    // 各读 epoch=N 各写 N+1 → 丢一次 bump, epoch 单调但与规则不一致。内存 RuleEngine 内部
+    // RwLock 只护读写集, 不护跨三步编排时序。此 Mutex 序列化三步编排, 保 epoch 严格单调 +
+    // 与规则一致。evaluate 仅取 RuleEngine 读锁, 不持此 Mutex → 拦截路径不被突变阻塞。
+    rule_orch_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl AuditEngine {
@@ -74,6 +80,7 @@ impl AuditEngine {
             rules: engine,
             redactor,
             store,
+            rule_orch_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -380,7 +387,12 @@ impl AuditEngine {
     // L1/P0-G4: disk 先 commit, 内存后 commit; 任一持久化失败 → 回滚内存 + 返错 (fail-closed)。
     // 顺序: save_rule(disk) → engine.add(memory, 编译 regex 验证) → save_epoch(disk)。
     // engine.add 失败 (regex/重复) → delete_rule 回滚已写 disk。save_epoch 失败 → 回滚内存 + disk。
+    // P1-5: 全程持 rule_orch_lock 序列化三步编排, 防并发 add_rule 丢 epoch bump。
     pub fn add_rule(&self, rule: GuardRule) -> std::result::Result<u64, RuleError> {
+        let _orch = self
+            .rule_orch_lock
+            .lock()
+            .map_err(|_| RuleError::NotFound("rule orchestration lock poisoned".into()))?;
         self.store
             .save_rule(&rule)
             .map_err(|e| {
@@ -406,6 +418,11 @@ impl AuditEngine {
     }
 
     pub fn update_rule(&self, name: &str, rule: GuardRule) -> std::result::Result<u64, RuleError> {
+        // P1-5: 持 rule_orch_lock 序列化三步编排 (与 add/remove 互斥), 保 epoch 一致。
+        let _orch = self
+            .rule_orch_lock
+            .lock()
+            .map_err(|_| RuleError::NotFound("rule orchestration lock poisoned".into()))?;
         self.store
             .save_rule(&rule)
             .map_err(|e| {
@@ -440,6 +457,11 @@ impl AuditEngine {
     }
 
     pub fn remove_rule(&self, name: &str) -> std::result::Result<u64, RuleError> {
+        // P1-5: 持 rule_orch_lock 序列化三步编排 (与 add/update 互斥), 保 epoch 一致。
+        let _orch = self
+            .rule_orch_lock
+            .lock()
+            .map_err(|_| RuleError::NotFound("rule orchestration lock poisoned".into()))?;
         self.store
             .delete_rule(name)
             .map_err(|e| {

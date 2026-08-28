@@ -21,18 +21,35 @@ start() {
         echo "[${GUARD_NAME}] binary missing, build first: cargo build --release" >&2
         return 1
     fi
+    # P2-2 (audit §P2-2): 主动清 stale socket。上次崩溃残留 socket 文件会致新进程 bind 报
+    # "address already in use"。守护进程 serve() 内虽 remove_file, 但 start.sh 侧先清更稳,
+    # 且 stop() 已清 —— 此处补 start 路径 (崩溃后重启无 stale socket 阻塞)。
+    if [ -S "${GUARD_SOCK}" ] && [ ! -f "${GUARD_PID}" ]; then
+        echo "[${GUARD_NAME}] clearing stale socket ${GUARD_SOCK} (no pid file)"
+        rm -f "${GUARD_SOCK}"
+    fi
     export FUSION_GUARD_SOCK="${GUARD_SOCK}"
     export FUSION_GUARD_LOG_DIR="${GUARD_DIR}/logs"
+    local guard_args=(start)
+    # P2-2 (audit §P2-2): 生产用 Keychain 免 env 传递主密钥。dev keyfile 是 escape hatch ——
+    # 仅当显式存在 ${GUARD_DIR}/token-key 时, 读入 env + 传 --insecure-env-key flag 放行
+    # (release 默认 Keychain, env key 需 flag 否则 KeychainRequired 拒启动)。
+    # 无 keyfile → 不导 env, 不传 flag → 走 macOS Keychain (prod 路径, 密钥不入环境变量)。
     if [ -z "${FUSION_GUARD_TOKEN_KEY:-}" ]; then
         local keyfile="${GUARD_DIR}/token-key"
         if [ -r "${keyfile}" ]; then
+            echo "[${GUARD_NAME}] WARNING: dev keyfile ${keyfile} in use — passing --insecure-env-key (P2-2: prod use Keychain)" >&2
             export FUSION_GUARD_TOKEN_KEY="$(cat "${keyfile}")"
+            guard_args+=(--insecure-env-key)
         else
-            echo "[${GUARD_NAME}] WARNING: token-key file missing at ${keyfile}, Keychain prompt may appear" >&2
-            echo "  fix: echo <64-hex-chars> > ${keyfile} && chmod 600 ${keyfile}" >&2
+            echo "[${GUARD_NAME}] no dev keyfile — prod Keychain path (P2-2)" >&2
         fi
+    else
+        # env 已由 operator 显式设 → 同样需 flag 放行 release gate。
+        echo "[${GUARD_NAME}] WARNING: FUSION_GUARD_TOKEN_KEY from env — passing --insecure-env-key (P2-2: prod use Keychain)" >&2
+        guard_args+=(--insecure-env-key)
     fi
-    nohup "${GUARD_BIN}" start >"${GUARD_LOG}" 2>&1 &
+    nohup "${GUARD_BIN}" "${guard_args[@]}" >"${GUARD_LOG}" 2>&1 &
     local pid=$!
     echo "${pid}" > "${GUARD_PID}"
     sleep 0.5

@@ -109,11 +109,18 @@ impl ActionStore {
         key_version: i64,
     ) -> Result<GuardVerdict, ActionError> {
         // P0-6: 单 audit_writer 锁全程 (pending_actions + audit_events 同连接可见, P1-7 经 ATTACH)。
-        let w = recover_lock!(
+        let mut w = recover_lock!(
             audit_writer.lock(),
             "audit writer (confirm single-lock P0-6)"
         );
-        let row = w
+        // H-D (product-audit §5): 跨库事务。原实现 SELECT+INSERT+UPDATE 各在 autocommit 独立提交,
+        // 崩溃窗口 (audit INSERT 已提交, UPDATE consumed 未提交) → 重启后 action_id 仍 consumed=0 →
+        // 可再次 confirm = 双确认重放, 违反 H4 一次性。BEGIN IMMEDIATE 跨 ATTACH 库 (audit_writer
+        // ATTACH action.db 为 `action` schema) 给跨库原子: 三步同事务, commit 全成或全回滚, 崩溃恢复
+        // 级 H4 原子达成。BEGIN IMMEDIATE 立即取 audit.db 写锁 + action.db 协调锁 (ATTACH 下多库事务
+        // 各库锁顺序一致, 无死锁)。事务内 SELECT 见已持写锁, 他连接不可插队改 consumed。
+        let tx = w.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = tx
             .query_row(
                 "SELECT verdict_json, risk_level, created_ts, consumed, ttl_secs, tenant_id
                  FROM action.pending_actions WHERE action_id = ?1",
@@ -207,17 +214,20 @@ impl ActionStore {
             prev_hash: String::new(),
             event_hash: String::new(),
         };
-        if let Err(e) = crate::insert_audit_event(&w, &ev, chain_key, key_version) {
+        if let Err(e) = crate::insert_audit_event_tx(&tx, &ev, chain_key, key_version) {
             tracing::error!(error = %e, action_id = action_id, "confirm audit insert failed — refusing consume (L2 fail-closed)");
             return Err(ActionError::AuditFailed(e.to_string()));
         }
 
-        // 审计落库成功 → 标 consumed (一次性)。同一 audit_writer 锁内, 无并发重消费窗口。
+        // 审计落库成功 → 标 consumed (一次性)。H-D: 与 audit INSERT 同一 BEGIN IMMEDIATE 事务,
+        // commit 原子 —— 崩溃在 INSERT 后 UPDATE 前, 事务未 commit 回滚, consumed 仍 0 但 audit
+        // 行也回滚 (无审计的消费) → 无双确认重放窗口。commit 全成 = 审计+consumed 同落。
         // P1-7: pending_actions 在 action.db (audit_writer ATTACH 为 `action` schema)。
-        w.execute(
+        tx.execute(
             "UPDATE action.pending_actions SET consumed = 1 WHERE action_id = ?1",
             params![action_id],
         )?;
+        tx.commit()?;
         drop(w);
 
         tracing::info!(
@@ -225,7 +235,7 @@ impl ActionStore {
             approved = approved,
             approved_by = approved_by,
             tenant = caller_tenant,
-            "action confirmed (single-lock: audit-then-consume, one-time, P0-6)"
+            "action confirmed (single-lock + cross-db tx: audit-then-consume atomic, one-time, P0-6 H-D)"
         );
         Ok(verdict)
     }

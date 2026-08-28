@@ -3,7 +3,7 @@ use fg_core::CheckStage;
 use fg_core::{GuardVerdict, RiskLevel, SafetyAction};
 use fg_rules::{GuardRule, RuleSet};
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::os::unix::fs::PermissionsExt;
@@ -320,11 +320,17 @@ impl AuditStore {
         let action_db_path = db_path.with_file_name("action.db");
 
         let conn = Connection::open(&audit_db_path).map_err(io_err)?;
+        // P1-4 (product-audit §3): db 连接 (规则/tcc/tenant_bindings/checkpoint 写) 补 busy_timeout=5000。
+        // 原 db 无 busy_timeout (默认 0 = 立即 SQLITE_BUSY), 与 audit_writer/low_writer 共享 audit.db
+        // 同一 WAL。高负载下 audit 写持 WAL 写锁时, save_rule/save_epoch/report_tcc_event/bind_tenant
+        // 立即收 SQLITE_BUSY 无重试 → 规则/tcc 写间歇性失败, 影响 SSOT 一致性 (与 §2 epoch 竞态叠加)。
+        // 其余四写连接 (audit_writer/low_writer/token_conn/action_conn) 已设 5000, 此处补齐 db。
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA wal_autocheckpoint=1000;
-             PRAGMA secure_delete=ON;",
+             PRAGMA secure_delete=ON;
+             PRAGMA busy_timeout=5000;",
         )
         .map_err(io_err)?;
         conn.execute_batch(SCHEMA).map_err(io_err)?;
@@ -367,7 +373,21 @@ impl AuditStore {
         token_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;")
             .map_err(io_err)?;
-        let tokens = TokenStore::open(token_conn).map_err(|e| {
+        // H-E (product-audit §5): allow_mint 由审计行存在性决定。audit.db 已有 audit_events 行 =
+        // 历史已用主密钥签名链, Keychain 缺密钥 = 密钥丢失 → 拒静默重生成 (否则 verify 全链报篡改
+        // 且无法区分真假)。全新库 (无审计行 + token.db 全新) → allow_mint=true 首次生成。
+        // 用 `conn` (audit.db, 已 migrate) 查 audit_events 行数; TokenStore::open_checked 再叠加
+        // token.db 自身存在性 (两库任一非全新 → allow_mint=false)。这里传 audit 行存在性作下限。
+        let audit_has_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit_events LIMIT 1)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false);
+        let allow_mint = !audit_has_rows;
+        let tokens = TokenStore::open_checked(token_conn, allow_mint).map_err(|e| {
             tracing::error!(error = %e, "token store open failed");
             std::io::Error::other(e.to_string())
         })?;
@@ -417,11 +437,11 @@ impl AuditStore {
                 // A2: 内联跑 batch (非每批 spawn 线程)。原 spawn-per-batch 零并发 + panic 吞整 batch
                 // (审计事件从防篡改日志消失, 无重试无持久)。内联 panic 毒化本 drain 线程 →
                 // 守护进程重启 fail-closed 可见, 非 silent drop。
-                let g = recover_lock!(writer_for_thread.lock(), "audit writer");
+                let mut g = recover_lock!(writer_for_thread.lock(), "audit writer");
                 // P1-2: 读当前 key version (轮换后即时新版本, 非闭包过期快照)。
                 let kv = kv_for_thread.load(std::sync::atomic::Ordering::Relaxed);
                 for ev in &batch {
-                    if let Err(e) = insert_audit_event(&g, ev, &key_for_thread, kv) {
+                    if let Err(e) = insert_audit_event(&mut g, ev, &key_for_thread, kv) {
                         tracing::warn!(error = %e, audit_id = %ev.audit_id, "async audit insert failed");
                         // A2: 插入失败持久到死信文件, 非虚空 (审计道不容静默丢)。
                         spool_dead_letter(
@@ -514,8 +534,7 @@ impl AuditStore {
         ts: chrono::DateTime<chrono::Utc>,
         raw: &str,
     ) -> Result<AuditEvent, rusqlite::Error> {
-        let g = self.audit_writer.lock();
-        let g = recover_lock!(g, "audit writer (test-helpers)");
+        let mut g = recover_lock!(self.audit_writer.lock(), "audit writer (test-helpers)");
         let ev = AuditEvent {
             audit_id: uuid::Uuid::new_v4(),
             ts,
@@ -534,7 +553,7 @@ impl AuditStore {
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
-        insert_audit_event(&g, &ev, &self.chain_key, kv)?;
+        insert_audit_event(&mut g, &ev, &self.chain_key, kv)?;
         Ok(ev)
     }
 
@@ -583,12 +602,11 @@ impl AuditStore {
             prev_hash: String::new(),
             event_hash: String::new(),
         };
-        let g = self.audit_writer.lock();
-        let g = recover_lock!(g, "audit writer (test-helpers P1-6)");
+        let mut g = recover_lock!(self.audit_writer.lock(), "audit writer (test-helpers P1-6)");
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
-        insert_audit_event(&g, &ev, &self.chain_key, kv)?;
+        insert_audit_event(&mut g, &ev, &self.chain_key, kv)?;
         Ok(ev)
     }
 
@@ -617,12 +635,11 @@ impl AuditStore {
             prev_hash: String::new(),
             event_hash: String::new(),
         };
-        let g = self.audit_writer.lock();
-        let g = recover_lock!(g, "audit writer");
+        let mut g = recover_lock!(self.audit_writer.lock(), "audit writer");
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
-        insert_audit_event(&g, &ev, &self.chain_key, kv)?;
+        insert_audit_event(&mut g, &ev, &self.chain_key, kv)?;
         tracing::info!(
             audit_id = %ev.audit_id,
             tenant = %ev.tenant_id,
@@ -663,12 +680,11 @@ impl AuditStore {
         };
 
         if high_risk {
-            let g = self.audit_writer.lock();
-            let g = recover_lock!(g, "audit writer");
+            let mut g = recover_lock!(self.audit_writer.lock(), "audit writer");
             let kv = self
                 .current_key_version
                 .load(std::sync::atomic::Ordering::Relaxed);
-            insert_audit_event(&g, &ev, &self.chain_key, kv)?;
+            insert_audit_event(&mut g, &ev, &self.chain_key, kv)?;
             tracing::info!(
                 audit_id = %ev.audit_id,
                 tenant = %ev.tenant_id,
@@ -1036,7 +1052,9 @@ impl AuditStore {
         }
 
         // 删行: 单事务, audit_writer (synchronous=FULL) 断电不丢 H7。
-        // A3/soak: 仅此 mutate 段锁 audit_writer (检查+选行已用 read_conn 完成, 无锁读)。
+        // A3/soak + P1-3 (product-audit §3): 仅此 mutate 段锁 audit_writer (检查+选行已用 read_conn
+        // 完成, 无锁读)。VACUUM 移出此临界区 (单独短重取锁), DELETE+checkpoint 提交先释放锁 →
+        // H7 高风险 append_event 不被整段 (删行+checkpoint+VACUUM) 串行阻塞, 仅 VACUUM 独占段阻塞。
         let w = self.audit_writer.lock();
         let mut w = recover_lock!(w, "audit writer (rotate delete)");
         let tx = w.transaction()?;
@@ -1083,17 +1101,24 @@ impl AuditStore {
         if let Err(e) = write_checkpoint(&w, &new_cp) {
             tracing::warn!(error = %e, "post-rotate checkpoint write failed (P0-4, next verify rescans)");
         }
+        // P1-3: 先释放 audit_writer 锁, DELETE+checkpoint 临界区结束 —— 此后 H7 append_event
+        // 可立即插入 (不被下方 VACUUM 整段预占)。VACUUM 单独短重取锁执行。
+        drop(w);
+
         // VACUUM 回收已删行页 (rotation 核心目的: 降 db 体积)。WAL 模式下 VACUUM 重写整库,
-        // 锁库期间阻塞写 — 放删行后, 短暂阻塞可接受 (治理非热路径)。audit_id 锚点 VACUUM 稳定。
+        // 需独占 (无活跃事务 + 无他连接持锁)。P1-3: 独占段最短 (仅 VACUUM, 不含删行/checkpoint),
+        // 周期治理非热路径; audit_id 锚点 VACUUM 稳定不破坏链。失败不阻断 (空间下次再回收)。
+        let w = self.audit_writer.lock();
+        let w = recover_lock!(w, "audit writer (rotate vacuum)");
         if let Err(e) = w.execute_batch("VACUUM;") {
             tracing::warn!(error = %e, "post-rotate VACUUM failed (P0-4, space not reclaimed yet)");
         }
-        let _ = remaining_after;
+        drop(w);
         tracing::info!(
             archived_rows = report.archived_rows,
             remaining = remaining_after,
             archive = ?archive_path,
-            "audit rotation complete (P0-4, PRD §13.3)"
+            "audit rotation complete (P0-4, PRD §13.3, VACUUM 移出删行临界区 P1-3)"
         );
         Ok(())
     }
@@ -1762,7 +1787,7 @@ impl AuditStore {
         }
         // 全验签通过 → 逐条导回 audit_events 续主链。导回作新行, 用当前 key_version 重算 hash。
         let mut imported = 0usize;
-        let g = recover_lock!(self.audit_writer.lock(), "audit writer");
+        let mut g = recover_lock!(self.audit_writer.lock(), "audit writer");
         let cur_kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1784,7 +1809,7 @@ impl AuditStore {
                     Box::new(e),
                 )
             })?;
-            insert_audit_event(&g, &ev, &self.chain_key, cur_kv)?;
+            insert_audit_event(&mut g, &ev, &self.chain_key, cur_kv)?;
             imported += 1;
         }
         // 导回成功 → 清空死信文件 (写空, 保留 inode + 权限)。
@@ -2087,13 +2112,24 @@ CREATE TABLE IF NOT EXISTS chain_checkpoint (
 );
 "#;
 
+// H-A (product-audit §2): 链单写者保证改在事务层。
+// 原实现 SELECT-then-INSERT 无事务包裹, audit_writer (高风险) 与 low_writer (drain) 各持
+// 独立 Mutex 各走此函数 → 两连接同时 SELECT 同一 prev_hash 再各自 INSERT → 两行同 prev_hash =
+// 链分叉, verify 误报篡改。Mutex 跨连接无效 (各自锁各自连接)。SQLite 写锁 (BEGIN IMMEDIATE)
+// 跨连接串行: BEGIN IMMEDIATE 立即取写锁 (RESERVED→EXCLUSIVE), 他连接 BEGIN IMMEDIATE 阻塞
+// (busy_timeout=5000 等待) → SELECT-then-INSERT 在单写锁内原子, prev_hash 读取与 INSERT 不可
+// 被他连接插入插队。故任一写者 (audit_writer/low_writer) 调此函数, 链 prev_hash 严格连续。
+// 事务还保 confirm_atomic 跨语句原子 (H-D 见 confirm_atomic 自带 BEGIN IMMEDIATE)。
 fn insert_audit_event(
-    conn: &Connection,
+    conn: &mut Connection,
     ev: &AuditEvent,
     key: &Zeroizing<[u8; 32]>,
     key_version: i64,
 ) -> rusqlite::Result<()> {
-    let prev_hash: String = conn
+    // H-A: BEGIN IMMEDIATE 立即取写锁, 串行化 SELECT-then-INSERT 跨连接。
+    // 失败 (SQLITE_BUSY) 由 busy_timeout=5000 (open 时设于两 writer) 重试, 仍失败则向上抛。
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let prev_hash: String = tx
         .query_row(
             "SELECT event_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
             [],
@@ -2106,7 +2142,7 @@ fn insert_audit_event(
             // P0-4: 主库空 (从未写入 或 归档清空)。归档清空后须续链到归档段末尾,
             // 非 genesis — 否则归档后首行 prev_hash=genesis 与归档段断链。读 checkpoint
             // 的 last_archived_hash; 无 checkpoint (全新库) → genesis。读失败 → genesis 兜底。
-            read_checkpoint(conn)
+            read_checkpoint(&tx)
                 .ok()
                 .flatten()
                 .and_then(|c| c.last_archived_hash.filter(|h| !h.is_empty()))
@@ -2114,7 +2150,62 @@ fn insert_audit_event(
         });
     let payload = ev.payload_bytes();
     let event_hash = compute_event_hmac(key, key_version, &payload, &prev_hash);
-    conn.execute(
+    tx.execute(
+        "INSERT INTO audit_events
+         (audit_id, ts, event_type, tenant_id, requester, action,
+          inferred_category, verdict_json, approved_by, seatbelt_required, outcome,
+          prev_hash, event_hash, key_version)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![
+            ev.audit_id.to_string(),
+            ev.ts.to_rfc3339(),
+            ev.event_type,
+            ev.tenant_id,
+            ev.requester,
+            ev.action,
+            ev.inferred_category,
+            ev.verdict_json,
+            ev.approved_by,
+            ev.seatbelt_required as i64,
+            ev.outcome,
+            prev_hash,
+            event_hash,
+            key_version,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+// H-D: confirm_atomic 跨库事务内插审计行。复用 insert_audit_event 的链计算逻辑, 但接受
+// 已开启的 Transaction (BEGIN IMMEDIATE), 不自起事务 —— 由 confirm_atomic 的 tx 统一 commit。
+// prev_hash 读自同一事务 (见已持写锁, 他连接不可插队), event_hash HMAC 计算与 insert_audit_event
+// 完全一致 (跨路径链连续)。调用方负责 commit/rollback。
+pub(crate) fn insert_audit_event_tx(
+    tx: &rusqlite::Transaction<'_>,
+    ev: &AuditEvent,
+    key: &Zeroizing<[u8; 32]>,
+    key_version: i64,
+) -> rusqlite::Result<()> {
+    let prev_hash: String = tx
+        .query_row(
+            "SELECT event_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| {
+            read_checkpoint(tx)
+                .ok()
+                .flatten()
+                .and_then(|c| c.last_archived_hash.filter(|h| !h.is_empty()))
+                .unwrap_or_else(|| GENESIS_PREV_HASH.to_string())
+        });
+    let payload = ev.payload_bytes();
+    let event_hash = compute_event_hmac(key, key_version, &payload, &prev_hash);
+    tx.execute(
         "INSERT INTO audit_events
          (audit_id, ts, event_type, tenant_id, requester, action,
           inferred_category, verdict_json, approved_by, seatbelt_required, outcome,
@@ -2139,8 +2230,6 @@ fn insert_audit_event(
     )?;
     Ok(())
 }
-
-// P0-G2 (C6): HMAC-SHA256(key, prev_hash ‖ payload), 非 bare SHA-256。
 // P1-2 (audit §1.6): key = HKDF 派生的 chain key (版本化), 非 master 直接复用 token key。
 // master + version → derive_chain_key → 派生 key。跨重启一致 (master 不变, 派生确定) → 链可重算校验。
 fn compute_event_hmac(

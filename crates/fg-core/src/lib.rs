@@ -163,6 +163,14 @@ pub enum GuardError {
     InvalidParams,
     #[error("method not found")]
     MethodNotFound,
+    // P2-3 (audit §3.4): JSON-RPC 协议版本非 "2.0" → -32600 (Invalid Request)。
+    // 防 caller 用非标协议绕过/污染审计 (旧码解析 jsonrpc 字段但不校验值)。
+    #[error("invalid request: jsonrpc must be \"2.0\"")]
+    InvalidRequest,
+    // H-B (product-audit §5): 规则突变方法 (add/update/remove) 仅 admin (root) 可调。
+    // 非 admin 调规则突变 → 拒 (-32001, 与 Unauthorized 同码 wire 不区分但日志区分)。
+    #[error("forbidden: rule mutation requires admin")]
+    Forbidden,
 }
 
 pub type Result<T> = std::result::Result<T, GuardError>;

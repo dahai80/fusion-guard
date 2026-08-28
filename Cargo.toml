@@ -42,6 +42,8 @@ futures = "0.3"
 # 日志追踪
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# P1-2 (audit §P1-2): 滚动日志文件 (按日切分 + 保留 N 份), 防长跑日志无限增长。
+tracing-appender = "0.2"
 
 # 通用工具
 regex = "1"

@@ -96,42 +96,135 @@ impl SemanticHit {
 // 非空命中 (C4 — 有错仍有真实危险调用如 os.system("rm -rf /") 中注入语法错)。
 // 全部零命中 + 全部报错 → 追加 L2 parse-error (不静默 clean); 否则 clean。
 
+// P2-1 (audit §P2-1): 语义扫描输入上限 + 语言启发式门控, 防 tree-sitter 多 grammar 大输入突破 SLA。
+//
+// 问题: 原实现无脑全试 4 grammar (Python/JS/TS/Rust)。clean Python 源经 3 个非原生 grammar
+// 错误恢复解析 (tree-sitter 错恢复超线性), 256KB → 27s, 远超 2s SLA (PRD R1)。
+//
+// 两道防线:
+//   (1) 输入硬上限 SEMANTIC_INPUT_CAP —— 超出 fail-open 降级 (regex/tokenizer 仍扫), L2 提示审计可见。
+//   (2) 语言启发式 guess_grammars —— 按首行/关键字猜源语言, 只试候选 grammar (通常 1 个),
+//       省 3/4 解析。clean 源最坏 1× 解析。无启发命中 → fallback 全 4 (由 cap 卡界, 罕见)。
+//
+// 保 C4 (有错源仍检真实危险调用) + C5 (跨语言裸命中, 如 JS const+eval 不误作 Python): 候选按
+// 确证优先 —— 无错 grammar 命中 > 无错零命中 > err+非空命中兜底 > 全错 L2 parse-error。
+pub const SEMANTIC_INPUT_CAP: usize = 256 * 1024;
+
+// P2-1: 语言启发式 —— 扫首 ~2KB + 整体特征关键字, 返回候选 grammar 顺序 (高确证在前)。
+// 关键字取各语言强特征 (互斥度高的语法关键字), 避 JS grammar 贪婪吃 Rust 源 (const/let 共用)。
+fn guess_grammars(content: &str) -> Vec<&'static str> {
+    let head: String = content.chars().take(2048).collect();
+    let full = content;
+    // Rust 强特征: use/fn/pub fn/let mut/impl/struct/unsafe/mod/extern/-> 类型签名。
+    let rust = head.contains("fn ")
+        || head.contains("::")
+        || head.contains("let mut")
+        || head.contains("pub fn")
+        || head.contains("impl ")
+        || head.contains("extern ")
+        || (head.contains("use ") && head.contains("::"));
+    // Python 强特征: def /import/from/elif/None/True/False/lambda/dunder。
+    let python = head.contains("\ndef ")
+        || head.starts_with("def ")
+        || head.contains("import ")
+        || head.contains("elif ")
+        || head.contains("lambda ")
+        || full.contains("__name__");
+    // JS/TS 特征: require(/console./const .*=require/=>/function( (TS 加 : 类型)。
+    let jsts = head.contains("require(")
+        || head.contains("console.")
+        || head.contains("=>")
+        || (head.contains("const ") && head.contains("require"))
+        || head.contains("module.exports");
+    let ts = jsts
+        && (head.contains(": string") || head.contains(": number") || head.contains("interface "));
+
+    let mut out: Vec<&'static str> = Vec::new();
+    if ts {
+        out.push("ts");
+    }
+    if rust {
+        out.push("rust");
+    }
+    if python {
+        out.push("python");
+    }
+    if jsts && !ts {
+        out.push("js");
+    }
+    if out.is_empty() {
+        // 无启发命中 → 全 4 (fallback, 由 SEMANTIC_INPUT_CAP 卡界, 模糊源兜底)。
+        out.extend_from_slice(&["python", "js", "ts", "rust"]);
+    }
+    out
+}
+
+fn scan_by_lang(lang: &str, code: &str) -> (Vec<SemanticHit>, bool) {
+    match lang {
+        "python" => scan_python(code),
+        "js" => scan_javascript(code),
+        "ts" => scan_typescript(code),
+        "rust" => scan_rust(code),
+        _ => (Vec::new(), true),
+    }
+}
+
 pub fn semantic_check(content: &str) -> Vec<SemanticHit> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let candidates = [
-        scan_python(trimmed),
-        scan_javascript(trimmed),
-        scan_typescript(trimmed),
-        scan_rust(trimmed),
-    ];
-    // 1. 优先: 无错 grammar 的非空命中 (源语言确证, 跨语言裸命中不混淆)。
-    for (hits, had_error) in &candidates {
-        if !hits.is_empty() && !had_error {
-            return hits.clone();
-        }
-    }
-    // 2. 兜底: 全 grammar 有错时, 首个非空命中 (C4 — 有错源仍检真实危险调用)。
-    for (hits, _had_error) in &candidates {
-        if !hits.is_empty() {
-            return hits.clone();
-        }
-    }
-    // 3. 全部零命中。仅当所有 grammar 都报错 → 标注扫描可能不完整 (C4 不静默 clean)。
-    // 任一 grammar 无错解析 (如 clean Rust) → 信任其零命中, 不误报。
-    if candidates.iter().all(|(_, err)| *err) {
-        vec![SemanticHit {
+    // P2-1 防线 1: 输入超上限 → 跳过 tree-sitter 解析, fail-open 降级 (regex/tokenizer 仍扫)。
+    if trimmed.len() > SEMANTIC_INPUT_CAP {
+        tracing::warn!(
+            input_bytes = trimmed.len(),
+            cap = SEMANTIC_INPUT_CAP,
+            "semantic input exceeds cap, degrading (P2-1 SLA guard)"
+        );
+        return vec![SemanticHit {
             language: "unknown",
-            callee: "<parse-error>".into(),
+            callee: "<input-too-large>".into(),
             risk: RiskLevel::L2,
-            reason: "源含解析错误, 语义扫描可能不完整 (C4)".into(),
+            reason: format!(
+                "语义扫描输入超上限 ({}>{}, 降级跳过, regex/tokenizer 仍扫)",
+                trimmed.len(),
+                SEMANTIC_INPUT_CAP
+            ),
             stage: CheckStage::Semantic,
-        }]
-    } else {
-        Vec::new()
+        }];
     }
+    // P2-1 防线 2: 语言启发式门控, 只试候选 grammar (通常 1 个), 省 3/4 解析。
+    let langs = guess_grammars(trimmed);
+    let mut err_hit: Option<Vec<SemanticHit>> = None;
+    let mut any_clean_empty = false;
+    for lang in &langs {
+        let (hits, had_error) = scan_by_lang(lang, trimmed);
+        if !had_error {
+            if !hits.is_empty() {
+                // 无错 + 非空命中 = 源语言确证 + 真实危险 (C5 最高优先), 立即返。
+                return hits;
+            }
+            // 无错 + 零命中: 正确语言且安全, 记为候选 (余下候选仍试, 查有无更优 clean+hits)。
+            any_clean_empty = true;
+        } else if !hits.is_empty() && err_hit.is_none() {
+            // 有错 + 非空: C4 兜底 (有错源仍检真实危险调用如 os.system 注入)。
+            err_hit = Some(hits);
+        }
+    }
+    // 优先级: clean_empty (正确语言零命中) > err_hit (C4 兜底) > all-error L2 parse-error。
+    if any_clean_empty {
+        return Vec::new();
+    }
+    if let Some(hits) = err_hit {
+        return hits;
+    }
+    vec![SemanticHit {
+        language: "unknown",
+        callee: "<parse-error>".into(),
+        risk: RiskLevel::L2,
+        reason: "源含解析错误, 语义扫描可能不完整 (C4)".into(),
+        stage: CheckStage::Semantic,
+    }]
 }
 
 // ── Python ───────────────────────────────────────────────────────────
