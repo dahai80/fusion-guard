@@ -72,18 +72,32 @@ fn in_flight_flag_persists() {
 }
 
 #[test]
-fn key_consistent_across_open() {
-    let conn = temp_conn();
-    let store1 = TokenStore::open(conn).unwrap();
-    store1.put("tok_persist", "persisted-secret").unwrap();
-    let key1 = store1.key_bytes();
-    let conn2 = temp_conn();
-    let store2 = TokenStore::open(conn2).unwrap();
-    assert_eq!(
-        key1,
-        store2.key_bytes(),
-        "key from same Keychain service/account must be identical"
-    );
+fn cross_restart_reveal_persists() {
+    let dir = std::env::temp_dir().join(format!(
+        "fg-token-restart-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("token-restart.db");
+    {
+        ensure_env_key();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        let store = TokenStore::open(conn).unwrap();
+        store.put("tok_restart", "restart-secret").unwrap();
+    }
+    {
+        ensure_env_key();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        let store = TokenStore::open(conn).unwrap();
+        let got = store.get("tok_restart").unwrap();
+        assert_eq!(got, "restart-secret", "encrypted token survives restart");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

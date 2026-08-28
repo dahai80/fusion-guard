@@ -21,6 +21,10 @@ enum Cmd {
     Start {
         #[arg(long, env = "FUSION_GUARD_SOCK", default_value = DEFAULT_SOCK)]
         sock: PathBuf,
+        // P2-1 (audit §2.6): 显式放行 env key (release 用)。默认 false —— prod 强制 Keychain。
+        // 置位 = set FUSION_GUARD_ALLOW_ENV_KEY=1 (fg-store token_store 读), 告警级 warn。
+        #[arg(long, default_value_t = false)]
+        insecure_env_key: bool,
     },
     Ping {
         #[arg(long, env = "FUSION_GUARD_SOCK", default_value = DEFAULT_SOCK)]
@@ -75,14 +79,24 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Some(Cmd::Start { sock }) => run_server(sock).await,
+        Some(Cmd::Start {
+            sock,
+            insecure_env_key,
+        }) => run_server(sock, insecure_env_key).await,
         Some(Cmd::Ping { sock }) => run_ping(sock).await,
-        None => run_server(PathBuf::from(DEFAULT_SOCK)).await,
+        None => run_server(PathBuf::from(DEFAULT_SOCK), false).await,
     }
 }
 
-async fn run_server(sock: PathBuf) -> anyhow::Result<()> {
+async fn run_server(sock: PathBuf, insecure_env_key: bool) -> anyhow::Result<()> {
     tracing::info!(sock = %sock.display(), "fusion-guard daemon starting");
+    // P2-1: CLI flag → env (token_store load_or_create_key 读)。flag 显式 = operator 知情放行。
+    if insecure_env_key {
+        std::env::set_var("FUSION_GUARD_ALLOW_ENV_KEY", "1");
+        tracing::warn!(
+            "--insecure-env-key set (P2-1): master key may load from env in release build"
+        );
+    }
     let db_path = data_dir().join("guard.db");
     let audit = Arc::new(AuditStore::open(&db_path)?);
     let engine = AuditEngine::new(audit.clone())?;

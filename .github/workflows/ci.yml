@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # AuditStore::open → TokenStore::load_or_create_key 在非交互环境会卡 Keychain
+  # SecItemCopyMatching 60s+。CI 注入固定 hex 32B key (dev/CI 路径, 非 prod Keychain)。
+  # release build 经 P2-1 门控: 需 FUSION_GUARD_ALLOW_ENV_KEY=1 或 --insecure-env-key 才读 env key。
+  # CI 用 cargo test (debug) 不经 release 门控, 直接读 env key。
+  FUSION_GUARD_TOKEN_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 jobs:
   rust-check:

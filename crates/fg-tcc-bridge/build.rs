@@ -41,16 +41,27 @@ fn main() {
             )
             .expect("write stub");
             let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-            let _ = Command::new(&cc)
+            // M7: 勿吞 cc 编译失败 (原 let _ = status())。stub .o 缺失 → 后续 ar 打包空 → 链接期
+            // 报错不清晰 (符号未定义而非 build.rs 阶段)。编译失败即显式 build fail。
+            let cc_status = Command::new(&cc)
                 .args(["-c", "-o", obj.to_str().unwrap(), stub.to_str().unwrap()])
-                .status();
+                .status()
+                .unwrap_or_else(|e| panic!("cc stub compile failed to start: {e}"));
+            if !cc_status.success() {
+                panic!("cc stub compile failed (exit {:?})", cc_status.code());
+            }
         }
     }
 
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-    let _ = Command::new(&ar)
+    // M7: ar 打包失败显式 fail, 非静默吞 (静态库损坏 → 链接报错不清晰)。
+    let ar_status = Command::new(&ar)
         .args(["rcs", lib.to_str().unwrap(), obj.to_str().unwrap()])
-        .status();
+        .status()
+        .unwrap_or_else(|e| panic!("ar archive failed to start: {e}"));
+    if !ar_status.success() {
+        panic!("ar archive failed (exit {:?})", ar_status.code());
+    }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=fgtccbridge");

@@ -11,13 +11,37 @@ fg-core.workspace = true
 fg-audit-engine.workspace = true
 fg-rules.workspace = true
 fg-store.workspace = true
+fg-tcc.workspace = true
+fg-peercred.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
 nix.workspace = true
 libc.workspace = true
+
+[features]
+# test-helpers: 暴露 new_with_req_permits (自定义 req_sem 槽数) 供集成测试
+# 确定性填满槽位验证 permit 超时 (P1-4), 不进生产路径。
+test-helpers = []
+
+[dev-dependencies]
+fg-core.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[test]]
+name = "p14_req_sem_timeout_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p15_authorizer_test"
+required-features = ["test-helpers"]
 
 [lints]
 workspace = true

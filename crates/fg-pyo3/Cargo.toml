@@ -1,0 +1,37 @@
+[package]
+name = "fg-pyo3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PyO3 binding for fusion-guard — UDS JSON-RPC client exposed to Python"
+
+# maturin 目标 crate: cdylib (Python 扩展) + rlib (in-process 测试/import)
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fg-core.workspace = true
+pyo3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+
+[dev-dependencies]
+fg-ipc.workspace = true
+fg-audit-engine.workspace = true
+fg-store.workspace = true
+fg-core.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+# fg-pyo3 不含 unsafe; unsafe 仅限 fg-tcc-bridge/fg-es-bridge FFI crate
+unsafe_code = "deny"

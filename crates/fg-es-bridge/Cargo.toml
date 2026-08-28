@@ -1,0 +1,17 @@
+[package]
+name = "fg-es-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Endpoint Security C FFI bridge — unsafe allow, stub fallback without entitlement"
+
+[lib]
+name = "fg_es_bridge"
+path = "src/lib.rs"
+
+[lints.rust]
+# ES FFI 需 unsafe (唯一 allow crate, 镜像 fg-tcc-bridge)
+unsafe_code = "allow"
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(es_bridge_stub)'] }
