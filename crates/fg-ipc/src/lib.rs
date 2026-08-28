@@ -621,6 +621,14 @@ impl IpcServer {
                 );
                 Ok(serde_json::to_value(&res)?)
             }
+            "guard.redact.patterns.dump" => {
+                // issue #7: 暴露 15 redaction pattern 定义 (name+regex+validator tag), 只读 dump。
+                // pattern 全局 (非租户 scoped), 不校验 tenant —— 任何授权 caller 可拉取, 消费方按
+                // tag 重实现 validator (fusion-gateway PII SSOT 订阅, 消手动 lockstep)。
+                let patterns = self.engine.pattern_defs();
+                tracing::info!(count = patterns.len(), "guard.redact.patterns.dump handled");
+                Ok(serde_json::json!({ "patterns": patterns }))
+            }
             "guard.reveal" => {
                 let content =
                     s_param(&req.params, "content", 0).ok_or(GuardError::InvalidParams)?;

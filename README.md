@@ -263,6 +263,7 @@ UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
 - `guard.audit.list` — `{tenant_id?, limit?}` → `{records: [AuditRecord]}`
 - `guard.audit.verify` — `{}` → `{audit:{...}, tcc:{...}, rules:{...}, dead_letter:{...}, tampered}` (全链聚合校验, P0-5: audit+tcc+rules+dead_letter 四子链; 各子链 `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at?}`; 顶层 `tampered`=任一子链被篡改, PRD §13.3)
 - `guard.redact` — `{content, reversible:bool}` → `{redacted_content, token_map_id?}` (可逆: token AES-GCM 加密落盘, in-flight 标记 R3; 不可逆: `[REDACTED:type#last4]`)
+- `guard.redact.patterns.dump` — `{}` → `{patterns: [{name, regex, validator}]}` (issue #7: 15 条脱敏 pattern 定义只读 dump, 优先序保留, validator tag `none|ipv4|aws_secret|luhn|phone`; 消费方拉取代 vendoring, 消手动 lockstep)
 - `guard.reveal` — `{content, token_map_id}` → `{content}` (还原; token 丢失回退 `[REDACTED:unrecoverable#...]` H6)
 - `guard.confirm` — `{action_id, approved:bool, approved_by?, tenant_id?}` → `{verdict: GuardVerdict}` (L3 人机确认; L4 拒绝 H8; action_id 一次性兑现 H4; TTL 30s 过期拒绝; approve→Allow, reject→Block)
 

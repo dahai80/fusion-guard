@@ -221,6 +221,12 @@ impl AuditEngine {
         }
     }
 
+    // issue #7: 暴露 15 redaction pattern 定义的可序列化 dump (guard.redact.patterns.dump)。
+    // pattern 全局 (非租户 scoped), 直接透传 Redactor::pattern_defs。
+    pub fn pattern_defs(&self) -> Vec<fg_redact::PatternDefDump> {
+        self.redactor.pattern_defs()
+    }
+
     pub fn reveal(&self, content: &str, _token_map_id: &str) -> Result<String> {
         self.reveal_tenant(content, fg_store::DEFAULT_TENANT)
     }
