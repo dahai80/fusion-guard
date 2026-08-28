@@ -2,6 +2,30 @@
 
 All notable changes to fusion-guard are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
+## [0.1.2] — 2026-08-28 (minor)
+
+Cross-node cluster consumer — closes issue #4 (was upstream-blocked on fusion-multi-node#52, now MERGED via PR #54 commit fa2cb41). fusion-guard implements the **consumer** side of the multi-node contract: multi-node defines TRANSPORT + IDENTITY + KEY SCHEME; guard consumes it. Per-host by PRD design (guard is NOT a cluster broker).
+
+### Added
+- **`fg-cluster` crate** (14th crate) — cross-node transport primitives, 100% local/LAN, no cloud:
+  - **Key scheme** (`key.rs`): HKDF-SHA256 from `cluster_token` (env `FUSION_GUARD_CLUSTER_TOKEN`) → 3 domain-separated MAC keys, info labels `b"fusion-multinode-audit-chain-v1"` / `b"fusion-multinode-rule-epoch-v1"` / `b"fusion-multinode-confirm-relay-v1"` (KEY_LEN=32, salt=None). `canonical_json` (sorted-keys, compact, `ensure_ascii=False`) for deterministic MAC input. `mac_payload` (HMAC-SHA256→hex), `verify_mac` (constant-time, empty→false). 7 unit tests.
+  - **Federated audit-chain verify** (`verify.rs`): each record carries `seq` / `prev_hash` (= sha256 of canonical-full of prior record INCLUDING mac) / `mac` (= HMAC over record MINUS mac). Double tamper detection: field flip → MAC mismatch + next `prev_hash` breaks. Degraded records (missing chain fields) → baseline, skip chain check. `verify_chain_segment` returns `{total_records, verified_links, broken_links, baseline_records, tampered, first_broken_at}`. 4 unit tests.
+  - **Multi-node HTTP client** (`client.rs`, `reqwest::blocking` — safe inside `spawn_blocking`): `GET /api/v1/audit/chain?since_seq=N`, `GET /api/v1/rules/epoch`, `POST /api/v1/rules/epoch/advance` (leader-only, non-leader→409 best-effort), `POST /api/confirm` (MAC-verified relay), `GET /api/v1/confirms?epoch=N`. Bearer `cluster_token` auth, 5s timeout, fail-closed on non-2xx.
+- **`guard.cluster.*` IPC** (4 methods, `fg-ipc`):
+  - `guard.cluster.audit.fetch {since_seq}` — fetch remote chain segment + local federated verify (MAC + prev_hash), returns `{node_id, fetched_at, records, verify}`.
+  - `guard.cluster.epoch.sync` — reconcile local vs cluster rule epoch (local>cluster → advance cluster best-effort; local<cluster → `local_behind`; equal → `in_sync`), Checkpoint 2 SSOT extended to cluster domain.
+  - `guard.cluster.confirm.relay {confirm_id, node_id, action, epoch, ts}` — relay confirm to master aggregation (builds MAC).
+  - `guard.cluster.confirm.list {epoch?}` — query confirm aggregation.
+  - Missing `FUSION_GUARD_CLUSTER_TOKEN` (single-node mode) → `-32011` cluster-not-configured, non-silent.
+- **Integration tests** (`tests/cluster_integration.rs`, 8 tests) — std-only HTTP mock (no tokio/wiremock, avoids `reqwest::blocking` runtime-drop panic in async context): clean chain verifies, tampered record detected, epoch get/advance, confirm relay MAC interop (bidirectional self-verify), confirm list, single-node-mode `None`, HTTP-error fail-closed.
+
+### Changed
+- Workspace version 0.1.1 → 0.1.2 (all 14 crates inherit). `pyproject.toml`, `python/fusion_guard/__init__.py` synced. Workspace members + deps add `fg-cluster`.
+- `fg-ipc` depends on `fg-cluster`; `handle_method` (sync, `spawn_blocking`) calls blocking client directly.
+
+### Tests
+- 172 tests pass (153 prior + 11 fg-cluster unit + 8 fg-cluster integration), clippy clean, fmt green.
+
 ## [0.1.1] — 2026-08-28 (patch)
 
 Patch release: fusion-event audit contract + PII redaction expansion + Python wheel packaging, plus the full P0-P2 audit hardening sweep (22 fixes) that landed between v0.1.0 and this release.

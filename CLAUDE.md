@@ -4,13 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Current release: v0.1.1 (2026-08-28, patch).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 + Phase 5 (TCC audit aggregation + Swift bridge) + Phase 7 (audit chain hash tamper-evidence + ES monitor + PyO3 binding + semantic stage) + P0-P2 audit hardening sweep (22 fixes: G1-G9 release-blockers + P1/P2 waves) + GitHub issues #1/#2/#3/#5 landed on `main`, pushed to dahai80/fusion-guard. Phases 3/4/6 blocked-on-upstream-PR (E2 — executor/agent-studio/studio integration, issue→PR→land flow).
+**Current release: v0.1.2 (2026-08-28, minor).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 + Phase 5 (TCC audit aggregation + Swift bridge) + Phase 7 (audit chain hash tamper-evidence + ES monitor + PyO3 binding + semantic stage) + P0-P2 audit hardening sweep (22 fixes: G1-G9 release-blockers + P1/P2 waves) + GitHub issues #1/#2/#3/#5 landed on `main` + **issue #4 (cluster/multi-node consumer) landed** in v0.1.2, pushed to dahai80/fusion-guard. Phases 3/4/6 blocked-on-upstream-PR (E2 — executor/agent-studio/studio integration, issue→PR→land flow).
+
+**v0.1.2 scope (2026-08-28):**
+- **Issue #4 (cluster/multi-node consumer, PRD §4.1/§8.2):** upstream fusion-multi-nodes#52 MERGED (PR #54 fa2cb41) — multi-node defines TRANSPORT+IDENTITY+KEY SCHEME; guard implements **consumer** (per-host, NOT broker). New `fg-cluster` crate (14th): HKDF-SHA256 from `cluster_token` → 3 domain-separated MAC keys (info labels `b"fusion-multinode-{audit-chain,rule-epoch,confirm-relay}-v1"`, KEY_LEN=32, salt=None); `canonical_json` (sorted/compact/`ensure_ascii=False`); federated audit-chain verify (MAC + prev_hash double-tamper detect, degraded→baseline skip); `reqwest::blocking` HTTP client (5s timeout, Bearer auth, fail-closed). 4 IPC methods `guard.cluster.{audit.fetch, epoch.sync, confirm.relay, confirm.list}`. Missing token → `-32011` cluster-not-configured (single-node mode, non-silent). 19 tests (11 unit + 8 integration std-mock), 172 total pass, clippy clean.
+- Version bump 0.1.1→0.1.2 across workspace + pyproject + __init__.py.
 
 **v0.1.1 patch scope (2026-08-28):**
 - **Issue #1/#3 (fusion-event `guard.audit` frozen contract, PRD §6.7 / D-10):** `AuditEngine::audit_event` + IPC `guard.audit`/`guard.audit_result`. Response `{decision: pass|block|challenge, reason, risk_level:int, audit_id, trigger_id}` — Allow/Redact/Preview→pass, Block→block, L3 requires_approval→challenge. risk_level = `RiskLevel::rank()` (0..3 int). audit_id = audit chain row PK (Uuid), trigger_id echoed. 4 tests (audit_event_test.rs). Live UDS smoke verified.
 - **Issue #2 (PII 脱敏扩展):** fg-redact 13→15 patterns — email + ipv4 (+ Luhn-free valid_ipv4 validator), placed after credential patterns to avoid conn_string overlap regression.
 - **Issue #5 (Python wheel 打包):** pyproject.toml (maturin build-backend, manifest-path → crates/fg-pyo3) + python/fusion_guard/__init__.py re-export wrapper (`NativeGuardClient` etc). `.gitignore` adds `*.whl`/`dist/`/`build/`.
-- **Issue #4 (P2-5 cluster/multi-node):** upstream-blocked on fusion-multi-nodes#52, keep open.
+- **Issue #4 (P2-5 cluster/multi-node):** landed in v0.1.2 (consumer side, multi-nodes#52 MERGED).
 - Version bump 0.1.0→0.1.1 across workspace + Cargo.lock + pyproject + __init__.py. 153 tests pass (default), +11 semantic feature tests, clippy clean, fmt green.
 
 Landed so far:
@@ -54,9 +58,10 @@ crates/
 ├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC status queries, compiled to static lib via build.rs, C stub fallback (unsafe_code=allow)
 ├── fg-es             # Endpoint Security 高危系统事件监控: EsEventKind/EsEvent/EsMonitorState/EsStatus/EsMonitor (safe types, unsafe_code=deny)
 ├── fg-es-bridge      # ES C FFI 桥: 无 entitlement → C stub 兜底 (cfg(es_bridge_stub), degraded → TCC — Q#3), unsafe_code=allow, is_stub() exposes cfg to fg-es
-├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc.status/tcc.report/tcc.events/audit/redact/reveal/confirm
+├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc.status/tcc.report/tcc.events/audit/redact/reveal/confirm/cluster.* (audit.fetch/epoch.sync/confirm.relay/confirm.list)
 ├── fg-store          # SQLite WAL: audit_events append-only (链式 hash 防篡改) + rules/rule_meta + encrypted token store (AES-GCM) + pending action store (H4) + tcc_events table
 ├── fg-pyo3           # PyO3 绑定: NativeGuardClient (UDS JSON-RPC 客户端暴露 Python, 对齐 fe-pyo3, pyo3 0.29, cdylib+rlib)
+├── fg-cluster        # 跨节点消费方 (issue #4 / multi-nodes#52): HKDF 域分离 3 MAC key + federated 链验证 (MAC+prev_hash) + reqwest::blocking HTTP 客户端 (5s, Bearer, fail-closed); per-host 非 broker
 └── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
