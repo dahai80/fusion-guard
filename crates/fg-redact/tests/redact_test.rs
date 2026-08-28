@@ -322,3 +322,103 @@ fn issue2_phone_present() {
     assert_eq!(matches.len(), 1, "phone (issue #2) one token: {out}");
     assert!(out.contains("[REDACTED:phone#tok_"));
 }
+
+// issue #10: redact_credentials() 仅脱凭据子集, 跳过 PII。
+// 消费方 (fusion-memory) 自带更准 PII 逻辑, 只需 fg-redact 补凭据覆盖。
+
+#[test]
+fn issue10_credentials_redacts_jwt_and_password() {
+    let r = make();
+    let input = "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c and password=hunter2pass";
+    let out = r.redact_credentials(input);
+    assert!(
+        out.contains("[REDACTED:jwt]"),
+        "jwt (credential) redacted: {out}"
+    );
+    assert!(
+        out.contains("[REDACTED:password]"),
+        "password (credential) redacted: {out}"
+    );
+    assert!(!out.contains("hunter2pass"), "credential value stripped");
+    assert!(
+        !out.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+        "jwt value stripped"
+    );
+}
+
+#[test]
+fn issue10_credentials_skips_idcard() {
+    // id-card 18 char: redact() 错吞 (credit_card 吃 17 位剩悬空 X), redact_credentials() 须
+    // 跳过 PII → 原样保留 (消费方自脱)。
+    let r = make();
+    let out = r.redact_credentials("身份证 11010119900307888X 复印件");
+    assert_eq!(
+        out, "身份证 11010119900307888X 复印件",
+        "id-card untouched by credentials-only: {out}"
+    );
+    assert!(!out.contains("REDACTED"), "no PII redaction: {out}");
+}
+
+#[test]
+fn issue10_credentials_skips_long_non_luhn_digits() {
+    // 18 位非 PII 数字串 (订单号样): redact() 误吞 (id_number 无 validator),
+    // redact_credentials() 须跳过 → 原样保留。
+    let r = make();
+    let out = r.redact_credentials("order 999999999999999999 timestamp");
+    assert_eq!(
+        out, "order 999999999999999999 timestamp",
+        "non-PII long digits untouched: {out}"
+    );
+    assert!(!out.contains("REDACTED"), "no PII redaction: {out}");
+}
+
+#[test]
+fn issue10_credentials_skips_phone_email_ipv4() {
+    let r = make();
+    let out = r.redact_credentials("call 13800138000 mail user@example.com ip 10.0.0.1");
+    assert_eq!(
+        out, "call 13800138000 mail user@example.com ip 10.0.0.1",
+        "phone/email/ipv4 (PII) untouched: {out}"
+    );
+    assert!(!out.contains("REDACTED"), "no PII redaction: {out}");
+}
+
+#[test]
+fn issue10_redact_with_patterns_subset() {
+    // 通用原语: 仅跑 private_key + jwt, 跳过其余 (含 password)。
+    let r = make();
+    let input = "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c and password=hunter2pass";
+    let out = r.redact_with_patterns(input, &["private_key", "jwt"]);
+    assert!(
+        out.contains("[REDACTED:jwt]"),
+        "jwt in subset redacted: {out}"
+    );
+    // password 不在传入子集 → 不脱 (值裸留)。
+    assert!(
+        out.contains("password=hunter2pass"),
+        "password outside subset untouched: {out}"
+    );
+}
+
+#[test]
+fn issue10_redact_with_patterns_unknown_name_ignored() {
+    let r = make();
+    let out = r.redact_with_patterns("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", &["nonexistent"]);
+    assert_eq!(
+        out,
+        "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "unknown name ignored, no redaction: {out}"
+    );
+}
+
+#[test]
+fn issue10_credentials_full_set_matches_redact_on_credential_only_input() {
+    // 纯凭据输入: redact_credentials() 与 redact() 产出一致 (无 PII 可分歧)。
+    let r = make();
+    let input = "key sk-abcdefghijklmnopqrstuvwx and password=secret123";
+    assert_eq!(
+        r.redact_credentials(input),
+        r.redact(input),
+        "credential-only input: credentials == full redact"
+    );
+}
