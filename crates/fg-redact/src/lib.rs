@@ -4,6 +4,22 @@ use std::cmp::Reverse;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
+// issue #10: 凭据模式子集名 (非 PII)。消费方用 redact_credentials() 或 redact_with_patterns()
+// 配此常量, 避免硬编码名随 defs 演化漂移。PII 子集 = email/ipv4/credit_card/phone/id_number,
+// 由消费方自脱 (fusion-memory 自带更准的本地化 PII 逻辑)。
+pub const CREDENTIAL_PATTERNS: &[&str] = &[
+    "private_key",
+    "jwt",
+    "oauth_bearer",
+    "api_key",
+    "conn_string",
+    "password",
+    "secret_kv",
+    "env_kv",
+    "netrc",
+    "aws_secret",
+];
+
 // M4: 编译失败不再 panic (原 4× .unwrap()), 返 Result 由 AuditEngine::new 决策 (fail-closed)。
 // P2: redact_counted 单次遍历返 (String, hit_count) —— evaluate 跳独立 has_sensitive 二扫。
 // P1-1 (audit §1.10): DLP 脱敏盲区扩展 —— 新增 AWS Secret/JWT/OAuth bearer/信用卡 (Luhn)/
@@ -279,9 +295,18 @@ impl Redactor {
     // 的 tok_<32hex> 占位符内 17 位数字子串 → 腐蚀原占位符 → extract_placeholders 找不到 →
     // reveal 撞 H6 → 可逆脱敏静默降级为不可逆。span 追踪消此 (占位符永不写回原内容, 单趟构建)。
     // accepted span 集合; 新命中与任一已接受 span 重叠即跳过 (首个模式优先, 防 id_number 吞 api_key)。
-    fn collect_spans(&self, content: &str) -> Vec<AcceptedMatch> {
+    // issue #10: pred 按模式名过滤 (true=全集 = 原 redact 语义; 凭据子集 = redact_credentials)。
+    // 顺序 (defs 优先序) 不变 —— 子集只跳过不匹配模式, 重叠 first-accept 逻辑同。
+    fn collect_spans_filtered<P: Fn(&str) -> bool>(
+        &self,
+        content: &str,
+        pred: P,
+    ) -> Vec<AcceptedMatch> {
         let mut accepted: Vec<AcceptedMatch> = Vec::new();
         for pd in &self.patterns {
+            if !pred(pd.name) {
+                continue;
+            }
             let name_tag = pd.name;
             for c in pd.re.captures_iter(content) {
                 let full = match c.get(0) {
@@ -320,6 +345,12 @@ impl Redactor {
         accepted
     }
 
+    // 原语义: 全模式收集 (pred 恒 true)。保所有现存调用点 (redact/redact_counted/
+    // redact_irreversible/redact_reversible/has_sensitive 经此或等价内联) 行为不变。
+    fn collect_spans(&self, content: &str) -> Vec<AcceptedMatch> {
+        self.collect_spans_filtered(content, |_| true)
+    }
+
     pub fn redact(&self, content: &str) -> String {
         let spans = self.collect_spans(content);
         if spans.is_empty() {
@@ -331,6 +362,32 @@ impl Redactor {
         let mut out = content.to_string();
         for m in &ordered {
             // span = group1 (值) 区间, 前缀 (group0..group1) 已在原位保留, 仅替换值。
+            let repl = format!("[REDACTED:{}]", m.name_tag);
+            out.replace_range(m.start..m.end, &repl);
+        }
+        out
+    }
+
+    // issue #10: 仅脱敏凭据子集 (CREDENTIAL_PATTERNS), 跳过 PII (email/ipv4/credit_card/
+    // phone/id_number)。消费方 (fusion-memory) 自带更准的 PII 脱敏, 只需 fg-redact 补凭据覆盖
+    // (private_key/jwt/bearer/api_key/conn_string/password/secret_kv/env_kv/netrc/aws_secret),
+    // 不接受 fg-redact 的 PII (idcard 被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被拒)。
+    // 同 collect_spans 的优先序+重叠语义, 子集只跳过 PII 模式。无 redact() 行为变更。
+    pub fn redact_credentials(&self, content: &str) -> String {
+        self.redact_with_patterns(content, CREDENTIAL_PATTERNS)
+    }
+
+    // issue #10: 通用原语 —— 仅跑命名子集模式 (names 取自 pattern_defs())。未知名忽略,
+    // 顺序仍按 defs 优先序 (先到先拒重叠), 非调用方传入顺序。便于消费方按需选类。
+    pub fn redact_with_patterns(&self, content: &str, names: &[&str]) -> String {
+        let spans = self.collect_spans_filtered(content, |n| names.contains(&n));
+        if spans.is_empty() {
+            return content.to_string();
+        }
+        let mut ordered = spans;
+        ordered.sort_by_key(|m| Reverse(m.start));
+        let mut out = content.to_string();
+        for m in &ordered {
             let repl = format!("[REDACTED:{}]", m.name_tag);
             out.replace_range(m.start..m.end, &repl);
         }
