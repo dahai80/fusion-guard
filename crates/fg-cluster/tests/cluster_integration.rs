@@ -94,9 +94,27 @@ fn handle_conn<F>(mut stream: TcpStream, handler: &Arc<F>)
 where
     F: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
 {
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    let req = String::from_utf8_lossy(&buf[..n]);
+    // 循环读到 headers 结束 (\r\n\r\n)。GET 无 body, headers 终止即整请求。
+    // 原 single-read 在并发负载下可能读半截 → path 解析空 → 500 flaky。
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let req = String::from_utf8_lossy(&buf);
     let mut lines = req.lines();
     let req_line = lines.next().unwrap_or("");
     let mut parts = req_line.split_whitespace();

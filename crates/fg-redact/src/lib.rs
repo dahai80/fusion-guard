@@ -1,4 +1,5 @@
 use regex::Regex;
+use serde::Serialize;
 use std::cmp::Reverse;
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -18,9 +19,35 @@ struct PatternDef {
     // P1-1 (规则 5): validator 接收 (content, span起, span止) —— 正则无 lookaround (regex crate),
     // 边界 (前后非同类字符) + Luhn + 字符多样性 用代码校验, 非模型非正则。
     validator: Option<ValidatorFn>,
+    // issue #7: validator 的可序列化标签 (规则 5 显式标注, 非 fn 指针映射)。IPC dump 暴露给
+    // 下游消费者 (fusion-gateway PII SSOT 订阅), 消费方按 tag 重实现 validator (算法小且文档化)。
+    validator_tag: ValidatorTag,
+    // issue #7: 原始 pattern 字符串 (re 是 Regex 不可序列化), dump 暴露原串。
+    pattern_str: &'static str,
 }
 
 type ValidatorFn = fn(&str, usize, usize) -> bool;
+
+// issue #7: redaction pattern 定义的可序列化 dump (guard.redact.patterns.dump 返回)。
+// 消费方 (fusion-gateway) 拉取 + 缓存取代 vendoring, 消手动 lockstep 更新。
+#[derive(Debug, Clone, Serialize)]
+pub struct PatternDefDump {
+    pub name: &'static str,
+    pub regex: &'static str,
+    pub validator: ValidatorTag,
+}
+
+// issue #7: validator 标签枚举 (serde lowercase = issue 契约 "none"|"ipv4"|"aws_secret"|"luhn"|"phone")。
+// 非 fn 指针 —— IPC payload 需可序列化, 消费方按 tag 重实现。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorTag {
+    None,
+    Ipv4,
+    AwsSecret,
+    Luhn,
+    Phone,
+}
 
 pub struct ReversibleMatch {
     pub placeholder: String,
@@ -53,31 +80,46 @@ impl Redactor {
     // M4: 返 Result, 编译失败可 fail-closed (非 process panic)。
     // 规则 5: Luhn (信用卡) + base64 字符集多样性 (AWS Secret) 用代码 validator, 非正则非模型。
     pub fn new() -> std::result::Result<Self, RedactError> {
-        // (name, pattern, optional_validator)
-        let defs: [(&'static str, &str, Option<ValidatorFn>); 15] = [
+        // (name, pattern, optional_validator, validator_tag, pattern_str)
+        // issue #7: 加 validator_tag + pattern_str —— dump 暴露可序列化定义, 不改 redaction 行为。
+        let defs: [(
+            &'static str,
+            &str,
+            Option<ValidatorFn>,
+            ValidatorTag,
+            &'static str,
+        ); 15] = [
             // PEM 块 / OpenSSH / JWK —— 多行, 最高优先, 不与短模式重叠。
             (
                 "private_key",
                 r#"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----|ssh-(?:rsa|ed25519|ecdsa) [A-Za-z0-9+/=]+|"(?:d|p|q|k|n)":\s*"[^"]+""#,
                 None,
+                ValidatorTag::None,
+                r#"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----|ssh-(?:rsa|ed25519|ecdsa) [A-Za-z0-9+/=]+|"(?:d|p|q|k|n)":\s*"[^"]+""#,
             ),
             // JWT 三段式 (eyJ… . eyJ… . …) —— base64url, 全匹配。先于裸数字模式 (防 17+ 数字子串误吞)。
             (
                 "jwt",
                 r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
                 None,
+                ValidatorTag::None,
+                r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
             ),
             // OAuth bearer token (Authorization: Bearer …) —— 组 1 = token 值, 前缀 "Bearer " 保留可见。
             (
                 "oauth_bearer",
                 r"(?i)bearer\s+([A-Za-z0-9_\-\.=~:/+]+)",
                 None,
+                ValidatorTag::None,
+                r"(?i)bearer\s+([A-Za-z0-9_\-\.=~:/+]+)",
             ),
             // GCP ya29 / Azure AIza / Stripe sk_live/sk_test + 原 API key 变体。
             (
                 "api_key",
                 r"(?i)(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{24,}|sk_test_[A-Za-z0-9]{24,}|ya29\.[A-Za-z0-9_\-]{20,}|api[_-]?key\s*[:=]\s*(\S+))",
                 None,
+                ValidatorTag::None,
+                r"(?i)(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{24,}|sk_test_[A-Za-z0-9]{24,}|ya29\.[A-Za-z0-9_\-]{20,}|api[_-]?key\s*[:=]\s*(\S+))",
             ),
             // 连接串内嵌凭据 (postgres://user:pass@host, mongodb://user:pass@, redis://:pass@)。
             // 组 1 = user:pass (机密), 协议 + @host 保留可见。
@@ -85,6 +127,8 @@ impl Redactor {
                 "conn_string",
                 r"(?i)(?:postgres(?:ql)?|mongodb(?:\+srv)?|redis|mysql|amqp|ftp|sftp)://[^/\s:@]+:([^@/\s]+)@",
                 None,
+                ValidatorTag::None,
+                r"(?i)(?:postgres(?:ql)?|mongodb(?:\+srv)?|redis|mysql|amqp|ftp|sftp)://[^/\s:@]+:([^@/\s]+)@",
             ),
             // 凭据键值模式 —— 带显式标签 (password=/secret=/KEY=val), 标签证明机密意图, 优先于裸数字。
             // password/passwd/pwd 键值 —— 组 1 = 值 (值可含数字, 须先于 id_number/credit_card 免被吞)。
@@ -92,51 +136,111 @@ impl Redactor {
                 "password",
                 r#"(?i)(?:password|passwd|pwd)\s*["']?\s*[:=]\s*["']?([^\s"']+)"#,
                 None,
+                ValidatorTag::None,
+                r#"(?i)(?:password|passwd|pwd)\s*["']?\s*[:=]\s*["']?([^\s"']+)"#,
             ),
             // secret/token 通用键值 (JSON/ENV/配置) —— 组 1 = 值。补 PRD §8 "敏感字段" 语义泛化。
             (
                 "secret_kv",
                 r#"(?i)(?:secret|token|access[_-]?token)["']?\s*[:=]\s*["']?([^\s"']{6,})"#,
                 None,
+                ValidatorTag::None,
+                r#"(?i)(?:secret|token|access[_-]?token)["']?\s*[:=]\s*["']?([^\s"']{6,})"#,
             ),
             // .env 风格泛化 KEY=value (大写下划线键名 = 配置/凭据惯例) —— 组 1 = 值, 键名保留可见。
-            ("env_kv", r"(?m)^[A-Z][A-Z0-9_]{2,}=(\S+)", None),
+            (
+                "env_kv",
+                r"(?m)^[A-Z][A-Z0-9_]{2,}=(\S+)",
+                None,
+                ValidatorTag::None,
+                r"(?m)^[A-Z][A-Z0-9_]{2,}=(\S+)",
+            ),
             // .netrc 风格 password XXX —— 组 1 = 值。
-            ("netrc", r"(?i)password\s+(\S+)", None),
+            (
+                "netrc",
+                r"(?i)password\s+(\S+)",
+                None,
+                ValidatorTag::None,
+                r"(?i)password\s+(\S+)",
+            ),
             // PII: email (issue #2) —— 放凭据模式之后: 连接串 user:pass@host 的 pass@host 会被 email 吞,
             //   故须让 conn_string 先吃 (先到先拒重叠)。非数字, 与下游 id_number/phone 无重叠。
             (
                 "email",
                 r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
                 None,
+                ValidatorTag::None,
+                r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
             ),
             // PII: ipv4 (issue #2) —— \b 词边界 + validator (每段 ≤255, 边界非数字/点)。
             (
                 "ipv4",
                 r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
                 Some(valid_ipv4),
+                ValidatorTag::Ipv4,
+                r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
             ),
             // AWS Secret Access Key —— 40 字符 base64 集 (A-Za-z0-9/+=), 无 AKIA 前缀 (那是 access key id,
             // 已归 api_key)。validator 排除全同字符 (aaaa…) 防误报 + 边界校验 (regex crate 不支持
             // lookaround, 边界由 valid_aws_secret(content,s,e) 检查前后非 base64 字符)。
-            ("aws_secret", r"[A-Za-z0-9/+=]{40}", Some(valid_aws_secret)),
+            (
+                "aws_secret",
+                r"[A-Za-z0-9/+=]{40}",
+                Some(valid_aws_secret),
+                ValidatorTag::AwsSecret,
+                r"[A-Za-z0-9/+=]{40}",
+            ),
             // 信用卡号 \d{13,19} —— validator Luhn 校验 + 边界 (regex crate 不支持 lookaround,
             // 边界由 valid_luhn(content,s,e) 检查前后非数字, 防吞 id_number/phone 子串)。
-            ("credit_card", r"\d{13,19}", Some(valid_luhn)),
+            (
+                "credit_card",
+                r"\d{13,19}",
+                Some(valid_luhn),
+                ValidatorTag::Luhn,
+                r"\d{13,19}",
+            ),
             // 手机号 (中国大陆 1[3-9]\d{9}) —— validator 边界校验 (前后非数字, 防吞入更长数字)。
-            ("phone", r"1[3-9]\d{9}", Some(valid_phone)),
+            (
+                "phone",
+                r"1[3-9]\d{9}",
+                Some(valid_phone),
+                ValidatorTag::Phone,
+                r"1[3-9]\d{9}",
+            ),
             // 身份证号 \d{17}[\dXx] —— 原 4 类保留。最后: 被前面凭据标签 + 边界数字模式先吃, 仅独立 17 位裸串落此。
-            ("id_number", r"\d{17}[\dXx]", None),
+            (
+                "id_number",
+                r"\d{17}[\dXx]",
+                None,
+                ValidatorTag::None,
+                r"\d{17}[\dXx]",
+            ),
         ];
         let mut patterns = Vec::with_capacity(defs.len());
-        for (name, pat, validator) in defs {
+        for (name, pat, validator, validator_tag, pattern_str) in defs {
             patterns.push(PatternDef {
                 name,
                 re: Regex::new(pat)?,
                 validator,
+                validator_tag,
+                pattern_str,
             });
         }
         Ok(Self { patterns })
+    }
+
+    // issue #7: 暴露 15 redaction pattern 定义的可序列化 dump (guard.redact.patterns.dump)。
+    // 消费方 (fusion-gateway PII SSOT) 拉取代 vendoring, 消手动 lockstep。按 defs 优先序 (先到先拒
+    // 重叠, 长凭据先于 id_number), name+regex 逐字, validator tag 枚举。只读, 不改 redaction 行为。
+    pub fn pattern_defs(&self) -> Vec<PatternDefDump> {
+        self.patterns
+            .iter()
+            .map(|pd| PatternDefDump {
+                name: pd.name,
+                regex: pd.pattern_str,
+                validator: pd.validator_tag,
+            })
+            .collect()
     }
 
     // P0-8: 按字符边界取末4字符, 非字节切片。原 s[n-4..] 在 CJK (3字节/字)/emoji (4字节)
