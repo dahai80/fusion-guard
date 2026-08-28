@@ -1,0 +1,17 @@
+[package]
+name = "fg-es"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Endpoint Security high-risk system event monitoring — safe types + degraded fallback"
+
+[dependencies]
+fg-es-bridge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

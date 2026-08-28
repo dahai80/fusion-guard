@@ -1,0 +1,24 @@
+[project]
+name = "fusion-guard"
+version = "0.1.1"
+description = "Fusion-Guard — zero-trust action authorization + DLP firewall daemon"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Fusion-MLX Team" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "crates/fg-pyo3/Cargo.toml"
+python-source = "python"
+module-name = "fusion_guard._native"
+features = ["pyo3/extension-module"]

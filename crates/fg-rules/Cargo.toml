@@ -14,6 +14,26 @@ thiserror.workspace = true
 regex.workspace = true
 shell-words.workspace = true
 tracing.workspace = true
+# Stage 3 语义分析 (PRD §7.4 R5) — feature gate 默认关, 防内存膨胀; 开启后引 tree-sitter
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+
+[features]
+# semantic = 启用 tree-sitter 多 grammar 代码内容扫描 (CheckStage::Semantic)
+# P0-2 (audit §1.8): 默认开 —— content_type=code 的代码内容须走 tree-sitter 语义阶段
+# (原默认关致代码内容无语义扫描, os.system/eval/Command::new 等危险调用漏检)。
+# 版本锁与 fusion-executor workspace 一致 (PRD §7.4 grammar drift guard)。
+default = ["semantic"]
+semantic = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-rust",
+]
 
 [lints]
 workspace = true

@@ -23,6 +23,15 @@ start() {
     fi
     export FUSION_GUARD_SOCK="${GUARD_SOCK}"
     export FUSION_GUARD_LOG_DIR="${GUARD_DIR}/logs"
+    if [ -z "${FUSION_GUARD_TOKEN_KEY:-}" ]; then
+        local keyfile="${GUARD_DIR}/token-key"
+        if [ -r "${keyfile}" ]; then
+            export FUSION_GUARD_TOKEN_KEY="$(cat "${keyfile}")"
+        else
+            echo "[${GUARD_NAME}] WARNING: token-key file missing at ${keyfile}, Keychain prompt may appear" >&2
+            echo "  fix: echo <64-hex-chars> > ${keyfile} && chmod 600 ${keyfile}" >&2
+        fi
+    fi
     nohup "${GUARD_BIN}" start >"${GUARD_LOG}" 2>&1 &
     local pid=$!
     echo "${pid}" > "${GUARD_PID}"

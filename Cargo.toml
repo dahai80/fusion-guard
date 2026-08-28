@@ -7,13 +7,17 @@ members = [
     "crates/fg-redact",
     "crates/fg-tcc",
     "crates/fg-tcc-bridge",
+    "crates/fg-es",
+    "crates/fg-es-bridge",
+    "crates/fg-peercred",
     "crates/fg-ipc",
     "crates/fg-store",
+    "crates/fg-pyo3",
     "crates/fg-bin",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -30,6 +34,9 @@ anyhow = "1"
 
 # 异步运行时
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+
+# 异步工具 (catch_unwind for IPC handler panic guard — P0-8/P2-2)
+futures = "0.3"
 
 # 日志追踪
 tracing = "0.1"
@@ -50,6 +57,29 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 aes-gcm = "0.10"
 security-framework = "2"
 
+# 审计链式 hash 防篡改 (PRD §13.3)
+sha2 = "0.10"
+hmac = "0.12"
+# P1-2 (audit §1.6): HKDF 域分离——HMAC 链 key 与 AES-GCM token key 经不同 info label 派生,
+# 单点泄露不双失守 (防篡改链 ≠ token 机密性)。key 轮换经 versioned 派生 key。
+hkdf = "0.12"
+
+# 密钥内存安全 (P0-G1: token master key zeroize + AuditStore chain HMAC key)
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Python 绑定 (fg-pyo3) — 0.29 支持 Python 3.14, 对齐 fusion-executor fe-pyo3
+# extension-module 由 maturin 经 pyproject features=["pyo3/extension-module"] 注入;
+# workspace 不开 extension-module (rlib 测试 + in-process import 需 PyLoader)
+pyo3 = { version = "0.29" }
+
+# Stage 3 语义分析 (PRD §7.4 R5: tree-sitter 多 grammar 代码内容扫描)
+# 版本锁与 fusion-executor workspace 一致 (§7.4 共享依赖锁, 防 grammar 漂移)
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+
 # 内部 crate
 fg-core = { path = "crates/fg-core" }
 fg-rules = { path = "crates/fg-rules" }
@@ -57,12 +87,16 @@ fg-audit-engine = { path = "crates/fg-audit-engine" }
 fg-redact = { path = "crates/fg-redact" }
 fg-tcc = { path = "crates/fg-tcc" }
 fg-tcc-bridge = { path = "crates/fg-tcc-bridge" }
+fg-es = { path = "crates/fg-es" }
+fg-es-bridge = { path = "crates/fg-es-bridge" }
+fg-peercred = { path = "crates/fg-peercred" }
 fg-ipc = { path = "crates/fg-ipc" }
 fg-store = { path = "crates/fg-store" }
+fg-pyo3 = { path = "crates/fg-pyo3" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)'] }
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)', 'cfg(es_bridge_stub)'] }
 
 [profile.release]
 strip = true

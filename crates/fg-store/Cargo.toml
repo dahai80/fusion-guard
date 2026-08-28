@@ -18,12 +18,51 @@ uuid.workspace = true
 rusqlite.workspace = true
 aes-gcm.workspace = true
 security-framework.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
 rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 uuid.workspace = true
+rusqlite.workspace = true
 tempfile = "3"
+chrono.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex = "0.4"
+
+[features]
+default = []
+# test-helpers: 暴露链构造内部供集成测试注入带指定 ts 的合法链行 (rotation 测试需旧行)。
+# 非生产路径, 不默认开启。
+test-helpers = []
+
+[[test]]
+name = "rotation_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p05_chain_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p12_key_separation_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p16_audit_filter_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p17_write_split_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p21_env_key_gating_test"
+required-features = ["test-helpers"]
 
 [lints]
 workspace = true

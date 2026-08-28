@@ -23,5 +23,12 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# semantic = 透传 fg-audit-engine/semantic → fg-rules/semantic (Stage 3 tree-sitter)
+# P0-2 (audit §1.8): 默认开 —— 代码内容 (content_type=code) 须走 tree-sitter 语义阶段。
+# 仍可 --no-default-features 关闭 (极简构建, 退回 shell-words MVP, 代码内容无语义扫描)。
+default = ["semantic"]
+semantic = ["fg-audit-engine/semantic"]
+
 [lints]
 workspace = true

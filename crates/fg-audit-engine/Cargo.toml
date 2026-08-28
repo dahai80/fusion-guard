@@ -12,12 +12,30 @@ fg-rules.workspace = true
 fg-redact.workspace = true
 fg-store.workspace = true
 fg-tcc.workspace = true
+fg-es.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[features]
+# semantic = 透传 fg-rules/semantic (Stage 3 tree-sitter 代码内容扫描)
+# P0-2 (audit §1.8): 默认开 —— 代码内容 (content_type=code) 须走 tree-sitter 语义阶段。
+default = ["semantic"]
+semantic = ["fg-rules/semantic"]
+# test-helpers: 透传 fg-store/test-helpers (insert_event_at_ts 等), 供集成测试注入故障。
+test-helpers = ["fg-store/test-helpers"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+uuid.workspace = true
+
+[[test]]
+name = "p13_put_failclosed_test"
+required-features = ["test-helpers"]
 
 [lints]
 workspace = true
