@@ -81,6 +81,7 @@ fn spawn_daemon() -> (Child, PathBuf, PathBuf, PathBuf) {
         .env("FUSION_GUARD_TOKEN_KEY", TEST_KEY_HEX)
         .env("FUSION_GUARD_LOG_DIR", &log_dir)
         .env("FUSION_GUARD_ALLOW_ENV_KEY", "1")
+        .env("FUSION_GUARD_ALLOW_NO_SECRET", "1")
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -14,7 +14,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 mod authorizer;
-pub use authorizer::{AuthDecision, Authorizer, PeerAuthorizer, TenantLookup};
+pub use authorizer::{
+    require_shared_secret_for_release, AuthDecision, Authorizer, PeerAuthorizer, TenantLookup,
+};
 // P2-3: PeerUid 三态对端凭证 (区分系统调用失败 vs 跨 UID 拒绝)。
 pub use fg_peercred::PeerUid;
 use tokio::net::{UnixListener, UnixStream};
@@ -24,6 +26,12 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_CONCURRENT_REQS: usize = 16;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const REQ_TIMEOUT_SECS: u64 = 2;
+// P1-7 (audit §P1-7): 慢任务独立限流槽。慢方法 (大表 verify_chain / 联邦网络调用) 2s 超时
+// 无法取消正在执行的 spawn_blocking 阻塞任务 —— 慢请求可占满 blocking 线程池 (max_blocking_threads=64),
+// 饿死拦截路径 (guard.evaluate)。分离 slow_sem (≤ fast req_sem): 慢任务拿 slow permit 并
+// move 进 spawn_blocking 闭包持到任务真完成 (非超时即释放), 硬限并发慢任务数, 保 fast 槽给拦截。
+// 4 槽: 大表 verify / 4 节点联邦 fetch 并发够用, 不全占 blocking 池, 留 60 槽给 fast evaluate。
+const MAX_CONCURRENT_SLOW: usize = 4;
 // P1-4 (audit §2.3): permit 等待独立短超时。旧码 req_sem.acquire_owned().await 嵌在
 // 2s handler timeout 内 → permit 排队时间偷占业务预算, 高并发时 handler 实际可用 < 2s。
 // 分离: permit 单独 500ms 等待, 拿不到 → -32002 rate limit 即拒; 拿到后 2s 全程给 handler。
@@ -70,6 +78,8 @@ pub struct IpcServer {
     audit: Arc<AuditStore>,
     conn_sem: Arc<Semaphore>,
     req_sem: Arc<Semaphore>,
+    // P1-7 (audit §P1-7): 慢任务独立限流槽 —— 防大表 verify/联邦网络调用占满 blocking 池饿死拦截。
+    slow_sem: Arc<Semaphore>,
     // P1-5 (audit §3.1): 鉴权层抽 trait —— 身份解析 + 方法级鉴权纯逻辑独立单测。
     // 旧 shared_secret 字段下沉进 PeerAuthorizer (Authorizer trait 实现), server 不再重复持。
     auth: Arc<dyn Authorizer>,
@@ -112,6 +122,7 @@ impl IpcServer {
             audit,
             conn_sem: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             req_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_REQS)),
+            slow_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SLOW)),
             auth,
         }
     }
@@ -131,6 +142,27 @@ impl IpcServer {
             audit,
             conn_sem: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             req_sem: Arc::new(Semaphore::new(permits)),
+            slow_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SLOW)),
+            auth,
+        }
+    }
+
+    // P1-7 test-helpers: 自定义 slow_sem 槽数 (req_sem 保持默认 16, 确保只 slow 路径受限)。
+    // 测试预取全部 slow permit → 慢方法走 slow_sem 等待 → 500ms 超时 → -32002;
+    // 同时快方法 (ping) 仍正常 (req_sem 空, 不受 slow_sem 影响), 证两限流独立。
+    #[cfg(feature = "test-helpers")]
+    pub fn new_with_slow_permits(
+        engine: AuditEngine,
+        audit: Arc<AuditStore>,
+        slow_permits: usize,
+    ) -> Self {
+        let auth: Arc<dyn Authorizer> = Arc::new(PeerAuthorizer::new(audit.clone()));
+        Self {
+            engine: Arc::new(engine),
+            audit,
+            conn_sem: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            req_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_REQS)),
+            slow_sem: Arc::new(Semaphore::new(slow_permits)),
             auth,
         }
     }
@@ -138,6 +170,13 @@ impl IpcServer {
     #[cfg(feature = "test-helpers")]
     pub fn req_sem_handle(&self) -> Arc<Semaphore> {
         self.req_sem.clone()
+    }
+
+    // P1-7 test-helpers: 暴露 slow_sem 句柄。测试预取全部 slow permit 持有,
+    // 强制慢方法走 slow_sem 等待 → 500ms 超时 → -32002 (确定性, 验 slow 限流独立于 fast)。
+    #[cfg(feature = "test-helpers")]
+    pub fn slow_sem_handle(&self) -> Arc<Semaphore> {
+        self.slow_sem.clone()
     }
 
     pub async fn serve(self, sock: PathBuf) -> Result<()> {
@@ -199,25 +238,35 @@ impl IpcServer {
         // E6 (PRD §6.2): LOCAL_PEERCRED 校验对端 uid == 守护进程 uid (或 root)。
         // fd 必须在 into_split 前取 (split 后 stream 移动)。
         let fd = stream.as_raw_fd();
-        let peer = peer_uid(fd);
-        let our = our_uid();
-        // P1-5: 身份解析下沉 Authorizer::resolve_identity (E6 + P0-1 纯逻辑)。
-        // server 仅留 I/O 边界 (取 fd/peer_uid), 解析进 trait → 独立单测无需套接字。
-        let identity = self.auth.resolve_identity(peer, our);
-
-        let (rd, mut wr) = stream.into_split();
-        let mut reader = BufReader::with_capacity(READ_CHUNK_BYTES, rd);
-        let mut line: Vec<u8> = Vec::new();
-
-        // C17/A6: 连接级总 deadline 包整个 read+dispatch 循环。
-        // 超时即断连释放 sem 槽, 防慢速攻击 (slowloris) 无限占连接。
+        // P2-4 (audit §3.4): peer_uid 系统调用经桥接 (fg-peercred), 可能 panic。与 conn_loop
+        // 读取路径同包 catch_unwind, 防 spawned task 静默死亡。故 peer_uid + resolve_identity +
+        // conn_loop 全纳入 catch 块 (resolve_identity 虽纯逻辑, 但持 self.auth dyn dispatch)。
         let deadline = std::time::Duration::from_secs(CONN_DEADLINE_SECS);
-        let conn_fut = self.conn_loop(&mut reader, &mut wr, &mut line, identity);
-        match tokio::time::timeout(deadline, conn_fut).await {
-            Ok(inner) => inner,
+        let conn_fut = async {
+            let peer = peer_uid(fd);
+            let our = our_uid();
+            // P1-5: 身份解析下沉 Authorizer::resolve_identity (E6 + P0-1 纯逻辑)。
+            let identity = self.auth.resolve_identity(peer, our);
+
+            let (rd, mut wr) = stream.into_split();
+            let mut reader = BufReader::with_capacity(READ_CHUNK_BYTES, rd);
+            let mut line: Vec<u8> = Vec::new();
+            self.conn_loop(&mut reader, &mut wr, &mut line, identity)
+                .await
+        };
+        let conn_with_guard = AssertUnwindSafe(conn_fut).catch_unwind();
+        match tokio::time::timeout(deadline, conn_with_guard).await {
+            Ok(Ok(inner)) => inner,
+            Ok(Err(panic_payload)) => {
+                let msg = panic_msg(&panic_payload);
+                tracing::error!(
+                    panic = %msg,
+                    "handle_conn PANIC caught (P2-4 catch_unwind) — disconnecting, no silent task death"
+                );
+                Err(std::io::Error::other("connection handler panic"))
+            }
             Err(_) => {
                 tracing::warn!(
-                    peer_uid = ?peer,
                     "connection total deadline exceeded (C17/A6 slowloris guard) — disconnect"
                 );
                 Err(std::io::Error::new(
@@ -281,6 +330,19 @@ impl IpcServer {
         let id = req.id.clone();
         let method = req.method.clone();
 
+        // P2-3 (audit §3.4): JSON-RPC 协议版本必须 "2.0"。旧码解析 jsonrpc 字段但不校验值 —
+        // caller 可发 {"jsonrpc":"1.0",...} 或省略字段, 仍走完整 dispatch/审计路径, 用非标协议
+        // 污染审计 / 绕过客户端侧版本断言。协议级校验先于方法鉴权 (JSON-RPC 规范: Invalid Request
+        // 在 method dispatch 前), 返 -32600。缺字段 (serde 默认空串) 同样拒。
+        if req.jsonrpc != "2.0" {
+            tracing::warn!(
+                jsonrpc = %req.jsonrpc,
+                method = %method,
+                "invalid request: jsonrpc field must be \"2.0\" (P2-3) — rejecting with -32600"
+            );
+            return err_resp_bytes(id, -32600, "invalid request: jsonrpc must be \"2.0\"");
+        }
+
         // P1-5: E6 鉴权闸门 + §12.1 共享 secret 校验下沉 Authorizer::authorize_method。
         // 旧码内联两段 (peercred 闸 + secret 常量时间比对) 在 dispatch_arc I/O 路径, 无独立单测。
         // 现 trait 决策 → deny_resp 直出 -32001 响应; Allow 继续业务。
@@ -295,6 +357,13 @@ impl IpcServer {
         let timeout = std::time::Duration::from_secs(REQ_TIMEOUT_SECS);
         let permit_timeout = std::time::Duration::from_millis(PERMIT_TIMEOUT_MS);
 
+        // P1-7 (audit §P1-7): 慢任务独立限流。慢方法 = 全表 rehash 或联邦网络调用,
+        // 2s 超时无法取消正在执行的阻塞任务, 慢请求可占满 blocking 池饿死拦截路径。
+        // is_slow 命中 → 额外取 slow_sem permit (move 进 fut 持到任务完成), 硬限并发慢任务数。
+        // 快方法 (evaluate/redact/confirm/tcc/es/rule.*) 不受 slow_sem 约束, 走原 req_sem 路径。
+        let is_slow = is_slow_method(&method);
+        let slow_sem = self.slow_sem.clone();
+
         let req_sem = self.req_sem.clone();
         let arc = self.clone();
         let identity_owned = identity.clone();
@@ -305,6 +374,33 @@ impl IpcServer {
         // 高并发下 handler 实际可用 < 2s, 拦截路径判定时限被压缩。分离两段:
         //   1) permit 单独 500ms 等待 — 拿不到即 -32002 rate limit (fail-fast, 不占 handler 窗口)。
         //   2) 拿到 permit 后, 2s timeout 只包 spawn_blocking(handle_method) 全程给业务。
+        // P1-7: 慢方法先取 slow_sem permit (独立 500ms 超时, 拿不到 → -32002)。
+        // 慢任务池满 → 即拒, 不让慢请求排队偷占 fast req_sem 槽 (保拦截路径并发)。
+        // _slow_permit 与 _permit 同寿命 (持到 fut await 返回 = 任务完成/超时), 不在超时提前释放。
+        let _slow_permit: Option<tokio::sync::OwnedSemaphorePermit> = if is_slow {
+            match tokio::time::timeout(permit_timeout, slow_sem.acquire_owned()).await {
+                Ok(Ok(owned)) => Some(owned),
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        method = %method,
+                        "slow_sem closed — slow task rate limit (P1-7)"
+                    );
+                    return err_resp_bytes(id, -32002, "guard rate limited");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        method = %method,
+                        limit_ms = PERMIT_TIMEOUT_MS,
+                        "slow task permit wait timeout — rate limit (P1-7)"
+                    );
+                    return err_resp_bytes(id, -32002, "guard rate limited");
+                }
+            }
+        } else {
+            // 非 slow: 无 slow permit 占用, 占位 None 保 _slow_permit 变量统一生命周期。
+            None
+        };
+
         let permit_fut = req_sem.acquire_owned();
         let _permit = match tokio::time::timeout(permit_timeout, permit_fut).await {
             Ok(Ok(owned)) => owned,
@@ -544,6 +640,17 @@ impl IpcServer {
                 Ok(serde_json::json!({ "rules": rs.rules, "epoch": rs.epoch }))
             }
             "guard.rule.add" => {
+                // H-B (product-audit §5): 规则突变 (add/update/remove) 仅 admin (root) 可调。
+                // 非 admin → Forbidden (-32001, wire 与 Unauthorized 同码防 admin 枚举, 日志区分)。
+                // PRD 规则 SSOT 守护: 防普通租户用户自行改 blocklist 致拦截失效或植入恶意规则。
+                if !identity.is_admin {
+                    tracing::warn!(
+                        method = "guard.rule.add",
+                        uid = identity.uid,
+                        "rule mutation by non-admin rejected (H-B admin gate)"
+                    );
+                    return Err(GuardError::Forbidden);
+                }
                 // L7/P1: 突变前 stale-epoch 校验 (非 0 且 == 当前), 否则 -32003。
                 let caller_epoch = u_param(&req.params, "caller_epoch", 0).unwrap_or(0);
                 self.engine.check_epoch(caller_epoch)?;
@@ -558,6 +665,14 @@ impl IpcServer {
                 Ok(serde_json::json!({ "new_epoch": new_epoch }))
             }
             "guard.rule.update" => {
+                if !identity.is_admin {
+                    tracing::warn!(
+                        method = "guard.rule.update",
+                        uid = identity.uid,
+                        "rule mutation by non-admin rejected (H-B admin gate)"
+                    );
+                    return Err(GuardError::Forbidden);
+                }
                 let caller_epoch = u_param(&req.params, "caller_epoch", 0).unwrap_or(0);
                 self.engine.check_epoch(caller_epoch)?;
                 let name = s_param(&req.params, "name", 1)
@@ -578,6 +693,14 @@ impl IpcServer {
                 Ok(serde_json::json!({ "new_epoch": new_epoch }))
             }
             "guard.rule.remove" => {
+                if !identity.is_admin {
+                    tracing::warn!(
+                        method = "guard.rule.remove",
+                        uid = identity.uid,
+                        "rule mutation by non-admin rejected (H-B admin gate)"
+                    );
+                    return Err(GuardError::Forbidden);
+                }
                 let caller_epoch = u_param(&req.params, "caller_epoch", 0).unwrap_or(0);
                 self.engine.check_epoch(caller_epoch)?;
                 let name = s_param(&req.params, "name", 1)
@@ -964,6 +1087,22 @@ fn cluster_cfg_or_err() -> Result<ClusterConfig> {
         .ok_or_else(|| GuardError::Engine("cluster not configured: FUSION_GUARD_CLUSTER_TOKEN env 未设 (单节点模式, 跨节点原语不可用)".into()))
 }
 
+// P1-7 (audit §P1-7): 慢方法判定 —— 全表 rehash 或联邦网络调用, 2s 超时无法取消阻塞任务。
+// 这类方法占 blocking 线程池时间久, 须独立 slow_sem 限流 (≤ fast), 防占满池饿死拦截路径。
+// guard.audit.verify: verify_all_chains 全表 4 链 rehash (audit+tcc+rules+dead_letter), 大表慢。
+// guard.cluster.*: 联邦 HTTP 调用 (5s 超时), 网络延迟下占阻塞槽久。
+// 快方法 (evaluate/redact/reveal/confirm/tcc.*/es.*/rule.*/audit.list/ping) 即时返回, 走原 req_sem。
+fn is_slow_method(method: &str) -> bool {
+    matches!(
+        method,
+        "guard.audit.verify"
+            | "guard.cluster.audit.fetch"
+            | "guard.cluster.epoch.sync"
+            | "guard.cluster.confirm.relay"
+            | "guard.cluster.confirm.list"
+    )
+}
+
 // L8/P1: JSON-RPC params 既可对象 (named) 也可数组 (positional)。
 // 旧码 `params.get("key")` 对 Value::Array 返 None → 所有字段缺省 → content 空 → L1 pass 绕过。
 // 统一取参: 先按名取 (named), 缺则按位置 idx 取 (positional)。两者都无 → None (调用方转 -32602)。
@@ -1019,11 +1158,16 @@ fn truncate_field(s: &str, max: usize) -> String {
 fn err_code(e: &GuardError) -> i32 {
     match e {
         GuardError::Unauthorized(_) => -32001,
+        // H-B: rule mutation non-admin 拒绝与 Unauthorized 同码 (-32001) — wire 不区分
+        // (防侧信道枚举 admin 身份), 日志区分 (Display 含 "forbidden: rule mutation requires admin")。
+        GuardError::Forbidden => -32001,
         GuardError::RateLimited => -32002,
         GuardError::StaleEpoch { .. } => -32003,
         GuardError::Engine(_) => -32010,
         GuardError::InvalidParams => -32602,
         GuardError::MethodNotFound => -32601,
+        // P2-3: JSON-RPC 协议版本非 "2.0" → -32600 Invalid Request (JSON-RPC 规范码)。
+        GuardError::InvalidRequest => -32600,
         _ => -32603,
     }
 }
@@ -1040,6 +1184,10 @@ fn err_wire_msg(e: &GuardError) -> String {
         }
         GuardError::InvalidParams => "invalid params".into(),
         GuardError::MethodNotFound => "method not found".into(),
+        // H-B: wire 通用 (不暴露 admin 枚举), 日志记 forbidden 详情。
+        GuardError::Forbidden => "unauthorized".into(),
+        // P2-3: 协议版本非法的通用消息。
+        GuardError::InvalidRequest => "invalid request: jsonrpc must be 2.0".into(),
         GuardError::Engine(_) => "guard engine error".into(),
         GuardError::Serde(_) => "serialization error".into(),
         GuardError::Io(_) => "io error".into(),

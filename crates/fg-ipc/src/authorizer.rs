@@ -96,9 +96,12 @@ impl PeerAuthorizer {
         if shared_secret.is_some() {
             tracing::info!("PeerAuthorizer: shared secret loaded from env (P0-1 §12.1)");
         } else {
+            // H-C (product-audit §5): secret 缺失 = dev 模式 (仅 warn)。release 启动拒绝由
+            // fg-bin run_server 调 require_shared_secret_for_release() 兜底, 此处保持构造兼容
+            // (测试不设 secret 仍可建 server 跑断言, 避免全测试改签名)。
             tracing::warn!(
                 env = SHARED_SECRET_ENV,
-                "PeerAuthorizer: shared secret NOT set — dev mode, secret check skipped (P0-1 §12.1: prod MUST set)"
+                "PeerAuthorizer: shared secret NOT set — dev mode, secret check skipped (P0-1 §12.1: prod MUST set, release start will refuse — H-C)"
             );
         }
         Self {
@@ -115,6 +118,48 @@ impl PeerAuthorizer {
             shared_secret,
         }
     }
+}
+
+// H-C (product-audit §5): release 构建启动闸门 —— SHARED_SECRET_ENV 未设则拒绝启动。
+// 缺陷根因: PeerAuthorizer::new 在 secret 缺失时仅 warn (dev 容错), 但 release 部署若也漏设,
+// 守护进程照常启动且 secret 校验跳过 → 仅 peercred (同 uid) 兜底, 无第二因子; 同 uid 任意进程
+// (含被攻陷的 subagent) 可全权调规则突变/可逆脱敏 reveal。prod MUST 显式设 secret。
+// 此函数供 fg-bin run_server 在 IpcServer::new 后调: release (not debug_assertions) 且 secret 缺 → Err。
+// dev 测试不调此 (容 secret 缺, 避全测试改签名); 显式 FUSION_GUARD_ALLOW_NO_SECRET=1 放行 (应急运维)。
+// 规则 5: 决策用代码 (cfg + env 读), 非 token 推断; 纯函数可单测。
+pub fn require_shared_secret_for_release() -> std::result::Result<(), String> {
+    // dev 构建跳过 (debug_assertions = true) —— 容 secret 缺。
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let secret = std::env::var(SHARED_SECRET_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
+    if secret.is_some() {
+        return Ok(());
+    }
+    // 应急放行 flag (运维知晓风险显式设): 非 prod 推荐路径, 但防锁死。
+    let allow_no_secret = std::env::var("FUSION_GUARD_ALLOW_NO_SECRET")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_no_secret {
+        tracing::warn!(
+            "H-C: release build starting WITHOUT shared secret (FUSION_GUARD_ALLOW_NO_SECRET=1 set) — \
+             peercred-only auth, INSECURE; remove this flag for prod"
+        );
+        return Ok(());
+    }
+    tracing::error!(
+        env = SHARED_SECRET_ENV,
+        "H-C: release build refusing to start — shared secret unset. \
+         Set {} to a strong random value (second auth factor beyond peercred), \
+         or set FUSION_GUARD_ALLOW_NO_SECRET=1 only for emergency insecure operation.",
+        SHARED_SECRET_ENV
+    );
+    Err(format!(
+        "refusing to start: {} unset in release build (H-C); set it or FUSION_GUARD_ALLOW_NO_SECRET=1 for insecure bypass",
+        SHARED_SECRET_ENV
+    ))
 }
 
 impl Authorizer for PeerAuthorizer {

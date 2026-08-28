@@ -24,8 +24,8 @@ nix.workspace = true
 libc.workspace = true
 
 [features]
-# test-helpers: 暴露 new_with_req_permits (自定义 req_sem 槽数) 供集成测试
-# 确定性填满槽位验证 permit 超时 (P1-4), 不进生产路径。
+# test-helpers: 暴露 new_with_req_permits/new_with_slow_permits (自定义 req_sem/slow_sem 槽数)
+# 供集成测试确定性填满槽位验证 permit 超时 (P1-4/P1-7), 不进生产路径。
 test-helpers = []
 
 [dev-dependencies]
@@ -42,6 +42,10 @@ required-features = ["test-helpers"]
 
 [[test]]
 name = "p15_authorizer_test"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "p17_slow_sem_test"
 required-features = ["test-helpers"]
 
 [lints]

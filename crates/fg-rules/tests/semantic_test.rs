@@ -130,3 +130,55 @@ fn semantic_check_empty() {
     assert!(semantic::semantic_check("").is_empty());
     assert!(semantic::semantic_check("   ").is_empty());
 }
+
+// ── P2-1 (audit §P2-1): 语义扫描输入上限 + 性能基线 ──────────────────────
+
+// P2-1: 输入超 SEMANTIC_INPUT_CAP → 跳过 tree-sitter 解析, 返 L2 降级提示 (非静默 clean)。
+// fail-open (regex/tokenizer 仍扫), 但审计可见降级 —— 防大输入突破 2s SLA。
+#[test]
+fn semantic_check_oversized_input_degrades() {
+    let cap = semantic::SEMANTIC_INPUT_CAP;
+    let huge = "x".repeat(cap + 1);
+    let hits = semantic::semantic_check(&huge);
+    assert_eq!(hits.len(), 1, "P2-1: 超上限须返单条降级 hit");
+    assert_eq!(hits[0].risk, RiskLevel::L2);
+    assert_eq!(hits[0].callee, "<input-too-large>");
+    assert_eq!(hits[0].stage, CheckStage::Semantic);
+}
+
+// P2-1: 上限内 (cap) 正常解析, 不降级。
+#[test]
+fn semantic_check_at_cap_parses_normally() {
+    let cap = semantic::SEMANTIC_INPUT_CAP;
+    // cap 内含真实危险调用 → 正常语义命中 (非降级)。
+    let pad = "x".repeat(cap - 64);
+    let code = format!("os.system('id')\n{}", pad);
+    let hits = semantic::semantic_check(&code);
+    assert!(
+        hits.iter().any(|h| h.callee.contains("os.system")),
+        "P2-1: 上限内须正常语义命中 os.system"
+    );
+}
+
+// P2-1: 性能基线 —— 上限内大代码块经语言启发式门控 (clean Python → 1 grammar 解析) 须在 SLA 内。
+// PRD R1: regex/AST p99<10ms, 2s 硬超时; 语义允松但大输入不突破。量化语义路径 p99。
+// 启发式猜 python (def 关键字) → 只试 Python grammar → 1× 解析, 不触发 3 非原生 grammar 错恢复。
+#[test]
+fn semantic_check_perf_baseline_under_cap() {
+    let cap = semantic::SEMANTIC_INPUT_CAP;
+    let unit = "def f():\n    return 1 + 2\n";
+    let mut code = String::new();
+    while code.len() + unit.len() <= cap {
+        code.push_str(unit);
+    }
+    let start = std::time::Instant::now();
+    let hits = semantic::semantic_check(&code);
+    let elapsed = start.elapsed();
+    assert!(hits.is_empty(), "P2-1: clean code 无命中");
+    // SLA: 启发式 1-grammar 解析 < 500ms (256KB Python 单 grammar, 2s 硬超时留充裕余量)。
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "P2-1: 上限内启发式 1-grammar 解析须 < 500ms (SLA guard), got {:?}",
+        elapsed
+    );
+}

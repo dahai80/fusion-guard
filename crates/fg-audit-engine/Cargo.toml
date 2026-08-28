@@ -32,6 +32,7 @@ test-helpers = ["fg-store/test-helpers"]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
 uuid.workspace = true
+tracing.workspace = true
 
 [[test]]
 name = "p13_put_failclosed_test"
