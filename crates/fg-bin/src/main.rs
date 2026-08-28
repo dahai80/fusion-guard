@@ -73,9 +73,22 @@ fn data_dir() -> PathBuf {
     home.join(".fusion-guard")
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     init_tracing();
+    // soak/商用: 显式 runtime 限 blocking 线程池 + 栈大小。
+    // 默认 max_blocking_threads=512 × 2MB 栈 = 潜在 1GB, 高并发 evaluate 全走 spawn_blocking
+    // (SQLite Mutex + 链 hash 阻塞) 时池涨满占大量 RSS。64 线程 × 256KB 栈 = 16MB, 足够
+    // 16 req_sem 并发 (实际并发 handler ≤ MAX_CONCURRENT_REQS=16), 512 纯浪费。
+    // worker_threads=CPU 核数保持 (异步 IO); blocking 池独立给 spawn_blocking。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(64)
+        .thread_stack_size(256 * 1024)
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
@@ -99,6 +112,9 @@ async fn run_server(sock: PathBuf, insecure_env_key: bool) -> anyhow::Result<()>
     }
     let db_path = data_dir().join("guard.db");
     let audit = Arc::new(AuditStore::open(&db_path)?);
+    // soak/商用: 周期 retention 监控覆盖 drain 低风险路径 (drain 只插不触 rotation)。
+    // 5s 间隔 —— 高频 L1 流量下 DB 涨快, 60s 太慢 (突发已超 rotation 阈值)。
+    audit.spawn_retention_monitor(5);
     let engine = AuditEngine::new(audit.clone())?;
     let server = IpcServer::new(engine, audit);
 

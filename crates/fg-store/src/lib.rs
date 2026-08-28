@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -908,6 +909,38 @@ impl AuditStore {
         Ok(report)
     }
 
+    // soak/商用: 周期 retention 监控线程。drain 线程只插低风险行, 不触 enforce_retention
+    // (P0-4 retention 原只在 sync append_event 高风险路径调)。高频 L1 流量下 audit_events
+    // 涨无 rotation 检查 → 长跑 OOM。此线程周期调 enforce_retention, 覆盖低风险积累路径
+    // (rotation 阈值 100MB/30d 达到则归档+VACUUM 回收页)。interval_secs 默认 5s —— drain
+    // 高频写入, 60s 太慢 (短跑/突发流量 DB 已涨超阈值); 5s 足够及时触发 rotation+VACUUM。
+    pub fn spawn_retention_monitor(self: &Arc<Self>, interval_secs: u64) {
+        let store = self.clone();
+        std::thread::Builder::new()
+            .name("fg-audit-retention".into())
+            .spawn(move || {
+                let interval = Duration::from_secs(interval_secs.max(1));
+                loop {
+                    std::thread::sleep(interval);
+                    match store.enforce_retention() {
+                        Ok(r) => {
+                            if r.archived_rows > 0 || r.pruned_archives > 0 {
+                                tracing::info!(
+                                    archived = r.archived_rows,
+                                    pruned = r.pruned_archives,
+                                    "retention monitor cycle (drain path coverage)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "retention monitor cycle failed");
+                        }
+                    }
+                }
+            })
+            .expect("spawn retention monitor");
+    }
+
     // P0-4: rotation 主体。决定归档窗口 (超 ROTATE_AGE_DAYS 或 db 超 ROTATE_BYTES),
     // 写 NDJSON + 删行 + 更新 checkpoint, 单 audit_writer 事务 (H7 耐久)。
     fn rotate_old_rows(&self, report: &mut RetentionReport) -> rusqlite::Result<()> {
@@ -917,9 +950,13 @@ impl AuditStore {
 
         // 触发条件 1: 有超 ROTATE_AGE_DAYS 的行。条件 2: db 文件超 ROTATE_BYTES (此时归档最旧段
         // 不论年龄, 降到阈值下)。先查超龄行数, 0 且 db 未超 → 跳过。
-        let w = self.audit_writer.lock();
-        let mut w = recover_lock!(w, "audit writer (rotate)");
-        let aged_count: i64 = w.query_row(
+        // A3/soak: 检查阶段 + 选待归档行用 read_conn (query_only, 不抢 audit_writer 写锁) ——
+        // 原实现整段持 audit_writer 跑 COUNT 扫表 + SELECT 选行, 即使无 rotate 也锁住所有审计写
+        // (append_event 高风险同步路径自 DoS, retention monitor 5s 周期持锁空查 → 吞吐骤降)。
+        // 仅删行+checkpoint+VACUUM (真 mutate) 才锁 audit_writer。TOCTOU 安全: rowid 单调增,
+        // 读到的旧 rowid 不被并发插入删除, 删按 rowid 区间 [min,max], 新插 rowid>max 不受影响。
+        let r = recover_lock!(self.read_conn.lock(), "read conn (rotate check)");
+        let aged_count: i64 = r.query_row(
             "SELECT COUNT(*) FROM audit_events WHERE ts < ?1",
             params![age_cutoff_str],
             |r| r.get(0),
@@ -940,7 +977,7 @@ impl AuditStore {
         // 取待归档行 (ORDER BY rowid ASC = 最旧优先)。超龄 → 全部超龄行; 仅 size 触发 → 最旧段
         // (按 rowid 限量, 一次归档最多 50000 行防长事务锁库)。
         let limit = if aged_count > 0 { aged_count } else { 50000 };
-        let mut stmt = w.prepare(
+        let mut stmt = r.prepare(
             "SELECT audit_id, ts, event_type, tenant_id, requester, action,
                     inferred_category, verdict_json, approved_by, seatbelt_required, outcome,
                     prev_hash, event_hash, key_version, rowid
@@ -950,6 +987,7 @@ impl AuditStore {
             .query_map(params![limit], row_to_event_with_rowid)?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
+        drop(r);
         if to_archive.is_empty() {
             return Ok(());
         }
@@ -998,6 +1036,9 @@ impl AuditStore {
         }
 
         // 删行: 单事务, audit_writer (synchronous=FULL) 断电不丢 H7。
+        // A3/soak: 仅此 mutate 段锁 audit_writer (检查+选行已用 read_conn 完成, 无锁读)。
+        let w = self.audit_writer.lock();
+        let mut w = recover_lock!(w, "audit writer (rotate delete)");
         let tx = w.transaction()?;
         tx.execute(
             "DELETE FROM audit_events WHERE rowid >= ?1 AND rowid <= ?2",

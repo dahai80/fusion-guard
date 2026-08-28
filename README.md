@@ -176,6 +176,8 @@ event_3: prev_hash=event_hash_2,    event_hash=SHA256(event_hash_2 || payload_3)
 - **Retention (冷存到期)**: 同次扫描归档目录, 文件名时间戳超 `RETENTION_DAYS` (180d) 的 `.ndjson` 删除 (按文件名非 mtime — mtime 可被 touch/cp 篡改)。生产归档目录 `~/.fusion-guard/audit-archive/` (env `FUSION_GUARD_ARCHIVE_DIR` 覆盖)。
 - **归档边界链连续**: 归档后剩余首行的 `prev_hash` 指向已归档行 (主库内悬空)。全表 verify 会误报 broken → 故归档后写 checkpoint 锚定剩余首行 (走增量, 跳过悬空段)。空库归档态 (全段已归档删): checkpoint 用空 `last_verified_audit_id` 哨兵 + `last_archived_hash`, verify 从归档段末 hash 作 `expected_prev` 续扫; 下次插入也读 `last_archived_hash` 作 `prev_hash` (续链非 genesis)。
 - **per-store 归档目录**: 非全局 env — `resolve_archive_dir(db_path)` 从 db 同级 `audit-archive/` 解析 (env 覆盖仍优先)。隔离并发测试 store 不抢同一 env; 生产单守护进程单 DB 单归档目录语义不变。
+- **Retention monitor (drain 路径覆盖)**: `enforce_retention` 原只在高风险 `append_event` 同步路径调, drain 线程只插 L1/L2 低风险行不触 rotation → 高频低风险流量下 audit_events 无界增长。守护进程启动 `spawn_retention_monitor(interval_secs=5)` 周期调 `enforce_retention` 覆盖低风险积累 (商用阻塞点 #6 soak 发现)。
+- **rotate 锁优化**: `rotate_old_rows` 检查阶段 (COUNT 超龄行 + db_bytes 判阈值) + 选待归档行改用 `read_conn` (query_only, 不抢 `audit_writer` 写锁), 仅删行 + checkpoint + VACUUM mutate 段锁 `audit_writer`。原实现整段持写锁跑空检查 → append_event 高风险同步路径自 DoS + 5s monitor 持锁空查吞吐骤降。30s soak: throughput +24%, p99 −20ms。TOCTOU 安全: rowid 单调增, 删按 rowid 区间, 并发插入不受影响。
 
 ## 安全审计修复 (audit-0827)
 
@@ -294,6 +296,25 @@ make check    # lint + test
 ```
 
 代码规范: 4 空格缩进, 无 docstring, 必带日志, `unsafe_code = "deny"` (workspace lint)。
+
+### 压测 / soak (商用阻塞点 #6)
+
+`crates/fg-ipc/tests/soak_test.rs` — 长跑并发压测, 验生产形态: 持续高并发负载下延迟不退化、子进程内存不泄漏、fail-closed 不破。
+
+```bash
+# 先建 release daemon (soak spawn 子进程, 非在进程内)
+cargo build --release -p fg-bin
+
+# 跑 soak (需 release binary, 缺失自动 skip 不挂全套 cargo test)
+export FUSION_GUARD_TOKEN_KEY=$(python3 -c "import secrets;print(secrets.token_hex(32))")
+cargo test -p fg-ipc --test soak_test -- --nocapture
+```
+
+模型: spawn `target/release/fusion-guard start` 子进程 (隔离 SOCK+DATA_DIR+TOKEN_KEY+LOG_DIR), 48 并发 UDS 连接循环 `guard.evaluate` 跑 10s, 每 2s 采子进程 RSS (`ps -o rss=`) + DB 磁盘占用。子进程模式 = RSS 量纯 server, 无客户端线程栈/malloc 污染, 无 debug 膨胀。
+
+断言: 吞吐 ≥5000 reqs/10s, 错误率 <1%, p50 ≤25ms, p99 ≤200ms, DB 磁盘 ≤200MB (rotation 有界), daemon RSS ≤1200MB (容 macOS libmalloc 不归还 + tokio 池驻留)。fail-closed 用例 (`rm -rf /`) 验 Block L4 高并发下不误判 allow。
+
+**测试前置**: `cargo test` 必先 `export FUSION_GUARD_TOKEN_KEY=<hex 32B>`, 否则 `AuditStore::open` → macOS Keychain `SecItemCopyMatching` 非交互环境挂 60s+。
 
 ## 路线图 (PRD §17)
 
