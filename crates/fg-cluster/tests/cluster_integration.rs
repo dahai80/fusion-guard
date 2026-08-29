@@ -26,8 +26,23 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+
+// workspace 并发跑时 fg-cluster 与其他 crate 测试竞争 CPU, 多个 mock server 并行 accept
+// + 2ms 轮询 → 偶发 path 解析空 → 500 flake (primitive2_epoch_advance / primitive3_confirm_list_by_epoch)。
+// 序列化锁: 全测试文件串行 (每测独占 mock), 消并发竞争。单个 crate 测试本就快 (<0.1s), 串行无感。
+fn serial_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+// 测试用宏: 取序列化锁 (Drop 自动释), 保 mock server 单测独占。
+macro_rules! serial {
+    () => {
+        let _guard = serial_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
 
 const TOKEN: &str = "cluster-test-token-12345";
 
@@ -49,16 +64,21 @@ impl MockMaster {
         let port = listener.local_addr().expect("addr").port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_cloned = stop.clone();
+        // 阻塞 accept + 短超时轮询 stop 标志 (原 nonblocking + 2ms sleep 在 workspace 并发编译
+        // CPU 竞争下 accept 延迟, reqwest 已连+发, mock 轮询晚 accept 读半截 → path 空 → 500 flaky)。
+        // 阻塞 accept 让 mock 在连接到达时即时处理, stop 检测靠 accept 超时返回 WouldBlock。
         listener.set_nonblocking(true).expect("nonblocking");
         let handler = Arc::new(handler);
         let handle = thread::spawn(move || {
+            // 用 50ms 短超时唤醒查 stop, 非 2ms 空 sleep (CPU 竞争下 2ms 频轮询反拖慢)。
+            let dur = std::time::Duration::from_millis(50);
             while !stop_cloned.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         handle_conn(stream, &handler);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(2));
+                        thread::sleep(dur);
                     }
                     Err(_) => break,
                 }
@@ -172,6 +192,7 @@ fn canonical_full(record: &AuditChainRecord) -> Vec<u8> {
 
 #[test]
 fn primitive1_audit_fetch_and_verify_clean_chain() {
+    serial!();
     let key = derive_audit_chain_key(TOKEN);
     let r0 = make_record(1, "", &key, "a0");
     let full0 = hex::encode(Sha256::digest(&canonical_full(&r0)));
@@ -203,6 +224,7 @@ fn primitive1_audit_fetch_and_verify_clean_chain() {
 
 #[test]
 fn primitive1_audit_fetch_detects_tampered_record() {
+    serial!();
     let key = derive_audit_chain_key(TOKEN);
     let mut r0 = make_record(1, "", &key, "a0");
     r0.action = "tampered".into();
@@ -230,6 +252,7 @@ fn primitive1_audit_fetch_detects_tampered_record() {
 
 #[test]
 fn primitive2_epoch_get() {
+    serial!();
     let body = json!({"epoch": 5, "advanced_at": "2026-08-28T10:00:00Z"}).to_string();
     let expected_auth = format!("Bearer {TOKEN}");
     let server = MockMaster::start(move |path, _, auth| {
@@ -247,6 +270,7 @@ fn primitive2_epoch_get() {
 
 #[test]
 fn primitive2_epoch_advance() {
+    serial!();
     let body = json!({"epoch": 7, "advanced_at": "2026-08-28T11:00:00Z"}).to_string();
     let expected_auth = format!("Bearer {TOKEN}");
     let server = MockMaster::start(move |path, method, auth| {
@@ -265,6 +289,7 @@ fn primitive2_epoch_advance() {
 
 #[test]
 fn primitive3_confirm_relay_mac_interop_bidirectional() {
+    serial!();
     // 双向 MAC 互操作: 客户端签 MAC, mock 端独立验签 (同 key scheme) — 证 wire 上 MAC 正确。
     let confirm_key = derive_confirm_relay_key(TOKEN);
     let ok_body = json!({
@@ -305,6 +330,7 @@ fn primitive3_confirm_relay_mac_interop_bidirectional() {
 
 #[test]
 fn primitive3_confirm_list_by_epoch() {
+    serial!();
     let body = json!({
         "confirms": [{"confirm_id": "c1", "node_id": "n1"}], "count": 1
     })
@@ -324,6 +350,7 @@ fn primitive3_confirm_list_by_epoch() {
 
 #[test]
 fn cluster_not_configured_returns_none_single_node_mode() {
+    serial!();
     std::env::remove_var("FUSION_GUARD_CLUSTER_TOKEN");
     assert!(
         ClusterConfig::from_env().is_none(),
@@ -333,6 +360,7 @@ fn cluster_not_configured_returns_none_single_node_mode() {
 
 #[test]
 fn http_error_fail_closed() {
+    serial!();
     let server = MockMaster::start(|_path, _, _| (500, "master down".into()));
     let client = ClusterClient::new(server.cfg()).unwrap();
     let err = client.get_rule_epoch().unwrap_err();

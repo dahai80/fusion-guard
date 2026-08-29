@@ -4,9 +4,10 @@ use std::cmp::Reverse;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
-// issue #10: 凭据模式子集名 (非 PII)。消费方用 redact_credentials() 或 redact_with_patterns()
-// 配此常量, 避免硬编码名随 defs 演化漂移。PII 子集 = email/ipv4/credit_card/phone/id_number,
-// 由消费方自脱 (fusion-memory 自带更准的本地化 PII 逻辑)。
+// issue #10/#13: 凭据模式子集名 (非 PII)。消费方用 redact_credentials() 或 redact_with_patterns()
+// 配此常量, 避免硬编码名随 defs 演化漂移。PII 子集 = email/ipv4/credit_card/phone/id_number ——
+// issue #13 修复后 (id_number GB 校验/前序 + phone 接受 +86) PII 行为已正确, 消费方可路由 PII 经
+// fg-redact; redact_credentials() 仍保留供仅需凭据子集的场景。
 pub const CREDENTIAL_PATTERNS: &[&str] = &[
     "private_key",
     "jwt",
@@ -53,8 +54,8 @@ pub struct PatternDefDump {
     pub validator: ValidatorTag,
 }
 
-// issue #7: validator 标签枚举 (serde lowercase = issue 契约 "none"|"ipv4"|"aws_secret"|"luhn"|"phone")。
-// 非 fn 指针 —— IPC payload 需可序列化, 消费方按 tag 重实现。
+// issue #7: validator 标签枚举 (serde snake_case = issue 契约 "none"|"ipv4"|"aws_secret"|"luhn"|"phone"|"id_card")。
+// 非 fn 指针 —— IPC payload 需可序列化, 消费方按 tag 重实现。issue #13 加 IdCard (GB 11643 身份证校验)。
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorTag {
@@ -63,6 +64,7 @@ pub enum ValidatorTag {
     AwsSecret,
     Luhn,
     Phone,
+    IdCard,
 }
 
 pub struct ReversibleMatch {
@@ -206,8 +208,21 @@ impl Redactor {
                 ValidatorTag::AwsSecret,
                 r"[A-Za-z0-9/+=]{40}",
             ),
+            // 身份证号 \d{17}[\dXx] —— issue #13 缺陷 1+2 修复: 加 GB 11643-1999 mod-11 校验 (valid_id_card),
+            // 且排 credit_card 之前 (先到先拒重叠)。原排最后 + 无校验 → (缺陷 2) 任意 18 位数字串
+            // (订单号/时间戳) 误吞; (缺陷 1) credit_card \d{13,19}+Luhn 先吞 17 位前导数字, 剩尾 X 悬空
+            // (...credit_card]X)。现 GB 校验通过者先吃全 18 字符 → id_number 标签, 无悬空。
+            (
+                "id_number",
+                r"\d{17}[\dXx]",
+                Some(valid_id_card),
+                ValidatorTag::IdCard,
+                r"\d{17}[\dXx]",
+            ),
             // 信用卡号 \d{13,19} —— validator Luhn 校验 + 边界 (regex crate 不支持 lookaround,
             // 边界由 valid_luhn(content,s,e) 检查前后非数字, 防吞 id_number/phone 子串)。
+            // issue #13: id_number 现排前, 合法身份证 (18 字符, GB 通过) 先被 id_number 吞, credit_card
+            // 不再吃其 17 位前导数字 (重叠拒) —— 消悬空 X 尾。Luhn 边界拒仍防独立 16-17 位数字串误判。
             (
                 "credit_card",
                 r"\d{13,19}",
@@ -215,21 +230,16 @@ impl Redactor {
                 ValidatorTag::Luhn,
                 r"\d{13,19}",
             ),
-            // 手机号 (中国大陆 1[3-9]\d{9}) —— validator 边界校验 (前后非数字, 防吞入更长数字)。
+            // 手机号 (中国大陆, issue #13 接受 +86/0086 国际前缀) —— validator 边界校验 (前后非数字)。
+            // 原 1[3-9]\d{9} 拒 +86/0086 前缀 (缺陷 3); 现 (?:\+86|0086)? 可选前缀。新 span 含前缀,
+            // valid_phone 边界检查 span 前一字符 (+86 的 '+' / 0086 的 '0' 前一字符) —— 若前缀前为数字
+            // (如 "20086139…", span 从 idx1 '0086' 起, start-1='2' 数字) → 边界拒, 不误吞更长数字子段。
             (
                 "phone",
-                r"1[3-9]\d{9}",
+                r"(?:\+86|0086)?1[3-9]\d{9}",
                 Some(valid_phone),
                 ValidatorTag::Phone,
-                r"1[3-9]\d{9}",
-            ),
-            // 身份证号 \d{17}[\dXx] —— 原 4 类保留。最后: 被前面凭据标签 + 边界数字模式先吃, 仅独立 17 位裸串落此。
-            (
-                "id_number",
-                r"\d{17}[\dXx]",
-                None,
-                ValidatorTag::None,
-                r"\d{17}[\dXx]",
+                r"(?:\+86|0086)?1[3-9]\d{9}",
             ),
         ];
         let mut patterns = Vec::with_capacity(defs.len());
@@ -368,11 +378,11 @@ impl Redactor {
         out
     }
 
-    // issue #10: 仅脱敏凭据子集 (CREDENTIAL_PATTERNS), 跳过 PII (email/ipv4/credit_card/
-    // phone/id_number)。消费方 (fusion-memory) 自带更准的 PII 脱敏, 只需 fg-redact 补凭据覆盖
-    // (private_key/jwt/bearer/api_key/conn_string/password/secret_kv/env_kv/netrc/aws_secret),
-    // 不接受 fg-redact 的 PII (idcard 被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被拒)。
-    // 同 collect_spans 的优先序+重叠语义, 子集只跳过 PII 模式。无 redact() 行为变更。
+    // issue #10/#13: 仅脱敏凭据子集 (CREDENTIAL_PATTERNS), 跳过 PII (email/ipv4/credit_card/
+    // phone/id_number)。issue #13 前消费方 (fusion-memory) 因 fg-redact PII 3 缺陷 (idcard 被
+    // credit_card 错吞 / id_number 误吞长数字 / +86 phone 被拒) 自带本地 PII 脱敏, 只取凭据子集。
+    // issue #13 修复后 PII 行为正确, 消费方可退役本地 PII 逻辑改路由 fg-redact; 本方法仍供仅需
+    // 凭据子集的场景。同 collect_spans 优先序+重叠语义, 子集只跳过 PII 模式。无 redact() 行为变更。
     pub fn redact_credentials(&self, content: &str) -> String {
         self.redact_with_patterns(content, CREDENTIAL_PATTERNS)
     }
@@ -528,6 +538,48 @@ fn valid_luhn(content: &str, start: usize, end: usize) -> bool {
         double = !double;
     }
     sum.is_multiple_of(10)
+}
+
+// issue #13 缺陷 1+2 (规则 5: 确定性校验用代码): 身份证号 GB 11643-1999 mod-11 校验 + 数字边界。
+// 原因: \d{17}[\dXx] 无 validator → 任意 18 位数字串 (订单号/时间戳) 误吞 (缺陷 2); 且排 credit_card
+// 之后被 \d{13,19}+Luhn 吞 17 位前导数字剩悬空 X (缺陷 1)。加校验位算法确认真实身份证。
+// GB 11643-1999: 前 17 位各位 × 权重 [7,9,10,5,8,4,2,1,6,3,7,9,10,5,8,4,2] 求和, sum%11 映射
+// 校验码 ['1','0','X','9','8','7','6','5','4','3','2'], 末位 (0-9 或 X/x=10) 须匹配。
+// 例 (Python 验算): 110101199003077651 → 前缀 11010119900307765, sum=242, 242%11=0 → '1' == '1' ✓ 合法;
+//     11010119900307889X → 前缀 11010119900307889, sum=266, 266%11=2 → 'X' == 'X' ✓ 合法 (尾 X);
+//     110101199003077658 → sum=242 → '1' ≠ '8' 拒; 110101199003077654 → '1' ≠ '4' 拒 (旧测试 id)。
+//     订单号 999999999999999999 → sum=900, 900%11=9 → '3' ≠ '9' 拒 (缺陷 2 修复)。
+fn valid_id_card(content: &str, start: usize, end: usize) -> bool {
+    let bytes = content.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_digit() {
+        return false;
+    }
+    if end < bytes.len() && bytes[end].is_ascii_digit() {
+        return false;
+    }
+    let s = &content[start..end];
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() != 18 {
+        return false;
+    }
+    const WEIGHTS: [u64; 17] = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+    const CHECK: [char; 11] = ['1', '0', 'X', '9', '8', '7', '6', '5', '4', '3', '2'];
+    let mut sum: u64 = 0;
+    for (i, c) in chars[..17].iter().enumerate() {
+        let d = match c {
+            '0'..='9' => (*c as u64) - 48,
+            _ => return false,
+        };
+        sum += d * WEIGHTS[i];
+    }
+    let expected = CHECK[(sum % 11) as usize];
+    let last = chars[17];
+    let actual = match last {
+        '0'..='9' => last,
+        'X' | 'x' => 'X',
+        _ => return false,
+    };
+    actual == expected
 }
 
 // P1-1 (audit §1.10, 规则 5): AWS Secret Access Key 假阳性防御 —— 40 字符 base64 集。validator

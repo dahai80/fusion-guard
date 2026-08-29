@@ -1,6 +1,7 @@
 // issue #7: guard.redact.patterns.dump 暴露 15 redaction pattern 定义的可序列化 dump。
 // 验证: 返回 patterns 数组 (15 条), 每条带 name/regex/validator tag, 优先序保留 (先到先拒重叠),
-// validator tag 枚举 none|ipv4|aws_secret|luhn|phone。只读 dump, 不改 redaction 行为。
+// validator tag 枚举 none|ipv4|aws_secret|luhn|phone|id_card (issue #13 加 id_card)。
+// 只读 dump, 不改 redaction 行为。
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -94,7 +95,7 @@ async fn redact_patterns_dump_returns_all_definitions() {
     );
 
     // 字段完整 + validator tag 枚举合法。
-    let valid_tags = ["none", "ipv4", "aws_secret", "luhn", "phone"];
+    let valid_tags = ["none", "ipv4", "aws_secret", "luhn", "phone", "id_card"];
     for p in patterns {
         assert!(p["name"].is_string(), "每条须带 name");
         assert!(p["regex"].is_string(), "每条须带 regex");
@@ -121,7 +122,8 @@ async fn redact_patterns_dump_preserves_priority_order() {
         .map(|p| p["name"].as_str().unwrap())
         .collect();
 
-    // 凭据标签模式须先于裸数字模式 (id_number 最后)。
+    // 凭据标签模式须先于裸数字模式 (id_number 现排 credit_card 之前 — issue #13 GB 校验须先吞全 18 字符,
+    // 防 credit_card 吞 17 位前导数字剩悬空尾字符)。
     let pos_private_key = names.iter().position(|n| *n == "private_key").unwrap();
     let pos_jwt = names.iter().position(|n| *n == "jwt").unwrap();
     let pos_api_key = names.iter().position(|n| *n == "api_key").unwrap();
@@ -152,7 +154,7 @@ async fn redact_patterns_dump_preserves_priority_order() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// validator 标签精确映射: 仅 ipv4/aws_secret/credit_card/phone 带算法 validator, 余 none。
+// validator 标签精确映射: 仅 ipv4/aws_secret/credit_card/phone/id_number 带算法 validator, 余 none。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redact_patterns_dump_validator_tags_exact() {
     let (db, sock) = ensure_env();
@@ -182,6 +184,11 @@ async fn redact_patterns_dump_validator_tags_exact() {
         "credit_card 须带 luhn validator"
     );
     assert_eq!(tag_of("phone"), "phone", "phone 须带 phone validator");
+    assert_eq!(
+        tag_of("id_number"),
+        "id_card",
+        "id_number 须带 id_card validator (issue #13 GB 11643 校验)"
+    );
     // 无算法 validator 的模式须标 none。
     for n in [
         "private_key",
@@ -194,7 +201,6 @@ async fn redact_patterns_dump_validator_tags_exact() {
         "env_kv",
         "netrc",
         "email",
-        "id_number",
     ] {
         assert_eq!(tag_of(n), "none", "{n} 须标 none (无算法 validator)");
     }
