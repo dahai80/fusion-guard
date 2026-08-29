@@ -43,6 +43,7 @@ Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审�
 | Python wheel 打包 (maturin pyproject.toml, issue #5) | ✅ |
 | 跨节点集群消费方 fg-cluster (HKDF 域分离 3 MAC key + federated 链验证, issue #4 / multi-nodes#52) | ✅ |
 | guard.cluster.audit.fetch / epoch.sync / confirm.relay / confirm.list (4 IPC) | ✅ |
+| shared secret macOS Keychain 来源 + release gate H-C (--insecure-secret-env / ALLOW_INSECURE_SECRET, ALLOW_NO_SECRET 应急) | ✅ |
 
 ## 架构
 
@@ -239,6 +240,14 @@ event_3: prev_hash=event_hash_2,    event_hash=SHA256(event_hash_2 || payload_3)
 - **M9 json_to_py 直转**: fg-pyo3 `Value` → Python 递归直转 (非 `to_string` + `json.loads` 往返), f64 精度保真, 零 import。
 - **P1/P2 regex 单扫**: `Lazy`/`OnceLock` 静态化 regex; `redact_counted` 单趟返 `(脱敏, 命中数)` 取代 has_sensitive+redact 二扫。
 
+### 产品商用审计修复 sweep (product-audit-0827)
+
+依据 `audit/fusion-guard-audit-result-product-0827.md` (产品商用判定) 落地。与 audit-0827 静态对抗审查不同 wave, 此为商用发布前阻断硬伤修复。详见 CLAUDE.md。
+
+- **shared secret prod 配置缺失 (H-C, audit §5)**: 旧 shared secret 仅 env 来源 (`FUSION_GUARD_SHARED_SECRET`) = 同 UID 进程可读 (`ps eww`/lsof/launchctl), 被攻陷 subagent (一核九端 9 个 fusion-* 同 UID) 可窃第二因子 → 规则突变/可逆脱敏 reveal 全权调用。**prod 来源改 macOS Keychain** (service `fusion-guard`, account `shared-secret`, 与 token-key 同 service 不同 account 域分离)。新增 `fg-store::secret_store` 模块: `resolve_shared_secret(is_debug, allow_insecure_flag, env_present) -> SharedSecretSource` 纯决策函数 (规则 5, 镜像 token-key 的 `resolve_key_source`) + `keychain_secret_get`/`keychain_secret_store` (macOS vs 非 macOS cfg) + `generate_shared_secret` (32 字节 hex 64 字符)。`load_shared_secret` 解析序 Keychain → env → none: Keychain 有即用 (prod 路径, 不入环境变量); Keychain 无 + env 放行 → env (escape hatch); Keychain 无 + env 未放行 → 不静默用 env (防漏 flag 降级) 视为无 secret; 两处皆无 + macOS release 首次启动 → 生成强随机 secret 存 Keychain (allow_mint, operator 也可预置纯 Keychain 不生成)。**Release gate** `require_shared_secret_for_release()`: release 启动检查两来源皆缺 → 拒启动 (防仅 peercred 兜底被同 UID 攻陷进程全权调用); Keychain 有 / env 放行 / `FUSION_GUARD_ALLOW_NO_SECRET=1` (应急运维 peercred-only) 三者任一放行。`ALLOW_NO_SECRET` **优先判** (启动 gate + load 双处), 跳过 Keychain 读 —— 非交互环境 `get_generic_password` 可能串行阻塞 (CLAUDE.md Keychain 挂起风险), CI/soak spawn release daemon 设此 flag 即可, 客户端无需携 secret。dev 构建 (debug) 跳过 gate, 容 secret 缺失 (测试便利)。`fg-bin` `start` 子命令增 `--insecure-secret-env` flag (置 `FUSION_GUARD_ALLOW_INSECURE_SECRET=1`, 镜像 `--insecure-env-key`)。`start.sh` shared-secret 供应块镜像 token-key 块: env 设 → flag; dev keyfile `${GUARD_DIR}/shared-secret` → 读 + flag; 两处皆无 → Keychain 路径。验证: 6 测 (`secret_store_test`) — 决策矩阵 4 分支 (Keychain/env-debug/env-insecure/release-no-flag) + 生成 hex 64 字符 + 随机性。
+- **token-test 挂起修复 (环境性)**: `ciphertext_not_plaintext` 原扫整个 `std::env::temp_dir()` (本机被其他进程污染, FIFO/大目录 entry) → `std::fs::read` → `open()` 在某 entry 阻塞, 测试挂 60s+。改 `open_conn_in_dir()` 仅扫测试自建子目录, 断言意图不变 (自建 db 目录下不得出现明文)。env-key 测试前置不变。
+- **操作文档**: 新增 `DEPLOYMENT.md` —— 两个密钥信任模型对比表 (token-key vs shared-secret, Keychain account / env 变量 / 泄露影响)、Keychain 安全路径 (首次自动生成 + operator 预置 `security add-generic-password`)、env 不安全路径表 (放行 flag CLI + env)、release gate 行为、快速 prod 部署清单、多节点集群 (shared secret 各节点一致)、launchd 常驻 (用户域 LaunchAgents)、密钥轮换。
+
 ### 测试稳健性 (verify 阶段补强)
 
 - **semantic_verdict_block payload 修正**: 原 payload `os.system('rm -rf /')` 同时命中 regex rm-rf (Block L4) + semantic os.system (Block L4), L11 stage_rank Regex>Semantic → verdict.stage=Regex 非 Semantic (测试误报 fail)。后改 `subprocess.run(['ls', '-la'])` 又撞 A1 glob `[...]` Ast L4 平局。终定 `os.system('id')`: Ast 仅非白名单 L3, semantic os.system L4 — L4 risk > L3 → semantic 确定性胜。L11 排序设计正确, 错在 payload 未隔离单一 stage。
@@ -297,6 +306,20 @@ make check    # lint + test
 ```
 
 代码规范: 4 空格缩进, 无 docstring, 必带日志, `unsafe_code = "deny"` (workspace lint)。
+
+## 生产部署
+
+**两个生产密钥** (token-key 主密钥 + shared-secret 第二因子) 部署方式不同, prod 必须用 macOS Keychain (service `fusion-guard`, account `token-key`/`shared-secret`), env 仅 dev/CI/应急 escape hatch (release 须显式 flag 放行)。
+
+完整部署文档: **`DEPLOYMENT.md`** (Keychain 安全路径 + env 不安全路径 + release gate H-C + 快速 prod 清单 + 多节点集群 + launchd 常驻 + 密钥轮换)。
+
+release 二进制启动前须预置 Keychain secret, 否则 release gate 拒启动 (除非 `FUSION_GUARD_ALLOW_NO_SECRET=1` 应急放行):
+
+```bash
+SS=$(python3 -c "import secrets;print(secrets.token_hex(32))")
+security add-generic-password -s fusion-guard -a shared-secret -w "${SS}"
+./start.sh start    # 客户端非 ping 请求须携 secret
+```
 
 ### 压测 / soak (商用阻塞点 #6)
 

@@ -23,6 +23,8 @@ hmac.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
 rand = "0.8"
+# secret_store: shared secret 生成 hex 编码 (prod 路径, 非 dev-only)。
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
@@ -32,7 +34,6 @@ tempfile = "3"
 chrono.workspace = true
 sha2.workspace = true
 hmac.workspace = true
-hex = "0.4"
 
 [features]
 default = []
