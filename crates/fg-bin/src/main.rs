@@ -25,6 +25,11 @@ enum Cmd {
         // 置位 = set FUSION_GUARD_ALLOW_ENV_KEY=1 (fg-store token_store 读), 告警级 warn。
         #[arg(long, default_value_t = false)]
         insecure_env_key: bool,
+        // H-C secret 侧: 显式放行 env shared secret (release 用)。默认 false —— prod 强制 Keychain。
+        // 置位 = set FUSION_GUARD_ALLOW_INSECURE_SECRET=1 (fg-ipc authorizer + gate 读), 告警级 warn。
+        // env secret = 同 UID 进程可读, 非推荐; prod 走 Keychain (security add-generic-password)。
+        #[arg(long, default_value_t = false)]
+        insecure_secret_env: bool,
     },
     Ping {
         #[arg(long, env = "FUSION_GUARD_SOCK", default_value = DEFAULT_SOCK)]
@@ -109,19 +114,33 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Cmd::Start {
             sock,
             insecure_env_key,
-        }) => run_server(sock, insecure_env_key).await,
+            insecure_secret_env,
+        }) => run_server(sock, insecure_env_key, insecure_secret_env).await,
         Some(Cmd::Ping { sock }) => run_ping(sock).await,
-        None => run_server(PathBuf::from(DEFAULT_SOCK), false).await,
+        None => run_server(PathBuf::from(DEFAULT_SOCK), false, false).await,
     }
 }
 
-async fn run_server(sock: PathBuf, insecure_env_key: bool) -> anyhow::Result<()> {
+async fn run_server(
+    sock: PathBuf,
+    insecure_env_key: bool,
+    insecure_secret_env: bool,
+) -> anyhow::Result<()> {
     tracing::info!(sock = %sock.display(), "fusion-guard daemon starting");
     // P2-1: CLI flag → env (token_store load_or_create_key 读)。flag 显式 = operator 知情放行。
     if insecure_env_key {
         std::env::set_var("FUSION_GUARD_ALLOW_ENV_KEY", "1");
         tracing::warn!(
             "--insecure-env-key set (P2-1): master key may load from env in release build"
+        );
+    }
+    // H-C secret 侧: CLI flag → env (fg-ipc authorizer + require_shared_secret_for_release 读)。
+    // flag 显式 = operator 知情放行 env shared secret (同 UID 可读, 非推荐); prod 走 Keychain。
+    if insecure_secret_env {
+        std::env::set_var("FUSION_GUARD_ALLOW_INSECURE_SECRET", "1");
+        tracing::warn!(
+            "--insecure-secret-env set (H-C): shared secret may load from env in release build — \
+             same-UID visible, prod should use Keychain (security add-generic-password -s fusion-guard -a shared-secret)"
         );
     }
     // H-C (product-audit §5): release 构建必须设共享 secret (第二鉴权因子, 超越 peercred)。

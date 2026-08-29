@@ -104,7 +104,17 @@ fn resolve_archive_dir(db_path: &Path) -> std::path::PathBuf {
 
 pub mod action_store;
 pub mod token_store;
+// 共享 secret (§12.1 第二因子) Keychain 来源辅助 —— 供 fg-ipc PeerAuthorizer 复用 (服务 fusion-guard,
+// account shared-secret)。与 token_store 主密钥 (account token-key) 域分离。
+pub mod secret_store;
 pub use action_store::{ActionError, ActionStore, PendingAction};
+pub use secret_store::{
+    allow_insecure_secret_flag_set, generate_shared_secret, keychain_secret_get,
+    keychain_secret_store, resolve_shared_secret, shared_secret_env_present, SecretError,
+    SharedSecretSource, KEYCHAIN_ACCOUNT as SHARED_SECRET_KEYCHAIN_ACCOUNT,
+    KEYCHAIN_SERVICE as SHARED_SECRET_KEYCHAIN_SERVICE,
+    SHARED_SECRET_ENV as SHARED_SECRET_ENV_CONST,
+};
 pub use token_store::{TokenError, TokenStore};
 
 pub const DEFAULT_TENANT: &str = "default";

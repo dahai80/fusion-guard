@@ -49,6 +49,25 @@ start() {
         echo "[${GUARD_NAME}] WARNING: FUSION_GUARD_TOKEN_KEY from env — passing --insecure-env-key (P2-2: prod use Keychain)" >&2
         guard_args+=(--insecure-env-key)
     fi
+    # H-C secret 侧: 共享 secret (§12.1 第二因子) 来源。镜像 token-key 模式:
+    # - env 已设 (FUSION_GUARD_SHARED_SECRET) → 传 --insecure-secret-env flag 放行 release gate (env = 同 UID 可读, escape hatch)。
+    # - dev keyfile ${GUARD_DIR}/shared-secret 存在 → 读入 env + flag (escape hatch)。
+    # - 两处皆无 → 不导 env 不传 flag → 走 macOS Keychain (account shared-secret, prod 路径)。
+    #   release 守护进程首次启动 Keychain 无 secret 时自动生成存 Keychain (PeerAuthorizer::load_shared_secret)。
+    #   operator 也可预置: `security add-generic-password -s fusion-guard -a shared-secret -w <secret>`。
+    if [ -z "${FUSION_GUARD_SHARED_SECRET:-}" ]; then
+        local secret_keyfile="${GUARD_DIR}/shared-secret"
+        if [ -r "${secret_keyfile}" ]; then
+            echo "[${GUARD_NAME}] WARNING: dev shared-secret keyfile ${secret_keyfile} in use — passing --insecure-secret-env (H-C: prod use Keychain)" >&2
+            export FUSION_GUARD_SHARED_SECRET="$(cat "${secret_keyfile}")"
+            guard_args+=(--insecure-secret-env)
+        else
+            echo "[${GUARD_NAME}] no dev shared-secret keyfile — prod Keychain path (H-C, account shared-secret)" >&2
+        fi
+    else
+        echo "[${GUARD_NAME}] WARNING: FUSION_GUARD_SHARED_SECRET from env — passing --insecure-secret-env (H-C: prod use Keychain)" >&2
+        guard_args+=(--insecure-secret-env)
+    fi
     nohup "${GUARD_BIN}" "${guard_args[@]}" >"${GUARD_LOG}" 2>&1 &
     local pid=$!
     echo "${pid}" > "${GUARD_PID}"

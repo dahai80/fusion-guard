@@ -41,12 +41,29 @@ fn missing_token_errors() {
     assert!(matches!(err, fg_store::TokenError::NotFound(_)));
 }
 
+// 仅扫本测试自建子目录, 不遍历整个系统 temp_dir —— 后者在本机被其他进程污染 (FIFO/大目录)
+// 致 std::fs::read 在某 entry 上 open 阻塞 (sample 证: 卡在 open syscall), 测试挂死。
+// 断言意图不变: 自建 db 目录下不得出现明文 "supersecret"。
+fn open_conn_in_dir() -> (Connection, std::path::PathBuf) {
+    ensure_env_key();
+    let dir = std::env::temp_dir().join(format!(
+        "fg-token-cipher-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("token-cipher.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        .unwrap();
+    (conn, dir)
+}
+
 #[test]
 fn ciphertext_not_plaintext() {
-    let conn = temp_conn();
+    let (conn, dir) = open_conn_in_dir();
     let store = TokenStore::open(conn).unwrap();
     store.put("tok_x", "supersecret").unwrap();
-    let dir = std::env::temp_dir();
     let mut found_plaintext = false;
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         if let Ok(content) = std::fs::read(entry.path()) {
@@ -59,6 +76,7 @@ fn ciphertext_not_plaintext() {
         !found_plaintext,
         "plaintext must not appear on disk in temp db"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

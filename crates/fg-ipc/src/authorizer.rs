@@ -13,6 +13,15 @@ use std::sync::Arc;
 
 use fg_peercred::{peer_allowed, PeerUid};
 use fg_store::AuditStore;
+// H-C secret 侧修复 (product-audit §5): shared secret Keychain 来源 (与 token-key 同根缺陷:
+// 原仅 env = 同 UID 可读 = 被攻陷 subagent 可读)。prod 来源改 macOS Keychain (service fusion-guard,
+// account shared-secret)。env 为 escape hatch (须显式 flag 放行)。fg-store::secret_store 提供辅助。
+// release-only 辅助 (Keychain I/O + 决策) 在 debug 构建未用 → allow(unused_imports)。
+#[allow(unused_imports)]
+use fg_store::secret_store::{
+    allow_insecure_secret_flag_set, generate_shared_secret, keychain_secret_get,
+    keychain_secret_store, resolve_shared_secret, shared_secret_env_present, SharedSecretSource,
+};
 
 use crate::{err_resp_bytes, CallerIdentity, RpcRequest, SHARED_SECRET_ENV};
 use serde_json::Value;
@@ -82,28 +91,165 @@ pub trait Authorizer: Send + Sync {
 }
 
 // P1-5: 默认实现。持 Arc<AuditStore> (租户解析) + Option<shared_secret> (§12.1)。
-// secret 来源: SHARED_SECRET_ENV env (prod 部署设); None = dev 模式跳过 secret 校验。
+// secret 来源 (H-C secret 侧修复): macOS Keychain (account shared-secret, prod 推荐) 优先;
+// env 为 escape hatch (release 须 FUSION_GUARD_ALLOW_INSECURE_SECRET=1 显式放行, warn 告警)。
+// None = dev 模式跳过 secret 校验 (release 启动由 require_shared_secret_for_release 拒)。
 pub struct PeerAuthorizer {
     tenants: Arc<dyn TenantLookup>,
     shared_secret: Option<String>,
 }
 
+// H-C secret 侧: 解析 shared secret 来源 → 实际加载 (Keychain I/O)。返回 (secret, source)。
+// 解析序: Keychain (macOS) → env (escape hatch) → none。
+// - Keychain 有 → 用 Keychain (prod 路径, 密钥不入环境变量)。
+// - Keychain 无 + env 有且放行 (debug 或 FUSION_GUARD_ALLOW_INSECURE_SECRET=1) → 用 env。
+// - Keychain 无 + env 有但 release 未放行 → 不静默用 env (防漏 flag 降级), 视为无 secret。
+// - 两处皆无 → None (release 启动拒, dev 跳过校验)。
+//
+// 首次启动 Keychain 无 secret + env 也无 + macos → 生成强随机 secret 存 Keychain (allow_mint)。
+// 注意: 生成仅当 env 亦缺失 (env 显式提供 = operator 自管, 不覆盖); release 生成是 prod 默认
+// (operator 也可预置 security add-generic-password 走纯 Keychain 不生成)。
+#[allow(clippy::needless_return)]
+pub fn load_shared_secret() -> (Option<String>, SharedSecretSource) {
+    let env_present = shared_secret_env_present();
+    // FUSION_GUARD_ALLOW_NO_SECRET=1: 应急/CI 放行 = peercred-only 鉴权, 跳过 secret 校验
+    // (与 require_shared_secret_for_release 的放行语义一致: 非 prod, 运维知情)。
+    // soak/CI spawn release daemon 设此 flag → 客户端不携 secret 仍通 (旧 env-only 行为)。
+    // 否则 release 无 env → Keychain 路径会自动生成 secret → 客户端无 secret 全 DenySecret。
+    let allow_no_secret = std::env::var("FUSION_GUARD_ALLOW_NO_SECRET")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_no_secret && !env_present {
+        tracing::warn!(
+            "PeerAuthorizer: shared secret check SKIPPED (FUSION_GUARD_ALLOW_NO_SECRET=1) — \
+             peercred-only auth, INSECURE (CI/soak/emergency posture; prod MUST provision Keychain)"
+        );
+        return (None, SharedSecretSource::None);
+    }
+    // dev 构建: 仅走 env (旧行为), 不触 Keychain —— 避免并发测试 spawn server 全调
+    // get_generic_password 在非交互环境串行阻塞 (CLAUDE.md 已记录 Keychain 挂起风险)。
+    // dev 无 env secret → None (跳过 secret 校验, 测试客户端不携 secret 仍通), 保向后兼容。
+    // release 构建: 走 Keychain (prod 路径), gate 兜底拒启动。
+    #[cfg(debug_assertions)]
+    {
+        if env_present {
+            let s = std::env::var(SHARED_SECRET_ENV)
+                .ok()
+                .filter(|v| !v.is_empty());
+            tracing::info!(
+                "PeerAuthorizer: shared secret loaded from env (debug build, dev posture)"
+            );
+            return (s, SharedSecretSource::EnvDebug);
+        }
+        tracing::warn!(
+            "PeerAuthorizer: shared secret NOT set — dev mode, secret check skipped \
+             (H-C: prod MUST provision Keychain; release start will refuse)"
+        );
+        return (None, SharedSecretSource::None);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let decision = resolve_shared_secret(false, allow_insecure_secret_flag_set(), env_present);
+        match decision {
+            SharedSecretSource::Keychain => {
+                match keychain_secret_get() {
+                    Ok(Some(s)) => {
+                        tracing::info!(
+                            "PeerAuthorizer: shared secret loaded from Keychain (H-C prod path)"
+                        );
+                        return (Some(s), SharedSecretSource::Keychain);
+                    }
+                    Ok(None) => {
+                        // Keychain 无 secret。env 提供但未放行 (release 漏 flag) 落此 —— 不静默用 env。
+                        if env_present {
+                            tracing::warn!(
+                            env = SHARED_SECRET_ENV,
+                            "PeerAuthorizer: shared secret env present but NOT authorized in release \
+                             (set FUSION_GUARD_ALLOW_INSECURE_SECRET=1 or --insecure-secret-env to use env, \
+                             or provision Keychain); falling back — secret check skipped"
+                        );
+                            return (None, SharedSecretSource::None);
+                        }
+                        // env 无 + Keychain 无: release 首次启动 macOS 生成存 Keychain (allow_mint)。
+                        // dev 构建不自动生成 (保向后兼容: 现有测试客户端不携 secret, dev 无 secret=跳过校验;
+                        // dev 若生成则非 ping 请求全 DenySecret 致测试断)。
+                        #[cfg(all(target_os = "macos", not(debug_assertions)))]
+                        {
+                            let new_secret = generate_shared_secret();
+                            match keychain_secret_store(&new_secret) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                    "PeerAuthorizer: shared secret generated + stored to Keychain \
+                                     (first start, H-C prod path) — operator may replace via \
+                                     `security add-generic-password -s fusion-guard -a shared-secret -w <secret>`"
+                                );
+                                    return (Some(new_secret), SharedSecretSource::Keychain);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "PeerAuthorizer: keychain store of generated shared secret failed — \
+                                         secret check skipped (release start will refuse — H-C)"
+                                    );
+                                    return (None, SharedSecretSource::None);
+                                }
+                            }
+                        }
+                        // dev 构建 / 非 macOS: 无 secret → dev 模式跳过校验 (release 由 gate 拒启动)。
+                        #[cfg(any(not(target_os = "macos"), debug_assertions))]
+                        {
+                            tracing::warn!(
+                            "PeerAuthorizer: no Keychain shared secret + no env — dev mode, \
+                             secret check skipped (H-C: prod MUST provision Keychain; release start will refuse)"
+                        );
+                            return (None, SharedSecretSource::None);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "PeerAuthorizer: keychain secret read error — falling back to no secret"
+                        );
+                        return (None, SharedSecretSource::None);
+                    }
+                }
+            }
+            SharedSecretSource::EnvDebug => {
+                let s = std::env::var(SHARED_SECRET_ENV)
+                    .ok()
+                    .filter(|v| !v.is_empty());
+                tracing::info!(
+                    "PeerAuthorizer: shared secret loaded from env (debug build, dev posture)"
+                );
+                (s, SharedSecretSource::EnvDebug)
+            }
+            SharedSecretSource::EnvInsecure => {
+                let s = std::env::var(SHARED_SECRET_ENV)
+                    .ok()
+                    .filter(|v| !v.is_empty());
+                // P2-1 secret 侧镜像告警: prod 用 env = 第二因子进进程环境, 同 UID 进程可读。
+                tracing::warn!(
+                    "INSECURE (H-C secret): shared secret loaded from env in release build — \
+                 visible to any same-UID process; prod MUST use Keychain \
+                 (FUSION_GUARD_ALLOW_INSECURE_SECRET=1 or --insecure-secret-env was set)"
+                );
+                (s, SharedSecretSource::EnvInsecure)
+            }
+            SharedSecretSource::None => {
+                // release 解析序下不可达 (resolve 无 env 总返 Keychain), 保留 exhaustive。
+                tracing::warn!(
+                    "PeerAuthorizer: shared secret NOT set — secret check skipped \
+                 (H-C: release start will refuse via require_shared_secret_for_release)"
+                );
+                (None, SharedSecretSource::None)
+            }
+        }
+    }
+}
+
 impl PeerAuthorizer {
     pub fn new(audit: Arc<AuditStore>) -> Self {
-        let shared_secret = std::env::var(SHARED_SECRET_ENV)
-            .ok()
-            .filter(|s| !s.is_empty());
-        if shared_secret.is_some() {
-            tracing::info!("PeerAuthorizer: shared secret loaded from env (P0-1 §12.1)");
-        } else {
-            // H-C (product-audit §5): secret 缺失 = dev 模式 (仅 warn)。release 启动拒绝由
-            // fg-bin run_server 调 require_shared_secret_for_release() 兜底, 此处保持构造兼容
-            // (测试不设 secret 仍可建 server 跑断言, 避免全测试改签名)。
-            tracing::warn!(
-                env = SHARED_SECRET_ENV,
-                "PeerAuthorizer: shared secret NOT set — dev mode, secret check skipped (P0-1 §12.1: prod MUST set, release start will refuse — H-C)"
-            );
-        }
+        let (shared_secret, _source) = load_shared_secret();
         Self {
             tenants: audit,
             shared_secret,
@@ -120,25 +266,23 @@ impl PeerAuthorizer {
     }
 }
 
-// H-C (product-audit §5): release 构建启动闸门 —— SHARED_SECRET_ENV 未设则拒绝启动。
+// H-C (product-audit §5): release 构建启动闸门 —— shared secret 两来源 (Keychain / env) 均缺则拒绝启动。
 // 缺陷根因: PeerAuthorizer::new 在 secret 缺失时仅 warn (dev 容错), 但 release 部署若也漏设,
 // 守护进程照常启动且 secret 校验跳过 → 仅 peercred (同 uid) 兜底, 无第二因子; 同 uid 任意进程
 // (含被攻陷的 subagent) 可全权调规则突变/可逆脱敏 reveal。prod MUST 显式设 secret。
-// 此函数供 fg-bin run_server 在 IpcServer::new 后调: release (not debug_assertions) 且 secret 缺 → Err。
+// secret 侧修复: 来源扩展到 Keychain (account shared-secret)。env 需 FUSION_GUARD_ALLOW_INSECURE_SECRET=1
+// 放行 (否则视为未授权, 不静默降级)。Keychain 存在即放行 (prod 推荐路径)。
+// 此函数供 fg-bin run_server 在 IpcServer::new 后调: release 且两来源皆缺 → Err。
 // dev 测试不调此 (容 secret 缺, 避全测试改签名); 显式 FUSION_GUARD_ALLOW_NO_SECRET=1 放行 (应急运维)。
-// 规则 5: 决策用代码 (cfg + env 读), 非 token 推断; 纯函数可单测。
+// 规则 5: 决策用代码 (Keychain 读 + env 读), 非 token 推断。
 pub fn require_shared_secret_for_release() -> std::result::Result<(), String> {
     // dev 构建跳过 (debug_assertions = true) —— 容 secret 缺。
     if cfg!(debug_assertions) {
         return Ok(());
     }
-    let secret = std::env::var(SHARED_SECRET_ENV)
-        .ok()
-        .filter(|s| !s.is_empty());
-    if secret.is_some() {
-        return Ok(());
-    }
-    // 应急放行 flag (运维知晓风险显式设): 非 prod 推荐路径, 但防锁死。
+    // 应急放行 flag 优先判 (CI/soak 设此 flag): 跳过 Keychain 读 —— 非交互环境 get_generic_password
+    // 可能串行阻塞 (CLAUDE.md 记录 Keychain 挂起风险), CI 无需也读不到 Keychain secret。
+    // 设此 flag = 运维知情 peercred-only 鉴权 (INSECURE, 非 prod), 与 load_shared_secret 旁路一致。
     let allow_no_secret = std::env::var("FUSION_GUARD_ALLOW_NO_SECRET")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -149,15 +293,28 @@ pub fn require_shared_secret_for_release() -> std::result::Result<(), String> {
         );
         return Ok(());
     }
+    // 来源 1: Keychain (macOS prod 推荐路径)。
+    let keychain_has = matches!(keychain_secret_get(), Ok(Some(_)));
+    if keychain_has {
+        return Ok(());
+    }
+    // 来源 2: env (escape hatch, release 须显式 flag 放行)。
+    let env_authorized = shared_secret_env_present() && allow_insecure_secret_flag_set();
+    if env_authorized {
+        return Ok(());
+    }
     tracing::error!(
         env = SHARED_SECRET_ENV,
-        "H-C: release build refusing to start — shared secret unset. \
-         Set {} to a strong random value (second auth factor beyond peercred), \
+        "H-C: release build refusing to start — shared secret not found in Keychain or env. \
+         Provision Keychain: `security add-generic-password -s fusion-guard -a shared-secret -w <secret>`, \
+         or set {} + FUSION_GUARD_ALLOW_INSECURE_SECRET=1 (env escape, same-UID visible — not recommended for prod), \
          or set FUSION_GUARD_ALLOW_NO_SECRET=1 only for emergency insecure operation.",
         SHARED_SECRET_ENV
     );
     Err(format!(
-        "refusing to start: {} unset in release build (H-C); set it or FUSION_GUARD_ALLOW_NO_SECRET=1 for insecure bypass",
+        "refusing to start: shared secret not found in Keychain (fusion-guard/shared-secret) or env (H-C); \
+         provision Keychain or set {} + FUSION_GUARD_ALLOW_INSECURE_SECRET=1, \
+         or FUSION_GUARD_ALLOW_NO_SECRET=1 for insecure bypass",
         SHARED_SECRET_ENV
     ))
 }
