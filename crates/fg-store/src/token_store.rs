@@ -1,7 +1,8 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
-use rusqlite::{params, Connection};
+use hmac::{Hmac, Mac};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::Sha256;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -17,6 +18,16 @@ const KEY_LEN: usize = 32;
 // 派生确定 (master 不变 → 同 version 永同 key), 故 DB 只存 key_version INT, 不存密钥材料。
 const CHAIN_INFO_PREFIX: &[u8] = b"fusion-guard/audit-chain-hmac/v";
 const TOKEN_INFO_PREFIX: &[u8] = b"fusion-guard/token-aes-gcm/v";
+
+// H-E (product-audit §5 item d): 每版本验签锚点。mint/rotate 时存 key_versions.key_anchor
+// = HMAC(canonical_msg, derive_chain_key(master, version))。verify 遇 HMAC 不匹配行时,
+// 查该行 key_version 的锚点, 用当前 master 重算锚点比较:
+//   锚点匹配 → 当前 master 能派生该 version → 真篡改 (tampered=true)
+//   锚点不匹配 → 当前 master 无法派生该 version → 密钥丢失 (key_version_unknown_rows++)
+//   锚点 NULL (旧迁移行) → fail-closed 当篡改 (攻击者删锚点无法隐藏)
+// canonical_msg 固定, 仅作版本可派生性探针, 非密钥材料。
+const KEY_ANCHOR_MSG: &[u8] = b"fusion-guard/key-anchor/v1";
+type HmacSha256 = Hmac<Sha256>;
 
 pub struct TokenStore {
     db: Mutex<Connection>,
@@ -74,11 +85,14 @@ impl TokenStore {
             CREATE INDEX IF NOT EXISTS idx_tokens_ts ON tokens(created_ts);
             CREATE TABLE IF NOT EXISTS key_versions (
                 version INTEGER PRIMARY KEY,
-                created_ts INTEGER NOT NULL
+                created_ts INTEGER NOT NULL,
+                key_anchor TEXT
             );
             INSERT OR IGNORE INTO key_versions (version, created_ts) VALUES (1, 0);
             ",
         )?;
+        // H-E (item d): 旧库 key_versions 无 key_anchor 列 → 幂等补列 (NULL = 旧迁移行, verify fail-closed 当篡改)。
+        let _ = conn.execute("ALTER TABLE key_versions ADD COLUMN key_anchor TEXT", []);
         // C2 旧库迁移: 加 tenant_id 列 (幂等)
         let _ = conn.execute(
             "ALTER TABLE tokens ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
@@ -91,6 +105,9 @@ impl TokenStore {
             [],
         );
         let key = load_or_create_key(allow_mint)?;
+        // H-E (item d): 为所有 NULL 锚点的版本回填 (仅缺锚点的旧行; 已有锚点永覆写 —— 锚点不可变,
+        // 派生确定, 重算必同值, 故回填 = 补缺, 非改写)。新库种子 v1 行也在此首次写入锚点。
+        backfill_key_anchors(&conn, &key)?;
         let current_version = max_key_version(&conn);
         Ok(Self {
             db: Mutex::new(conn),
@@ -233,19 +250,37 @@ impl TokenStore {
             .current_version
             .load(std::sync::atomic::Ordering::Relaxed)
             + 1;
+        // H-E (item d): 新版本落锚点 (当前 master 派生), 供 verify 区分后续真篡改 vs 密钥丢失。
+        let anchor = key_anchor_for_version(&self.key, new_version);
         let g = recover_lock!(self.db.lock(), "token db");
         g.execute(
-            "INSERT OR REPLACE INTO key_versions (version, created_ts) VALUES (?1, ?2)",
-            params![new_version, now_ts()],
+            "INSERT OR REPLACE INTO key_versions (version, created_ts, key_anchor) VALUES (?1, ?2, ?3)",
+            params![new_version, now_ts(), anchor],
         )?;
         drop(g);
         self.current_version
             .store(new_version, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             new_version = new_version,
-            "key rotated (P1-2 HKDF version bump)"
+            "key rotated (P1-2 HKDF version bump, H-E anchor written)"
         );
         Ok(new_version)
+    }
+
+    // H-E (item d): 查指定版本锚点。verify 路径用 —— 行 HMAC 不匹配时, 取该行 key_version
+    // 的锚点与当前 master 重算锚点比较, 区分真篡改 (锚点匹配) vs 密钥丢失 (锚点不匹配)。
+    // 返回 None = 旧迁移行无锚点 (verify fail-closed 当篡改)。
+    #[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
+    pub(crate) fn key_anchor(&self, version: i64) -> Result<Option<String>, TokenError> {
+        let g = recover_lock!(self.db.lock(), "token db");
+        let row = g
+            .query_row(
+                "SELECT key_anchor FROM key_versions WHERE version = ?1",
+                params![version],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
     }
 }
 
@@ -305,6 +340,46 @@ fn max_key_version(conn: &Connection) -> i64 {
     .ok()
     .flatten()
     .unwrap_or(1)
+}
+
+// H-E (item d): 计算指定版本的验签锚点 = HMAC(KEY_ANCHOR_MSG, derive_chain_key(master, version))。
+// 用 chain 派生 key (非 token key) —— 锚点探针链路派生可派生性, 与审计 HMAC 同域。
+// pub(crate): fg-store::lib verify 路径调 (按行 key_version 比对当前 master 重算锚点)。
+pub(crate) fn key_anchor_for_version(master: &Zeroizing<[u8; KEY_LEN]>, version: i64) -> String {
+    let dkey = derive_chain_key(master, version);
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&dkey[..]).expect("HMAC accepts any key length");
+    mac.update(KEY_ANCHOR_MSG);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+// H-E (item d): 为所有 NULL 锚点的版本回填。锚点不可变 (派生确定 → 重算同值), 故回填 = 补缺非改写。
+// 仅 UPDATE WHERE key_anchor IS NULL: 已有锚点的版本 (含旧 master 写的) 永不覆写 ——
+// 旧 master 锚点保留, 用新 master 重算不匹配 → verify 判密钥丢失, 非误判篡改。
+fn backfill_key_anchors(
+    conn: &Connection,
+    master: &Zeroizing<[u8; KEY_LEN]>,
+) -> Result<(), TokenError> {
+    let versions: Vec<(i64, Option<String>)> = conn
+        .prepare("SELECT version, key_anchor FROM key_versions ORDER BY version ASC")?
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (version, existing) in versions {
+        if existing.is_some() {
+            continue;
+        }
+        let anchor = key_anchor_for_version(master, version);
+        let n = conn.execute(
+            "UPDATE key_versions SET key_anchor = ?1 WHERE version = ?2 AND key_anchor IS NULL",
+            params![anchor, version],
+        )?;
+        if n > 0 {
+            tracing::info!(version = version, "H-E: backfilled key_anchor for version");
+        }
+    }
+    Ok(())
 }
 
 // P2-1 (audit §2.6): env key 门控 + 告警决策。纯函数 (规则 5: 决策用代码非 token, 可测)。
@@ -498,5 +573,3 @@ fn keychain_store(key: &[u8]) -> Result<(), TokenError> {
         .map_err(|e| TokenError::Keychain(e.to_string()))?;
     Ok(())
 }
-
-use rusqlite::OptionalExtension;

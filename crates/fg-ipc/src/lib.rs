@@ -473,7 +473,9 @@ impl IpcServer {
     fn handle_method(self: Arc<Self>, req: RpcRequest, identity: CallerIdentity) -> Result<Value> {
         match req.method.as_str() {
             "guard.ping" => Ok(serde_json::json!({
-                "pong": "ok",
+                // pong: bool —— 跨仓消费方契约 (fusion-cli #9 / fusion-studio #344 读 Bool)。
+                // 原 "ok" string 令消费方 `as? Bool` / `pong:bool` 反序列化失败 → 误报不可达。
+                "pong": true,
                 "version": env!("CARGO_PKG_VERSION"),
                 "rules_epoch": self.engine.epoch(),
             })),

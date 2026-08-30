@@ -404,7 +404,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fg-audit-engine"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "chrono",
  "fg-core",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "fg-bin"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "fg-cluster"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-core",
  "hex",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "fg-core"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "chrono",
  "serde",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "fg-es"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-es-bridge",
  "serde",
@@ -479,11 +479,11 @@ dependencies = [
 
 [[package]]
 name = "fg-es-bridge"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 
 [[package]]
 name = "fg-ipc"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-audit-engine",
  "fg-cluster",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "fg-peercred"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "libc",
  "tracing",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "fg-pyo3"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-audit-engine",
  "fg-core",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "fg-redact"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-core",
  "regex",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "fg-rules"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-core",
  "regex",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "fg-store"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "fg-tcc"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "fg-core",
  "fg-tcc-bridge",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "fg-tcc-bridge"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 
 [[package]]
 name = "find-msvc-tools"

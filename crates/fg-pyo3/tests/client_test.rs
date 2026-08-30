@@ -127,7 +127,7 @@ async fn ping_roundtrip() {
     let sock_for_cleanup = sock.clone();
     let client = fg_pyo3::UdsClient::new(sock);
     let res = call_retry(&client, "guard.ping", serde_json::json!({}));
-    assert_eq!(res["pong"], "ok");
+    assert_eq!(res["pong"], true);
     assert!(res["rules_epoch"].as_u64().is_some());
 
     handle.abort();
@@ -223,7 +223,7 @@ async fn p24_persistent_conn_reuse_and_reconnect() {
     // (1) 同 client 多次 call 复用连接 —— ping 5 次全 ok, 证明复用不损坏 wire。
     for i in 0..5u8 {
         let res = call_retry(&client, "guard.ping", serde_json::json!({}));
-        assert_eq!(res["pong"], "ok", "reuse call #{i} 须成功");
+        assert_eq!(res["pong"], true, "reuse call #{i} 须成功");
         assert!(
             res["rules_epoch"].as_u64().is_some(),
             "reuse call #{i} 须带 epoch"
@@ -242,7 +242,7 @@ async fn p24_persistent_conn_reuse_and_reconnect() {
     // 重启后 ping 仍 ok —— 证明死流被检测+清空+重连, 调用方不感知服务端重启。
     // call_retry 内重试瞬态 -32010 兜底重启竞态 (B 绑定前 connect 旧失败)。
     let res = call_retry(&client, "guard.ping", serde_json::json!({}));
-    assert_eq!(res["pong"], "ok", "服务端重启后须透明重连成功 (P2-4)");
+    assert_eq!(res["pong"], true, "服务端重启后须透明重连成功 (P2-4)");
 
     handle_b.abort();
     let _ = std::fs::remove_file(&sock);

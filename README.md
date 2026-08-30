@@ -165,7 +165,7 @@ event_3: prev_hash=event_hash_2,    event_hash=SHA256(event_hash_2 || payload_3)
 
 - **payload** = 11 字段 (`audit_id/ts/event_type/tenant_id/requester/action/inferred_category/verdict_json/approved_by/seatbelt_required/outcome`) 用 `\x1f` 连接。改任一字段 → `event_hash` 对不上 → 检出。
 - **单连接序列化**: 所有审计插入 (同步高风险 + 异步低风险) 走同一 `Arc<Mutex<Connection>>`, 插入时锁内读上一条 `event_hash` → 算本条 hash。消除并发读 prev_hash 导致的链分叉。
-- **`guard.audit.verify`**: 增量校验 (P0-4) — `chain_checkpoint` 缓存上次校验通过的末行 `audit_id`+`event_hash`, 本调用只验该行之后的新增段, O(新增量) 而非 O(全表)。锚点用 `audit_id` (UUID, VACUUM 后 rowid 重排不失效)。退化条件 (安全起见全表扫): 无 checkpoint; 锚行已被归档删除 (audit_id 缺失); hash 对不上; 检出篡改 (重算全表以定位 `first_broken_at`, 不缓存坏点)。返回 `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at}`。
+- **`guard.audit.verify`**: 增量校验 (P0-4) — `chain_checkpoint` 缓存上次校验通过的末行 `audit_id`+`event_hash`, 本调用只验该行之后的新增段, O(新增量) 而非 O(全表)。锚点用 `audit_id` (UUID, VACUUM 后 rowid 重排不失效)。退化条件 (安全起见全表扫): 无 checkpoint; 锚行已被归档删除 (audit_id 缺失); hash 对不上; 检出篡改 (重算全表以定位 `first_broken_at`, 不缓存坏点)。返回 `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at, key_version_unknown_rows}` (聚合 `verify_all_chains` 另增 `key_loss` + 各子链结果)。`key_version_unknown_rows`/`key_loss` 见下 §H-E。
 - **迁移兼容**: 老 DB 无 `prev_hash`/`event_hash` 列 → `migrate_audit_chain` 幂等 `ALTER TABLE ADD COLUMN`(DEFAULT '')。空 hash 行计为 `unhashed_rows`, 不误报 tamper。append-only, 不回填历史行。
 - **依赖**: `sha2 = "0.10"` (workspace dep)。
 
@@ -179,6 +179,15 @@ event_3: prev_hash=event_hash_2,    event_hash=SHA256(event_hash_2 || payload_3)
 - **per-store 归档目录**: 非全局 env — `resolve_archive_dir(db_path)` 从 db 同级 `audit-archive/` 解析 (env 覆盖仍优先)。隔离并发测试 store 不抢同一 env; 生产单守护进程单 DB 单归档目录语义不变。
 - **Retention monitor (drain 路径覆盖)**: `enforce_retention` 原只在高风险 `append_event` 同步路径调, drain 线程只插 L1/L2 低风险行不触 rotation → 高频低风险流量下 audit_events 无界增长。守护进程启动 `spawn_retention_monitor(interval_secs=5)` 周期调 `enforce_retention` 覆盖低风险积累 (商用阻塞点 #6 soak 发现)。
 - **rotate 锁优化**: `rotate_old_rows` 检查阶段 (COUNT 超龄行 + db_bytes 判阈值) + 选待归档行改用 `read_conn` (query_only, 不抢 `audit_writer` 写锁), 仅删行 + checkpoint + VACUUM mutate 段锁 `audit_writer`。原实现整段持写锁跑空检查 → append_event 高风险同步路径自 DoS + 5s monitor 持锁空查吞吐骤降。30s soak: throughput +24%, p99 −20ms。TOCTOU 安全: rowid 单调增, 删按 rowid 区间, 并发插入不受影响。
+
+### H-E: 主密钥丢失单点致命 (product-audit-0827, 2026-08-29)
+
+master key 丢失 = 全历史审计链 verify 失败 (假报篡改) + 可逆 token 不可解, 与真篡改不可区分。四项修复:
+
+- **(a) 拒绝静默 remint**: Keychain miss + DB 已有历史数据 → `load_keychain_or_err` 拒启动明确报错 (非静默重生成新密钥令历史全不可解), 仅 virgin DB 首次允许生成。
+- **(b) 密钥托管 escrow**: 首次生成后立即导 Keychain master 到离线备份, 丢失时恢复**同一**密钥 → 锚点匹配 → 无假篡改 (运维流程, 见 `DEPLOYMENT.md` §主密钥托管, 无 daemon 代码)。
+- **(c) `rotate_key` 历史行可验 (无 re-hash)**: `rotate_key` = bump `key_version` (master 不变, HKDF 按 version 派生)。旧行记旧 version, 用旧派生 key 验 (确定性 HKDF 同 master 可重算) → 轮换后历史行可验可解。**re-hash 审计链被刻意拒绝**: hash 不可变 = 防篡改保证, re-sign 等于自废武功且无法区分真篡改与运维 re-hash。
+- **(d) 密钥丢失 vs 真篡改区分**: per-version `key_versions.key_anchor` 锚点 (HMAC of 固定消息 under `derive_chain_key(master, version)`)。verify HMAC 不匹配行调 `classify_break`: 锚点与当前 master 重算**匹配** → 真篡改 (`tampered=true`); **不匹配** → 密钥丢失 (`key_version_unknown_rows++`, 不计 tampered); **NULL** (legacy) → fail-closed 篡改 (攻击者清锚点无藏身处)。`guard.audit.verify` 增 `key_version_unknown_rows` (单链) + `key_loss` (聚合) 字段。测试 `he_key_loss_distinguish_test.rs` (4 cases) + `he_key_loss_test.rs` (5 decision-gate cases)。
 
 ## 安全审计修复 (audit-0827)
 
@@ -259,7 +268,7 @@ UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
 帧格式: JSON-RPC 2.0 + `0x0A` 分隔, 1MiB 上限, 2s 超时 fail-closed
 
 方法:
-- `guard.ping` — `{pong, version, rules_epoch}`
+- `guard.ping` — `{pong: bool, version, rules_epoch}` (`pong` 为 boolean —— 跨仓消费方 fusion-cli #9 / fusion-studio #344 按 `Bool` 读; 勿返 string)
 - `guard.evaluate` — `{action, content, caller_epoch?, tenant_id?, requester?}` → GuardVerdict (caller_epoch != 0 且 != guard epoch → `-32003` stale epoch)
 - `guard.rule.list` — `{rules: [GuardRule], epoch}`
 - `guard.rules.dump` — `{rules, epoch}` (同 rule.list)

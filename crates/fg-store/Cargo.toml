@@ -76,5 +76,10 @@ required-features = ["test-helpers"]
 name = "he_key_loss_test"
 required-features = ["test-helpers"]
 
+# H-E (item c+d): 轮换后全 4 链 (audit/tcc/rules/dead-letter) + token 可验 + 密钥丢失 vs 真篡改区分。
+[[test]]
+name = "he_key_loss_distinguish_test"
+required-features = ["test-helpers"]
+
 [lints]
 workspace = true
