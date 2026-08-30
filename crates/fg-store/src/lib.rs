@@ -194,6 +194,9 @@ pub struct ChainVerification {
     pub broken_links: usize,
     pub tampered: bool,
     pub first_broken_at: Option<usize>,
+    // H-E (item d): 行 HMAC 不匹配中, 因 key_version 锚点与当前 master 不匹配 (密钥丢失) 而非真篡改的行数。
+    // 这些行仍计 broken_links (不可验证), 但不计 tampered (非恶意篡改)。
+    pub key_version_unknown_rows: usize,
 }
 
 // P0-5 (audit §1.4): 防篡改覆盖面补齐。单表链 (audit_events) 只覆盖审计行;
@@ -209,6 +212,8 @@ pub struct SubChainVerification {
     pub broken_links: usize,
     pub tampered: bool,
     pub first_broken_at: Option<usize>,
+    // H-E (item d): 同 ChainVerification.key_version_unknown_rows (密钥丢失行, 非真篡改)。
+    pub key_version_unknown_rows: usize,
 }
 
 // P0-5: 全链聚合校验。audit (audit_events 链) + tcc (tcc_events 链) + rules
@@ -221,6 +226,9 @@ pub struct AllChainsVerification {
     pub rules: SubChainVerification,
     pub dead_letter: SubChainVerification,
     pub tampered: bool,
+    // H-E (item d): 任一链存在 key_version_unknown_rows → 密钥丢失 (历史行不可验证但非真篡改)。
+    // true 时运维知是密钥丢失非被篡改: 恢复 Keychain 主密钥 (从 escrow) 即可复验, 勿误判安全事件。
+    pub key_loss: bool,
 }
 
 // P0-4 (audit §1.3/§2.4): 增量链校验检查点。缓存上次校验通过的末行 audit_id, 下次只验新增段。
@@ -1291,6 +1299,8 @@ impl AuditStore {
         let mut broken_links = 0usize;
         let mut tampered = false;
         let mut first_broken_at: Option<usize> = None;
+        // H-E (item d): 密钥丢失行数 (锚点不匹配, 非真篡改)。
+        let mut key_version_unknown_rows = 0usize;
         // global_i: 全表位置 (first_broken_at 用全表行号定位, 便于运维 DB 查行)。
         let mut global_i = 0usize;
         let mut last_hash = expected_prev.clone();
@@ -1336,7 +1346,12 @@ impl AuditStore {
                         if first_broken_at.is_none() {
                             first_broken_at = Some(global_i);
                         }
-                        tampered = true;
+                        // H-E (item d): 区分真篡改 vs 密钥丢失。锚点匹配/缺失 → 篡改;
+                        // 锚点不匹配 → 密钥丢失, 不计 tampered。
+                        match classify_break(&self.tokens, *kv) {
+                            BreakKind::KeyLoss => key_version_unknown_rows += 1,
+                            BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
+                        }
                     }
                 } else if in_scope {
                     verified_links += 1;
@@ -1373,7 +1388,8 @@ impl AuditStore {
             verified_links,
             broken_links,
             tampered,
-            "audit chain verification done (PRD §13.3, HMAC, P0-1 tenant-scoped, P0-4 incremental)"
+            key_version_unknown_rows,
+            "audit chain verification done (PRD §13.3, HMAC, P0-1 tenant-scoped, P0-4 incremental, H-E key-loss distinguish)"
         );
         Ok(ChainVerification {
             total_rows,
@@ -1382,6 +1398,7 @@ impl AuditStore {
             broken_links,
             tampered,
             first_broken_at,
+            key_version_unknown_rows,
         })
     }
 
@@ -1457,6 +1474,7 @@ impl AuditStore {
         let mut broken_links = 0usize;
         let mut tampered = false;
         let mut first_broken_at: Option<usize> = None;
+        let mut key_version_unknown_rows = 0usize;
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, row) in rows.enumerate() {
             let (audit_id, ts, permission, requester, result, reason, prev_hash, event_hash, kv) =
@@ -1481,10 +1499,14 @@ impl AuditStore {
             // P1-2: 用行 key_version 派生 chain key 验。
             let computed = compute_event_hmac(&self.chain_key, kv, &payload, &prev_hash);
             if computed != event_hash {
-                tampered = true;
                 broken_links += 1;
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
+                }
+                // H-E (item d): 区分真篡改 vs 密钥丢失。
+                match classify_break(&self.tokens, kv) {
+                    BreakKind::KeyLoss => key_version_unknown_rows += 1,
+                    BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
                 }
             } else {
                 verified_links += 1;
@@ -1506,6 +1528,7 @@ impl AuditStore {
             broken_links,
             tampered,
             first_broken_at,
+            key_version_unknown_rows,
         })
     }
 
@@ -1535,6 +1558,7 @@ impl AuditStore {
         let mut broken_links = 0usize;
         let mut tampered = false;
         let mut first_broken_at: Option<usize> = None;
+        let mut key_version_unknown_rows = 0usize;
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, row) in rows.enumerate() {
             let (mutation_id, ts, kind, name, rule_json, prev_hash, event_hash, kv) = row?;
@@ -1556,10 +1580,14 @@ impl AuditStore {
             // P1-2: 用行 key_version 派生 chain key 验。
             let computed = compute_event_hmac(&self.chain_key, kv, &payload, &prev_hash);
             if computed != event_hash {
-                tampered = true;
                 broken_links += 1;
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
+                }
+                // H-E (item d): 区分真篡改 vs 密钥丢失。
+                match classify_break(&self.tokens, kv) {
+                    BreakKind::KeyLoss => key_version_unknown_rows += 1,
+                    BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
                 }
             } else {
                 verified_links += 1;
@@ -1581,6 +1609,7 @@ impl AuditStore {
             broken_links,
             tampered,
             first_broken_at,
+            key_version_unknown_rows,
         })
     }
 
@@ -1597,6 +1626,7 @@ impl AuditStore {
                     broken_links: 0,
                     tampered: false,
                     first_broken_at: None,
+                    key_version_unknown_rows: 0,
                 }
             }
         };
@@ -1606,6 +1636,7 @@ impl AuditStore {
         let mut broken_links = 0usize;
         let mut tampered = false;
         let mut first_broken_at: Option<usize> = None;
+        let mut key_version_unknown_rows = 0usize;
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, line) in content.lines().filter(|l| !l.is_empty()).enumerate() {
             total_rows += 1;
@@ -1675,10 +1706,14 @@ impl AuditStore {
             mac.update(&payload);
             let computed = hex_encode(&mac.finalize().into_bytes());
             if computed != hmac {
-                tampered = true;
                 broken_links += 1;
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
+                }
+                // H-E (item d): 区分真篡改 vs 密钥丢失 (死信行 kv 取自 JSON, 老格式默认 1)。
+                match classify_break(&self.tokens, kv) {
+                    BreakKind::KeyLoss => key_version_unknown_rows += 1,
+                    BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
                 }
             } else {
                 verified_links += 1;
@@ -1701,6 +1736,7 @@ impl AuditStore {
             broken_links,
             tampered,
             first_broken_at,
+            key_version_unknown_rows,
         }
     }
 
@@ -1845,12 +1881,17 @@ impl AuditStore {
         let rules = self.verify_rules_chain()?;
         let dead_letter = self.verify_dead_letter();
         let tampered = audit.tampered || tcc.tampered || rules.tampered || dead_letter.tampered;
+        let key_loss = audit.key_version_unknown_rows > 0
+            || tcc.key_version_unknown_rows > 0
+            || rules.key_version_unknown_rows > 0
+            || dead_letter.key_version_unknown_rows > 0;
         Ok(AllChainsVerification {
             audit,
             tcc,
             rules,
             dead_letter,
             tampered,
+            key_loss,
         })
     }
 
@@ -2253,6 +2294,44 @@ fn compute_event_hmac(
     mac.update(prev_hash.as_bytes());
     mac.update(payload);
     hex_encode(&mac.finalize().into_bytes())
+}
+
+// H-E (item d): 行 HMAC 不匹配的成因分类。verify 路径遇不匹配行时调 classify_break,
+// 区分真篡改与密钥丢失, 避免密钥丢失被误报为全量篡改 (product-audit H-E 核心缺陷)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakKind {
+    // 当前 master 能派生该行 key_version (锚点匹配) → 行内容被改 = 真篡改。
+    Tamper,
+    // 当前 master 无法派生该行 key_version (锚点不匹配) → 密钥丢失, 行不可验但非篡改。
+    KeyLoss,
+    // 旧迁移行无锚点 (NULL) → fail-closed 当篡改 (攻击者删锚点无法隐藏篡改)。
+    MissingAnchor,
+}
+
+// H-E (item d): 用 key_version 锚点分类 HMAC 不匹配行。查 key_versions.key_anchor,
+// 与当前 master 重算锚点比较。tokens.key_anchor 读 token.db (独立锁, 不阻 audit 写)。
+fn classify_break(tokens: &TokenStore, key_version: i64) -> BreakKind {
+    match tokens.key_anchor(key_version) {
+        Ok(Some(stored)) => {
+            // 当前 master 重算该 version 锚点 (master_key 原始引用拷一份派生, 不持久化派生 key)。
+            let master = Zeroizing::new(*tokens.master_key());
+            let recomputed = token_store::key_anchor_for_version(&master, key_version);
+            if recomputed == stored {
+                BreakKind::Tamper
+            } else {
+                BreakKind::KeyLoss
+            }
+        }
+        Ok(None) => BreakKind::MissingAnchor,
+        Err(e) => {
+            tracing::warn!(
+                key_version = key_version,
+                error = %e,
+                "H-E: key_anchor lookup failed — fail-closed as tamper"
+            );
+            BreakKind::MissingAnchor
+        }
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

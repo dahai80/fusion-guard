@@ -23,6 +23,28 @@ Keychain 密钥不入进程环境变量, 同 UID 进程不可经 `ps eww` / `lso
 
 之后启动直接从 Keychain 加载, 不再生成。**H-E**: token key 一旦 Keychain 丢失而 DB 已有历史数据, 拒绝静默重生成 (否则历史 token 不可解 + 审计链验证全报篡改), 启动报错。
 
+### 主密钥托管 (escrow, H-E item b)
+
+token key 丢失 = 单点致命: 历史可逆 token 不可解 + 全审计链验证失败。**首次自动生成或预置后, 立即把密钥导出到离线备份**, 不要只存 Keychain (Keychain 可能因用户账户重置 / keychain 重建而丢)。
+
+```bash
+# 导出 (首次启动后, 或预置后):
+security find-generic-password -s fusion-guard -a token-key -w > /secure/offline/fusion-guard-token-key.txt
+chmod 600 /secure/offline/fusion-guard-token-key.txt
+# 立即清屏历史: history -d ... (勿留 shell 历史)
+```
+
+**恢复路径 (密钥丢失)**: 从 escrow 取回**同一**密钥 → 重写 Keychain → 重启守护。同 master → 锚点匹配 → 无假篡改, 无需 remint:
+
+```bash
+KEY=$(cat /secure/offline/fusion-guard-token-key.txt)
+security delete-generic-password -s fusion-guard -a token-key   # 若残留错误项先删
+security add-generic-password -s fusion-guard -a token-key -w "${KEY}"
+./start.sh start
+```
+
+无 escrow 备份 → 密钥不可恢复。此时历史审计链无法复验, 只能作为"密钥丢失 (key_loss=true, 非真篡改)"处理 (见下 §密钥丢失区分); 可逆 token 历史数据彻底不可解。**这是为何 escrow 是部署必需步骤**。
+
 ### operator 预置 (推荐: 不依赖自动生成)
 
 operator 可预先写入固定密钥 (多节点部署需各节点同密钥以互操作):
@@ -124,11 +146,36 @@ plist 占位符 `__GUARD_BIN__` / `__HOME__` 渲染为真实绝对路径; 残留
 
 ## 密钥轮换
 
-- **token key 轮换**: `guard` IPC 暴露轮换接口 (bump key_version, HKDF 新派生 key; 旧 key_version 行用旧 key 验/解)。轮换后 Keychain 更新:
+轮换分两种语义, 不可混淆:
+
+- **版本轮换 (rotate_key, 推荐常态)**: master key 不变, 仅 bump `key_version`。HKDF 按 version 派生新 chain/token key; 旧行落库时记旧 `key_version`, 用旧派生 key 验/解 (确定性 HKDF, 同 master 可重算)。**历史数据轮换后仍可验可解**, 无需 re-hash/re-encrypt。
   ```bash
-  NEW=$(python3 -c "import secrets;print(secrets.token_hex(32))")
-  security delete-generic-password -s fusion-guard -a token-key
-  security add-generic-password -s fusion-guard -a token-key -w "${NEW}"
-  # 重启守护进程加载新 key (旧 key_version 数据仍可解 — 版本化派生)
+  # IPC 调用 (bump version, master 不动, 不碰 Keychain)
+  # {"jsonrpc":"2.0","id":1,"method":"guard.key.rotate","params":{"secret":"<SHARED_SECRET>"}}
+  # 返回 new_version。之后新审计行/token 记 new_version。
   ```
+  验证: `guard.audit.verify` 透过 (混合 v1+v2 链 broken_links=0, tampered=false)。测试 `he_key_loss_distinguish_test::rotation_all_chains_and_tokens_verify` 覆盖全 4 链 + token。
+
+- **master key 替换 (慎用, 非常态)**: 真·换 Keychain 主密钥。**不在 rotate_key 接口语义内** (与 H-E (a) 拒绝 remint 一致)。仅当 master 疑似泄露且已 escrow 旧 key (只读保留以验旧链) 时做。替换后旧 `key_version` 的审计链锚点与新 master 不匹配 → 被归类为"密钥丢失" (见下), 非假篡改。流程: escrow 旧 key → 写新 key 到 Keychain → 重启。
+
+> ⚠️ **re-hash 审计链被刻意拒绝**: 即便 master 替换, 也**不**用新 key 重算历史行的 HMAC。防篡改的保证正是"hash 不可变" —— re-sign 等于自废武功, 攻击者无法区分真篡改与运维 re-hash。正确做法: 旧 key escrow 只读保留, 旧链用旧 key 验 (锚点匹配旧 master); 新链起新 version。`guard.audit.verify` 的 `key_loss` 字段区分"密钥丢失"与"真篡改"。
+
 - **shared secret 轮换**: 直接 Keychain 更新 + 重启 + 同步所有客户端新 secret。无版本化 (第二因子, 非加密密钥), 轮换瞬间旧 client secret 失效。
+
+## 密钥丢失区分 (H-E item d)
+
+`guard.audit.verify` 返回字段区分 HMAC 不匹配的根因, 避免密钥丢失被误报为全量篡改:
+
+| 字段 | 含义 |
+|------|------|
+| `tampered` | 真·篡改 (同 master 能派生该行 version, 但 HMAC 对不上 = 内容被改) 或 prev_hash 断链或空 hash 行 |
+| `key_version_unknown_rows` | 密钥丢失行数: 行 version 锚点与当前 master 重算不匹配 (master 无法派生该 version) |
+| `key_loss` | 聚合: 任一链有 `key_version_unknown_rows > 0` |
+| `broken_links` | 总不可验证行数 = 篡改 + 丢失 + 空hash |
+
+诊断逻辑 (per-version `key_anchor`):
+- 纯密钥丢失 (master 换了, 无内容篡改): `key_loss=true`, `tampered=false`, `key_version_unknown_rows>0` → 从 escrow 恢复原 master 即可复验, **非安全事件**。
+- 真篡改: `tampered=true`, `key_version_unknown_rows=0` → 立即按安全事件响应。
+- 锚点缺失 (legacy NULL 迁移行 / 攻击者清锚点): fail-closed 当 `tampered` (攻击者无法靠删锚点把篡改伪装成密钥丢失)。
+
+旧库 (H-E 迁移前无 `key_anchor` 列) 启动时 idempotent `ALTER TABLE ADD COLUMN key_anchor TEXT`, 旧行锚点 NULL → 验证时若 HMAC 不匹配则 fail-closed 当篡改 (保守)。新行 mint/rotate 即写锚点。
