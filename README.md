@@ -1,161 +1,163 @@
 # fusion-guard
 
-Fusion local AI OS 的零信任动作授权守护进程 (zero-trust action authorization daemon)。拦截 Agent 高风险副作用 (`rm -rf`、静默外发),动态脱敏敏感字段 (API Key、密码、身份证号、私钥),聚合 macOS TCC 权限审计。
+English | [中文](README_CN.md)
 
-**PRD 源**: `/Users/dahai/fusion/architecture/fusion-guard-prd-plan-v2-0826.md` (v0.2)
+Zero-trust action authorization daemon for the Fusion local AI OS. Intercepts high-risk Agent side-effects (`rm -rf`, silent exfiltration), dynamically masks sensitive fields (API keys, passwords, ID numbers, private keys), and aggregates macOS TCC permission audit.
 
-## 状态
+**PRD source**: `/Users/dahai/fusion/architecture/fusion-guard-prd-plan-v2-0826.md` (v0.2)
 
-Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审计链式 hash + PyO3 + Endpoint Security + tree-sitter 语义阶段) 完成。14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。当前版本 **v0.1.2** (minor: 跨节点集群消费方 fg-cluster + guard.cluster.* 3 原语, issue #4 闭合)。
+## Status
 
-| 验收项 | 状态 |
-|--------|------|
+Phase 2 complete, Phase 5 (TCC audit aggregation + Swift bridge) complete, Phase 7 (audit chain hash + PyO3 + Endpoint Security + tree-sitter semantic stage) complete. 14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL audit + rule SSOT/epoch persistence. Current version **v0.2.0-rc.2** (H-E master-key loss vs real tamper distinction + pong:bool contract fix + 7/7 upstream integration issues all closed, code-level production-ready).
+
+| Acceptance item | Status |
+|-----------------|--------|
 | `cargo build` (debug + release) | ✅ |
-| `./start.sh start` 起 UDS server | ✅ |
+| `./start.sh start` launches UDS server | ✅ |
 | `guard.ping` roundtrip | ✅ |
-| SQLite WAL 审计 (L3+ 同步 / L1-L2 异步) | ✅ |
-| 规则 SSOT + epoch 持久化 (跨重启) | ✅ |
-| stale epoch 拒绝 (-32003) | ✅ |
-| 加密 token store (AES-GCM + Keychain/env 密钥) | ✅ |
-| guard.redact / guard.reveal 往返还原 | ✅ |
-| 跨重启 reveal (加密落盘 H6) | ✅ |
-| reveal 容错回退 (H6) | ✅ |
-| guard.confirm + action_id 一次性兑现 (H4 TTL) | ✅ |
-| L4 绝对拦截无 confirm 路径 (H8) | ✅ |
-| confirm 审计 (approved/rejected) | ✅ |
-| Stage 2 tokenizer (shell-words, AST 阶段白名单+敏感路径) | ✅ |
-| category 推断 (H9: argv[0]→shell_exec/network/file_write) | ✅ |
-| seatbelt_required flag (E7: L3+ / Block 标记) | ✅ |
-| SENSITIVE_PATHS/WHITELIST 收敛 (含 ~/.config/~/.fusion) | ✅ |
-| TCC 状态聚合 (Swift bridge, status-only — H1) | ✅ |
-| guard.tcc.report (审计聚合持久化) | ✅ |
-| guard.tcc.events (TCC 审计查询) | ✅ |
-| 审计链式 hash 防篡改 (PRD §13.3) | ✅ |
-| guard.audit.verify (链完整性校验, 增量 P0-4 + 全链聚合 P0-5) | ✅ |
-| 审计 rotation (100MB/30d 归档 NDJSON) + retention (180d 删归档) | ✅ |
-| Stage 3 tree-sitter 语义阶段 (feature=semantic, 多 grammar 代码扫描) | ✅ |
-| PyO3 绑定 fg-pyo3 (UDS 客户端暴露 Python, 对齐 fe-pyo3) | ✅ |
-| Endpoint Security fg-es (stub 降级, 无 entitlement → TCC — Q#3) | ✅ |
-| guard.es.status / guard.es.events (IPC 暴露, 如实回 degraded — P0-7) | ✅ |
-| guard.audit (fusion-event 冻结契约 D-10, pass/block/challenge 三态) | ✅ |
-| guard.audit_result (challenge 回调回执) | ✅ |
-| PII 脱敏扩展 (email/ipv4/银行卡, issue #2) | ✅ |
-| Python wheel 打包 (maturin pyproject.toml, issue #5) | ✅ |
-| 跨节点集群消费方 fg-cluster (HKDF 域分离 3 MAC key + federated 链验证, issue #4 / multi-nodes#52) | ✅ |
+| SQLite WAL audit (L3+ sync / L1-L2 async) | ✅ |
+| Rule SSOT + epoch persistence (cross-restart) | ✅ |
+| Stale epoch rejected (-32003) | ✅ |
+| Encrypted token store (AES-GCM + Keychain/env key) | ✅ |
+| guard.redact / guard.reveal roundtrip restore | ✅ |
+| Cross-restart reveal (encrypted persisted, H6) | ✅ |
+| Reveal fault-tolerant fallback (H6) | ✅ |
+| guard.confirm + action_id one-time consume (H4 TTL) | ✅ |
+| L4 absolute block, no confirm path (H8) | ✅ |
+| Confirm audit (approved/rejected) | ✅ |
+| Stage 2 tokenizer (shell-words, AST stage whitelist + sensitive paths) | ✅ |
+| Category inference (H9: argv[0]→shell_exec/network/file_write) | ✅ |
+| seatbelt_required flag (E7: L3+ / Block marked) | ✅ |
+| SENSITIVE_PATHS/WHITELIST converged (incl. ~/.config/~/.fusion) | ✅ |
+| TCC status aggregation (Swift bridge, status-only — H1) | ✅ |
+| guard.tcc.report (audit aggregation persisted) | ✅ |
+| guard.tcc.events (TCC audit query) | ✅ |
+| Audit chain hash tamper-evidence (PRD §13.3) | ✅ |
+| guard.audit.verify (chain integrity check, incremental P0-4 + all-chain aggregation P0-5) | ✅ |
+| Audit rotation (100MB/30d archive NDJSON) + retention (180d delete archive) | ✅ |
+| Stage 3 tree-sitter semantic stage (feature=semantic, multi-grammar code scan) | ✅ |
+| PyO3 binding fg-pyo3 (UDS client exposed to Python, aligned fe-pyo3) | ✅ |
+| Endpoint Security fg-es (stub degraded, no entitlement → TCC — Q#3) | ✅ |
+| guard.es.status / guard.es.events (IPC exposed, honest degraded report — P0-7) | ✅ |
+| guard.audit (fusion-event frozen contract D-10, pass/block/challenge tri-state) | ✅ |
+| guard.audit_result (challenge callback receipt) | ✅ |
+| PII masking expansion (email/ipv4/bank-card, issue #2) | ✅ |
+| Python wheel packaging (maturin pyproject.toml, issue #5) | ✅ |
+| Cross-node cluster consumer fg-cluster (HKDF domain-separated 3 MAC keys + federated chain verify, issue #4 / multi-nodes#52) | ✅ |
 | guard.cluster.audit.fetch / epoch.sync / confirm.relay / confirm.list (4 IPC) | ✅ |
-| shared secret macOS Keychain 来源 + release gate H-C (--insecure-secret-env / ALLOW_INSECURE_SECRET, ALLOW_NO_SECRET 应急) | ✅ |
+| shared secret macOS Keychain source + release gate H-C (--insecure-secret-env / ALLOW_INSECURE_SECRET, ALLOW_NO_SECRET emergency) | ✅ |
 
-## 架构
+## Architecture
 
-14-crate Rust workspace (对齐 fusion-executor 布局):
+14-crate Rust workspace (aligned with fusion-executor layout):
 
 ```
 crates/
-├── fg-core           # 核心类型: RiskLevel/SafetyAction/GuardVerdict/GuardError/CheckStage(Regex|Ast|Semantic)
-├── fg-rules          # 规则引擎: regex 阶段 + AST tokenizer 阶段 + Stage 3 tree-sitter 语义阶段 (feature=semantic) + epoch + RuleSet + category 推断
-├── fg-audit-engine   # 审计引擎: 规则评估 + 脱敏联动 + verdict 合成 + TCC 审计聚合编排
-├── fg-redact         # 动态脱敏: api_key/password/id_number/private_key, 可逆/不可逆, placeholder 提取
-├── fg-tcc            # TCC 状态聚合 (status-only, 不 brokering — H1) + 事件类型
-├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC 状态查询, 编译为 static lib, C stub 兜底 (unsafe allow)
-├── fg-es             # Endpoint Security 高危系统事件监控 (安全类型 + 降级状态, unsafe deny)
-├── fg-es-bridge      # ES C FFI 桥: 无 entitlement → C stub 兜底 (cfg(es_bridge_stub), degraded → TCC — PRD Q#3), unsafe allow
+├── fg-core           # Core types: RiskLevel/SafetyAction/GuardVerdict/GuardError/CheckStage(Regex|Ast|Semantic)
+├── fg-rules          # Rule engine: regex stage + AST tokenizer stage + Stage 3 tree-sitter semantic stage (feature=semantic) + epoch + RuleSet + category inference
+├── fg-audit-engine   # Audit engine: rule evaluation + redact coordination + verdict synthesis + TCC audit aggregation orchestration
+├── fg-redact         # Dynamic masking: api_key/password/id_number/private_key, reversible/irreversible, placeholder extraction
+├── fg-tcc            # TCC status aggregation (status-only, no brokering — H1) + event types
+├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC status queries, compiled to static lib, C stub fallback (unsafe allow)
+├── fg-es             # Endpoint Security high-risk system event monitoring (safe types + degraded state, unsafe deny)
+├── fg-es-bridge      # ES C FFI bridge: no entitlement → C stub fallback (cfg(es_bridge_stub), degraded → TCC — PRD Q#3), unsafe allow
 ├── fg-ipc            # UDS JSON-RPC server + 2s timeout + 64 conn + rate limit
-├── fg-store          # SQLite WAL: 审计 append-only (链式 hash) + 规则持久化 + 加密 token store (AES-GCM) + pending action store (H4) + tcc_events
-├── fg-pyo3           # PyO3 绑定: UDS JSON-RPC 客户端暴露 Python (NativeGuardClient), maturin 目标, 对齐 fe-pyo3 (cdylib+rlib)
-├── fg-cluster        # 跨节点消费方 (issue #4 / multi-nodes#52): HKDF 域分离 3 MAC key + federated 链验证 (MAC+prev_hash 双重篡改检出) + reqwest::blocking HTTP 客户端 (5s, Bearer, fail-closed); per-host 非 broker
-└── fg-bin            # fusion-guard 二进制: start/ping 子命令
+├── fg-store          # SQLite WAL: audit append-only (chain hash) + rule persistence + encrypted token store (AES-GCM) + pending action store (H4) + tcc_events
+├── fg-pyo3           # PyO3 binding: UDS JSON-RPC client exposed to Python (NativeGuardClient), maturin target, aligned fe-pyo3 (cdylib+rlib)
+├── fg-cluster        # Cross-node consumer (issue #4 / multi-nodes#52): HKDF domain-separated 3 MAC keys + federated chain verify (MAC+prev_hash double tamper detection) + reqwest::blocking HTTP client (5s, Bearer, fail-closed); per-host not broker
+└── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
-## 跨节点集群消费方 (issue #4 / multi-nodes#52, PRD §4.1/§8.2)
+## Cross-node Cluster Consumer (issue #4 / multi-nodes#52, PRD §4.1/§8.2)
 
-fusion-multi-node 定义 TRANSPORT + IDENTITY + KEY SCHEME (PR #54 MERGED); fusion-guard 实现**消费方** (per-host, 非 broker)。100% 本地/LAN, 无云。
+fusion-multi-node defines TRANSPORT + IDENTITY + KEY SCHEME (PR #54 MERGED); fusion-guard implements the **consumer** (per-host, not broker). 100% local/LAN, no cloud.
 
-- **密钥方案** (`fg-cluster::key`): HKDF-SHA256 从 `cluster_token` (env `FUSION_GUARD_CLUSTER_TOKEN`) 域分离派生 3 个 MAC 密钥, info label `b"fusion-multinode-{audit-chain,rule-epoch,confirm-relay}-v1"` (KEY_LEN=32, salt=None)。`canonical_json` (排序键 + compact + `ensure_ascii=False`) 保 MAC 输入确定性。`mac_payload` (HMAC-SHA256→hex), `verify_mac` (常量时间, 空→false)。
-- **原语 1 — federated 审计链验证** (`fg-cluster::verify`): 每记录带 `seq` / `prev_hash` (= 含 mac 的完整前序记录 sha256) / `mac` (= HMAC over 记录减 mac)。双重篡改检出: 字段翻转→MAC 不匹配 + 下条 prev_hash 断链。降级记录 (缺链字段) → 基线跳过。`verify_chain_segment` → `{total_records, verified_links, broken_links, baseline_records, tampered, first_broken_at}`。
-- **原语 2 — 集群规则纪元 reconcile**: `guard.cluster.epoch.sync` — local>cluster→推进集群纪元对齐 (leader-only, 非 leader 409 best-effort); local<cluster→`local_behind`; equal→`in_sync`。Checkpoint 2 SSOT 扩展集群域。
-- **原语 3 — confirm 中继聚合**: `guard.cluster.confirm.relay` 构 MAC 中继到 master; `guard.cluster.confirm.list` 查聚合。
-- **IPC**: `guard.cluster.audit.fetch {since_seq}` / `epoch.sync` / `confirm.relay` / `confirm.list`。无 `FUSION_GUARD_CLUSTER_TOKEN` (单节点) → `-32011` cluster-not-configured, 非静默。
-- **HTTP 客户端**: `reqwest::blocking` (handle_method 跑 spawn_blocking 独立线程, 非 tokio worker, 阻塞 IO 安全), 5s 超时, Bearer `cluster_token` 鉴权, 非 2xx fail-closed。
+- **Key scheme** (`fg-cluster::key`): HKDF-SHA256 derives 3 MAC keys from `cluster_token` (env `FUSION_GUARD_CLUSTER_TOKEN`) with domain separation, info label `b"fusion-multinode-{audit-chain,rule-epoch,confirm-relay}-v1"` (KEY_LEN=32, salt=None). `canonical_json` (sorted keys + compact + `ensure_ascii=False`) ensures deterministic MAC input. `mac_payload` (HMAC-SHA256→hex), `verify_mac` (constant-time, empty→false).
+- **Primitive 1 — federated audit chain verify** (`fg-cluster::verify`): each record carries `seq` / `prev_hash` (= sha256 of the full prior record incl mac) / `mac` (= HMAC over record minus mac). Double tamper detection: field flip → MAC mismatch + next record's prev_hash breaks chain. Degraded records (missing chain fields) → baseline skip. `verify_chain_segment` → `{total_records, verified_links, broken_links, baseline_records, tampered, first_broken_at}`.
+- **Primitive 2 — cluster rule epoch reconcile**: `guard.cluster.epoch.sync` — local>cluster → advance cluster epoch to align (leader-only, non-leader 409 best-effort); local<cluster → `local_behind`; equal → `in_sync`. Extends Checkpoint 2 SSOT to the cluster domain.
+- **Primitive 3 — confirm relay aggregation**: `guard.cluster.confirm.relay` constructs a MAC and relays to master; `guard.cluster.confirm.list` queries aggregation.
+- **IPC**: `guard.cluster.audit.fetch {since_seq}` / `epoch.sync` / `confirm.relay` / `confirm.list`. Missing `FUSION_GUARD_CLUSTER_TOKEN` (single-node) → `-32011` cluster-not-configured, non-silent.
+- **HTTP client**: `reqwest::blocking` (handle_method runs in spawn_blocking on an independent thread, not a tokio worker, blocking-IO safe), 5s timeout, Bearer `cluster_token` auth, non-2xx fail-closed.
 
-## Stage 3 语义阶段 (tree-sitter, PRD §7.4 R5)
+## Stage 3 Semantic Stage (tree-sitter, PRD §7.4 R5)
 
-`feature = "semantic"` 启用 (默认关, MVP 仅 shell-words — PRD "需时再引且锁版本")。代码内容 (非命令) 经 tree-sitter 多 grammar 扫描危险调用:
+Enabled via `feature = "semantic"` (off by default, MVP uses shell-words only — PRD "introduce when needed, lock version"). Code content (not commands) scanned for dangerous calls via tree-sitter multi-grammar:
 
 ```
-content (代码)
+content (code)
   │
   ▼
 semantic_check (fg-rules::semantic, feature=semantic)
   ├── Python grammar (tree-sitter-python 0.23): os.system/subprocess.*/eval/exec/__import__/pickle.loads → L4/L3
   ├── JavaScript grammar (tree-sitter-javascript 0.23): eval/Function/child_process.exec → L3/L4
-  ├── TypeScript grammar (tree-sitter-typescript 0.23): 同 JS
+  ├── TypeScript grammar (tree-sitter-typescript 0.23): same as JS
   └── Rust grammar (tree-sitter-rust 0.23): Command::new/remove_dir_all → L4
   │
   ▼
-evaluate_full 合并: regex (Stage 1) + tokenizer (Stage 2) + semantic (Stage 3) → max risk verdict
+evaluate_full merges: regex (Stage 1) + tokenizer (Stage 2) + semantic (Stage 3) → max risk verdict
 ```
 
-- **版本锁**: tree-sitter 0.25 + grammars 0.23, 与 `fusion-executor` workspace 同 Cargo.lock 段 (PRD §7.4 防 grammar 漂移)。
-- **默认关**: `default = []`。启用: `cargo build -p fg-bin --features semantic --release`。透传链 fg-bin → fg-audit-engine → fg-rules/semantic。
-- **CheckStage::Semantic**: 命中 verdict `stage=Semantic`, `inferred_category=semantic:<lang>:<callee>`, `scope=Content`。
+- **Version lock**: tree-sitter 0.25 + grammars 0.23, aligned with `fusion-executor` workspace Cargo.lock segment (PRD §7.4 grammar drift guard).
+- **Off by default**: `default = []`. Enable: `cargo build -p fg-bin --features semantic --release`. Forwarding chain fg-bin → fg-audit-engine → fg-rules/semantic.
+- **CheckStage::Semantic**: hit verdict `stage=Semantic`, `inferred_category=semantic:<lang>:<callee>`, `scope=Content`.
 
-## 风险等级 (4-tier)
+## Risk Levels (4-tier)
 
-| 级别 | 行为 | 示例 |
-|------|------|------|
-| L1 | Allow (自主) | 读非敏感文件 |
-| L2 | Preview/Redact | 含敏感字段内容 |
-| L3 | Gateway 人工确认 | 删除文件、HTTP 请求 |
-| L4 | **Block (绝对,无确认路径 — H8)** | `rm -rf` 递归删除 |
+| Level | Behavior | Example |
+|-------|----------|---------|
+| L1 | Allow (autonomous) | Read non-sensitive file |
+| L2 | Preview/Redact | Content with sensitive fields |
+| L3 | Gateway human confirmation | Delete file, HTTP request |
+| L4 | **Block (absolute, no confirm path — H8)** | `rm -rf` recursive delete |
 
-## 两级校验 (Stage 1 Regex + Stage 2 Tokenizer)
+## Two-stage Validation (Stage 1 Regex + Stage 2 Tokenizer)
 
 ```
 content
   │
   ▼
 Stage 1 (Regex, fg-rules::evaluate)
-  ├── 命中 blocklist 规则 (rm -rf / curl|sh / sudo / dd / git force-push 等) → 直接 Block (L4)
-  └── 未命中 → 进 Stage 2
+  ├── Hits blocklist rule (rm -rf / curl|sh / sudo / dd / git force-push etc.) → direct Block (L4)
+  └── No hit → proceed to Stage 2
   │
   ▼
 Stage 2 (Tokenizer, fg-rules::tokenizer::tokenize_check, shell-words MVP)
-  ├── 命令替换 $(...)/反引号 / 进程替换 <(...) → Block (L3)
-  ├── split_chain 按 &&/||/;/|/换行 分段 (尊重单/双引号)
-  ├── shell_words::split 每段 → argv[0] basename → WHITELIST 检查
-  │     └── 非白名单二进制 (nc/scp/rm 等) → Block (L3, sensitive_target=false)
-  ├── argv 敏感路径检查 (mv/cp 目的地 / cat/grep 读源 / tee/chmod/cd 参数 / 重定向目标)
-  │     └── 命中 SENSITIVE_PATHS → Block (L4, sensitive_target=true)
-  ├── 凭据文件名 (id_rsa / .pem / .key / .p12 / .pfx / .keystore / .htpasswd) → Block (L4)
-  ├── .. 路径逃逸 (cat/grep 读源含 .. 组件) → Block (L4)
+  ├── Command substitution $(...)/backtick / process substitution <(...) → Block (L3)
+  ├── split_chain splits on &&/||/;/|/newline (quote-aware single/double)
+  ├── shell_words::split per segment → argv[0] basename → WHITELIST check
+  │     └── Non-whitelist binary (nc/scp/rm etc.) → Block (L3, sensitive_target=false)
+  ├── argv sensitive path check (mv/cp destination / cat/grep read-source / tee/chmod/cd arg / redirect target)
+  │     └── Hits SENSITIVE_PATHS → Block (L4, sensitive_target=true)
+  ├── Credential filename (id_rsa / .pem / .key / .p12 / .pfx / .keystore / .htpasswd) → Block (L4)
+  ├── .. path escape (cat/grep read-source contains .. component) → Block (L4)
   └── sed -i / find -exec / git config/-c/alias → Block (L4)
 ```
 
-**Category 推断 (H9)**: guard 从内容推断 category, 非依赖 caller 声明。argv[0]=rm/sh/dd/diskutil→`shell_exec`, curl/wget/scp/ssh→`network`, 重定向到敏感路径→`file_write`。最终级别 = max(推断, 规则命中, hint)。
+**Category inference (H9)**: guard infers category from content, not caller declaration. argv[0]=rm/sh/dd/diskutil→`shell_exec`, curl/wget/scp/ssh→`network`, redirect to sensitive path→`file_write`. Final level = max(inferred, rule hit, hint).
 
-**seatbelt_required (E7)**: verdict 对 L3/L4 或 Block 标记 `seatbelt_required:true` (flag, 非 profile 文本)。executor 据此决定是否编译 seatbelt profile。
+**seatbelt_required (E7)**: verdict marks `seatbelt_required:true` for L3/L4 or Block (flag, not profile text). executor decides whether to compile a seatbelt profile based on this.
 
-**收敛源**: SENSITIVE_PATHS/WHITELIST/分词逻辑对齐 `fusion-executor/crates/fe-security` (只读收敛, 扩展 `~/.config`/`~/.fusion` per PRD §7.5)。tree-sitter Stage 3 语义阶段已落地 (feature=semantic, 见上文 §Stage 3); MVP 命令扫描仍用 shell-words (Stage 2)。
+**Convergence source**: SENSITIVE_PATHS/WHITELIST/tokenizer logic aligned with `fusion-executor/crates/fe-security` (read-only convergence, extended `~/.config`/`~/.fusion` per PRD §7.5). tree-sitter Stage 3 semantic stage landed (feature=semantic, see §Stage 3 above); MVP command scan still uses shell-words (Stage 2).
 
-## TCC 审计聚合 (H1, PRD §9)
+## TCC Audit Aggregation (H1, PRD §9)
 
-guard **不 brokering** TCC — macOS per-app 模型, 各子项目自请求权限。guard 只两件事:
-- **状态查询**: `guard.tcc.status` 经 Swift bridge (`@_cdecl` FFI, 编译为 static lib) 查 6 服务 (Accessibility/ScreenRecording/FullDiskAccess/Microphone/Camera/AppleEvents)。Swift 不可用时 C stub 兜底 (`cfg(tcc_bridge_stub)`)。
-- **审计聚合**: `guard.tcc.report` 记录各项目 TCC 请求结果到 `tcc_events` 表, `guard.tcc.events` 查询。`source` 字段标记来源 (`swift-bridge:live` / `tccutil:stub`)。
+guard does **not broker** TCC — macOS per-app model, each subproject requests its own permissions. guard does two things:
+- **Status query**: `guard.tcc.status` queries 6 services (Accessibility/ScreenRecording/FullDiskAccess/Microphone/Camera/AppleEvents) via Swift bridge (`@_cdecl` FFI, compiled to static lib). Swift unavailable → C stub fallback (`cfg(tcc_bridge_stub)`).
+- **Audit aggregation**: `guard.tcc.report` records each project's TCC request result to `tcc_events` table, `guard.tcc.events` queries. `source` field tags origin (`swift-bridge:live` / `tccutil:stub`).
 
 ```
-子项目自请求 TCC (macOS per-app)
-        │  结果上报
+subproject self-requests TCC (macOS per-app)
+        │  result reported
         ▼
-guard.tcc.report → tcc_events 表 (审计聚合, 非授权)
-guard.tcc.status → Swift bridge → 状态 (6 服务)
+guard.tcc.report → tcc_events table (audit aggregation, not authorization)
+guard.tcc.status → Swift bridge → status (6 services)
 ```
 
-fg-tcc-bridge 是 workspace 唯一 `unsafe_code = "allow"` crate (FFI 必须); fg-tcc 保持 `deny`。Swift 编译失败自动降级 stub, build.rs emit `cargo:rustc-cfg=tcc_bridge_stub`。
+fg-tcc-bridge is the workspace's only `unsafe_code = "allow"` crate (FFI requires it); fg-tcc stays `deny`. Swift compile failure auto-degrades to stub, build.rs emits `cargo:rustc-cfg=tcc_bridge_stub`.
 
-## 审计链式 hash 防篡改 (PRD §13.3)
+## Audit Chain Hash Tamper-evidence (PRD §13.3)
 
-每条审计事件带链式 hash (前一条 `event_hash` 入下一条 `prev_hash`), 防止审计行被事后篡改/删除:
+Each audit event carries a chain hash (prior row's `event_hash` enters next row's `prev_hash`), preventing post-hoc tampering/deletion of audit rows:
 
 ```
 event_1: prev_hash=genesis(000…0),  event_hash=SHA256(genesis || payload_1)
@@ -163,139 +165,139 @@ event_2: prev_hash=event_hash_1,    event_hash=SHA256(event_hash_1 || payload_2)
 event_3: prev_hash=event_hash_2,    event_hash=SHA256(event_hash_2 || payload_3)
 ```
 
-- **payload** = 11 字段 (`audit_id/ts/event_type/tenant_id/requester/action/inferred_category/verdict_json/approved_by/seatbelt_required/outcome`) 用 `\x1f` 连接。改任一字段 → `event_hash` 对不上 → 检出。
-- **单连接序列化**: 所有审计插入 (同步高风险 + 异步低风险) 走同一 `Arc<Mutex<Connection>>`, 插入时锁内读上一条 `event_hash` → 算本条 hash。消除并发读 prev_hash 导致的链分叉。
-- **`guard.audit.verify`**: 增量校验 (P0-4) — `chain_checkpoint` 缓存上次校验通过的末行 `audit_id`+`event_hash`, 本调用只验该行之后的新增段, O(新增量) 而非 O(全表)。锚点用 `audit_id` (UUID, VACUUM 后 rowid 重排不失效)。退化条件 (安全起见全表扫): 无 checkpoint; 锚行已被归档删除 (audit_id 缺失); hash 对不上; 检出篡改 (重算全表以定位 `first_broken_at`, 不缓存坏点)。返回 `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at, key_version_unknown_rows}` (聚合 `verify_all_chains` 另增 `key_loss` + 各子链结果)。`key_version_unknown_rows`/`key_loss` 见下 §H-E。
-- **迁移兼容**: 老 DB 无 `prev_hash`/`event_hash` 列 → `migrate_audit_chain` 幂等 `ALTER TABLE ADD COLUMN`(DEFAULT '')。空 hash 行计为 `unhashed_rows`, 不误报 tamper。append-only, 不回填历史行。
-- **依赖**: `sha2 = "0.10"` (workspace dep)。
+- **payload** = 11 fields (`audit_id/ts/event_type/tenant_id/requester/action/inferred_category/verdict_json/approved_by/seatbelt_required/outcome`) joined by `\x1f`. Modifying any field → `event_hash` mismatch → detected.
+- **Single serialized connection**: all audit inserts (sync high-risk + async low-risk) go through one `Arc<Mutex<Connection>>`; inside the lock, reads the prior row's `event_hash` → computes current hash. Eliminates chain fork from concurrent prev_hash reads.
+- **`guard.audit.verify`**: incremental verification (P0-4) — `chain_checkpoint` caches the last verified row's `audit_id`+`event_hash`; this call only verifies the new segment after that row, O(new delta) not O(full table). Anchor uses `audit_id` (UUID, stable after VACUUM reorders rowid). Degradation conditions (full table scan for safety): no checkpoint; anchor row archived/deleted (audit_id missing); hash mismatch; tamper detected (recompute full table to locate `first_broken_at`, no bad-point caching). Returns `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at, key_version_unknown_rows}` (aggregated `verify_all_chains` adds `key_loss` + each sub-chain result). `key_version_unknown_rows`/`key_loss` see §H-E below.
+- **Migration compat**: legacy DB without `prev_hash`/`event_hash` columns → `migrate_audit_chain` idempotent `ALTER TABLE ADD COLUMN`(DEFAULT ''). Empty-hash rows counted as `unhashed_rows`, not false tamper. Append-only, no backfill of historical rows.
+- **Dependency**: `sha2 = "0.10"` (workspace dep).
 
-### Rotation / Retention / 增量校验 (P0-4, PRD §13.3)
+### Rotation / Retention / Incremental Verification (P0-4, PRD §13.3)
 
-审计库体积随事件增长线性膨胀, 无界增长会拖慢 verify + 耗尽磁盘。治理分三段:
+The audit DB grows linearly with events; unbounded growth slows verify + exhausts disk. Governance in three stages:
 
-- **Rotation (归档触发)**: `enforce_retention` 在每次审计写后调用。触发条件二选一: DB 体积 > `ROTATE_BYTES` (100MB) 或 存在 `ts < now - ROTATE_AGE_DAYS` (30d) 的旧行。触发 → 超龄旧行导出到 NDJSON 归档文件 (`<archive_dir>/audit-YYYYMMDDTHHMMSS.ndjson`, 0o600), 单事务删行 + `VACUUM` 回收页。归档文件含完整链字段 (prev_hash/event_hash), 跨归档可独立重算校验。
-- **Retention (冷存到期)**: 同次扫描归档目录, 文件名时间戳超 `RETENTION_DAYS` (180d) 的 `.ndjson` 删除 (按文件名非 mtime — mtime 可被 touch/cp 篡改)。生产归档目录 `~/.fusion-guard/audit-archive/` (env `FUSION_GUARD_ARCHIVE_DIR` 覆盖)。
-- **归档边界链连续**: 归档后剩余首行的 `prev_hash` 指向已归档行 (主库内悬空)。全表 verify 会误报 broken → 故归档后写 checkpoint 锚定剩余首行 (走增量, 跳过悬空段)。空库归档态 (全段已归档删): checkpoint 用空 `last_verified_audit_id` 哨兵 + `last_archived_hash`, verify 从归档段末 hash 作 `expected_prev` 续扫; 下次插入也读 `last_archived_hash` 作 `prev_hash` (续链非 genesis)。
-- **per-store 归档目录**: 非全局 env — `resolve_archive_dir(db_path)` 从 db 同级 `audit-archive/` 解析 (env 覆盖仍优先)。隔离并发测试 store 不抢同一 env; 生产单守护进程单 DB 单归档目录语义不变。
-- **Retention monitor (drain 路径覆盖)**: `enforce_retention` 原只在高风险 `append_event` 同步路径调, drain 线程只插 L1/L2 低风险行不触 rotation → 高频低风险流量下 audit_events 无界增长。守护进程启动 `spawn_retention_monitor(interval_secs=5)` 周期调 `enforce_retention` 覆盖低风险积累 (商用阻塞点 #6 soak 发现)。
-- **rotate 锁优化**: `rotate_old_rows` 检查阶段 (COUNT 超龄行 + db_bytes 判阈值) + 选待归档行改用 `read_conn` (query_only, 不抢 `audit_writer` 写锁), 仅删行 + checkpoint + VACUUM mutate 段锁 `audit_writer`。原实现整段持写锁跑空检查 → append_event 高风险同步路径自 DoS + 5s monitor 持锁空查吞吐骤降。30s soak: throughput +24%, p99 −20ms。TOCTOU 安全: rowid 单调增, 删按 rowid 区间, 并发插入不受影响。
+- **Rotation (archive trigger)**: `enforce_retention` called after each audit write. Trigger when either: DB size > `ROTATE_BYTES` (100MB) OR rows exist with `ts < now - ROTATE_AGE_DAYS` (30d). On trigger → aged rows exported to NDJSON archive file (`<archive_dir>/audit-YYYYMMDDTHHMMSS.ndjson`, 0o600), single-transaction row delete + `VACUUM` reclaims pages. Archive file carries full chain fields (prev_hash/event_hash), independently re-verifiable across archives.
+- **Retention (cold-store expiry)**: same scan of archive dir; `.ndjson` files whose filename timestamp exceeds `RETENTION_DAYS` (180d) deleted (by filename not mtime — mtime forgeable via touch/cp). Production archive dir `~/.fusion-guard/audit-archive/` (env `FUSION_GUARD_ARCHIVE_DIR` overrides).
+- **Archive-boundary chain continuity**: after archive, the remaining first row's `prev_hash` points to an archived row (dangling within main DB). Full-table verify would false-report broken → so after archive a checkpoint anchors the remaining first row (incremental, skips dangling segment). Empty-DB archived state (entire segment archived+deleted): checkpoint uses an empty `last_verified_audit_id` sentinel + `last_archived_hash`; verify continues from the archive segment's last hash as `expected_prev`; next insert also reads `last_archived_hash` as `prev_hash` (continues chain, not genesis).
+- **Per-store archive dir**: not a global env — `resolve_archive_dir(db_path)` resolves from db's sibling `audit-archive/` (env override still takes priority). Isolates concurrent test stores from racing on one env; production single-daemon single-DB single-archive-dir semantics unchanged.
+- **Retention monitor (drain path coverage)**: `enforce_retention` was only called on the high-risk `append_event` sync path; the drain thread only inserts L1/L2 low-risk rows without triggering rotation → audit_events unbounded growth under high-volume low-risk traffic. Daemon startup `spawn_retention_monitor(interval_secs=5)` periodically calls `enforce_retention` covering low-risk accumulation (commercial blocker #6, found via soak).
+- **Rotate lock optimization**: `rotate_old_rows` check phase (COUNT aged rows + db_bytes threshold check) + selecting rows to archive now uses `read_conn` (query_only, does not take `audit_writer` write lock); only row delete + checkpoint + VACUUM mutate section locks `audit_writer`. Original impl held the write lock for the entire span including empty checks → append_event high-risk sync path self-DoS + 5s monitor holding lock for empty queries tanked throughput. 30s soak: throughput +24%, p99 −20ms. TOCTOU safe: rowid monotonically increases, delete by rowid range, concurrent inserts unaffected.
 
-### H-E: 主密钥丢失单点致命 (product-audit-0827, 2026-08-29)
+### H-E: Master-key Loss Single-point Fatal (product-audit-0827, 2026-08-29)
 
-master key 丢失 = 全历史审计链 verify 失败 (假报篡改) + 可逆 token 不可解, 与真篡改不可区分。四项修复:
+Master key loss = all historical audit chain verification fails (false tamper report) + reversible tokens undecryptable, indistinguishable from real tampering. Four remediation items:
 
-- **(a) 拒绝静默 remint**: Keychain miss + DB 已有历史数据 → `load_keychain_or_err` 拒启动明确报错 (非静默重生成新密钥令历史全不可解), 仅 virgin DB 首次允许生成。
-- **(b) 密钥托管 escrow**: 首次生成后立即导 Keychain master 到离线备份, 丢失时恢复**同一**密钥 → 锚点匹配 → 无假篡改 (运维流程, 见 `DEPLOYMENT.md` §主密钥托管, 无 daemon 代码)。
-- **(c) `rotate_key` 历史行可验 (无 re-hash)**: `rotate_key` = bump `key_version` (master 不变, HKDF 按 version 派生)。旧行记旧 version, 用旧派生 key 验 (确定性 HKDF 同 master 可重算) → 轮换后历史行可验可解。**re-hash 审计链被刻意拒绝**: hash 不可变 = 防篡改保证, re-sign 等于自废武功且无法区分真篡改与运维 re-hash。
-- **(d) 密钥丢失 vs 真篡改区分**: per-version `key_versions.key_anchor` 锚点 (HMAC of 固定消息 under `derive_chain_key(master, version)`)。verify HMAC 不匹配行调 `classify_break`: 锚点与当前 master 重算**匹配** → 真篡改 (`tampered=true`); **不匹配** → 密钥丢失 (`key_version_unknown_rows++`, 不计 tampered); **NULL** (legacy) → fail-closed 篡改 (攻击者清锚点无藏身处)。`guard.audit.verify` 增 `key_version_unknown_rows` (单链) + `key_loss` (聚合) 字段。测试 `he_key_loss_distinguish_test.rs` (4 cases) + `he_key_loss_test.rs` (5 decision-gate cases)。
+- **(a) Refuse silent remint**: Keychain miss + DB already has historical data → `load_keychain_or_err` refuses startup with explicit error (not silently regenerating a new key rendering all history undecryptable); only virgin DB allows first-time generation.
+- **(b) Key escrow**: after first mint, immediately export the Keychain master to an offline backup; on loss, restore the **same** key → anchors match → no false tamper (ops procedure, see `DEPLOYMENT.md` §Master Key Escrow, no daemon code).
+- **(c) `rotate_key` historical rows verifiable (no re-hash)**: `rotate_key` = bump `key_version` (master unchanged, HKDF derives per version). Old rows record old version, verified with old derived key (deterministic HKDF, same master recomputable) → after rotation historical rows verifiable/decryptable. **Re-hashing the audit chain is deliberately rejected**: hash immutability = tamper-evidence guarantee; re-signing defeats the purpose and cannot distinguish real tamper from ops re-hash.
+- **(d) Key loss vs real tamper distinction**: per-version `key_versions.key_anchor` anchor (HMAC of a fixed message under `derive_chain_key(master, version)`). On HMAC mismatch, verify calls `classify_break`: anchor **matches** current-master recompute → real tamper (`tampered=true`); **mismatches** → key loss (`key_version_unknown_rows++`, not counted as tampered); **NULL** (legacy) → fail-closed tamper (attacker stripping the anchor has no hiding place). `guard.audit.verify` adds `key_version_unknown_rows` (single chain) + `key_loss` (aggregated) fields. Tests `he_key_loss_distinguish_test.rs` (4 cases) + `he_key_loss_test.rs` (5 decision-gate cases).
 
-## 安全审计修复 (audit-0827)
+## Security Audit Hardening (audit-0827)
 
-依据 `audit/fusion-guard-audit-0827.md` (静态对抗性审查, 判定 NO-BLOCK → 修复后重审) 分三波落地。所有缺陷 (P0 发版阻断 + P1 第一 sprint + P2 技术债) 已修复, `cargo build`/`cargo test`/`cargo clippy` 全绿。
+Per `audit/fusion-guard-audit-0827.md` (static adversarial review, verdict NO-BLOCK → re-reviewed after fixes), landed in three waves. All defects (P0 release-blocking + P1 first sprint + P2 tech debt) fixed; `cargo build`/`cargo test`/`cargo clippy` all green.
 
-### P0 — 发版阻断 (9 组)
+### P0 — Release-blocking (9 groups)
 
-- **鉴权基线 (E6/C1/C2 + P0-1)**: `accept` 后 `getpeereid` (macOS) / `SO_PEERCRED` (Linux) 取对端 uid, 非 daemon uid 拒所有非 ping 方法; **peercred→tenant 绑定** (`tenant_bindings` 表 uid→授权租户集合): wire `tenant_id` 须在 caller 授权集合内 (非 admin 跨租户 → -32001), `audit.list`/`audit.verify`/`evaluate`/`redact`/`reveal`/`confirm` 全部强制 tenant gate, verify 加 `tenant_id` 作用域 (斩跨租户行数外泄); 非 ping 请求校验共享 secret (`FUSION_GUARD_SHARED_SECRET`, 常量时间比较); macOS 改 `getpeereid` 因 Darwin 25 `LOCAL_PEERCRED` 实测回 len=4 cr_uid=0 (内核不再填 xucred)。
-- **fail-closed (D/C16/C23/L1/M10)**: 规则加载失败/返空 → 拒启动非降级; `save_rule`/`save_epoch` 失败回滚内存 + 返错; 高风险审计写失败返错拒 evaluate (非 continue); 种子持久化失败拒启动。
-- **审计链 HMAC (C6/C7/C8)**: HMAC-SHA256(key, payload) 替裸 SHA-256, key 与 token-key 同源; 空 event_hash 列为 tampered 非兼容; payload 改 length-prefixed 编码消 `\x1f` 碰撞; 单序列化写入路径防链分叉。
-- **审计治理 P0-4 (audit §1.3/§6)**: rotation (DB>100MB 或 旧行>30d → 归档 NDJSON + 删行 + VACUUM) + retention (归档文件名时间戳>180d 删) + 增量 verify (`chain_checkpoint` 缓存 audit_id+hash 锚点, O(新增量) 非全表; VACUUM 稳定 audit_id 锚点; 归档边界 checkpoint 锚剩余首行避悬空误报; 空库归档态空哨兵+last_archived_hash 续链非 genesis)。
-- **审计覆盖面 P0-5 (audit §1.4)**: 死信文件加 per-row HMAC 链 (prev_hmac‖hmac, 同 token-key) + reimport 路径 (全量预验签 → 通过则导回 audit_events 续主链 + 清空死信文件, 任一行篡改/断裂 → 中止不部分导入); `tcc_events` 加独立链 (prev_hash+event_hash 直接列, 已 append-only); `rule_mutations` append-only 突变表记每条 add/update/remove/epoch 突变 (rules/rule_meta 用 INSERT OR REPLACE/DELETE 会断链, 故独立突变链); `verify_all_chains` 聚合 audit+tcc+rules+dead_letter 四链, `guard.audit.verify` 返 `{audit, tcc, rules, dead_letter, tampered}` (tampered=任一子链被篡改)。规则篡改 (控 Block 的最高影响面) 现可检出。
-- **并发模型 P0-6 (audit §2.1)**: `handle_method` 包 `tokio::task::spawn_blocking` 移阻塞 SQLite/链 hash 计算到独立阻塞线程池 (默认 512 线程), tokio worker 仅 await `JoinHandle` (可取消, 2s 超时能真正打断); 旧码 `async fn handle_method` 零 `.await` 跑在 tokio worker, confirm 突发负载活锁 8 worker 池 → accept/紧急拦截无法调度 → 安全绕过。`confirm_atomic` 双锁消除: `pending_actions`+`audit_events` 同在 guard.db 文件, `audit_writer` Connection 可见两表, 改单 `audit_writer` 锁全程 SELECT+INSERT+UPDATE (无嵌套 `action_db` 锁); `action_db` Mutex 仅留 `put`/`evict_expired` (无审计写路径, 不与 `audit_writer` 竞争)。4 个写连接加 `PRAGMA busy_timeout=5000` 防 WAL 多写者 `SQLITE_BUSY`。
-- **密钥管理 (E/C13/C14/C15/A4)**: `zeroize` 依赖, key 存 `Zeroizing<[u8;32]>`; 删 `key_bytes()` 外泄; env key 加门控; Keychain 失败拒启动非临时生成; `Drop` zeroize。
-- **解释器 RCE (C3) + tokenizer gap (L3/L4)**: 白名单二进制 `-c`/`-e`/`--command`/`--eval`/`-x` flag 检测 → L4 绝对 Block; `rm -fr`/`--recursive --force` 变体归 L4; `dd of=/dev/*` L4; `diskutil eraseDisk` L4; 多段命令全段扫描取 max。
-- **H8 绕过 (C9/L2/A8)**: confirm 从 `verdict_json` 重建 verdict, risk_level 从 verdict_json 读非 action 列; L4 二次校验拒; consume+audit 单事务。
-- **E5 大小写漂移 (C11)**: 服务端 serialize 与客户端 parse 端到端 lowercase 对齐 + e2e round-trip 测试。
-- **OOM/slowloris (C17/A6)**: `read_until` 分块读 + 累计 > 1MiB 断连; 连接级总 deadline; 限流。
-- **文件权限 (C21/A5)**: `AuditStore::open` 后 guard.db `0o600` + 目录 `0o700`; socket 路径 TOCTOU 防护。
+- **Auth baseline (E6/C1/C2 + P0-1)**: after `accept`, `getpeereid` (macOS) / `SO_PEERCRED` (Linux) reads peer uid; non-daemon uid rejected for all non-ping methods; **peercred→tenant binding** (`tenant_bindings` table uid→authorized tenant set): wire `tenant_id` must be in caller's authorized set (non-admin cross-tenant → -32001), `audit.list`/`audit.verify`/`evaluate`/`redact`/`reveal`/`confirm` all enforce tenant gate, verify adds `tenant_id` scoping (cuts cross-tenant row-count leak); non-ping requests verify shared secret (`FUSION_GUARD_SHARED_SECRET`, constant-time compare); macOS uses `getpeereid` because Darwin 25 `LOCAL_PEERCRED` measured returning len=4 cr_uid=0 (kernel no longer fills xucred).
+- **Fail-closed (D/C16/C23/L1/M10)**: rule load failure/empty return → refuse startup not degrade; `save_rule`/`save_epoch` failure rolls back memory + returns error; high-risk audit write failure returns error and rejects evaluate (not continue); seed persistence failure refuses startup.
+- **Audit chain HMAC (C6/C7/C8)**: HMAC-SHA256(key, payload) replaces bare SHA-256, key same origin as token-key; empty event_hash column treated as tampered not compat; payload uses length-prefixed encoding eliminating `\x1f` collision; single serialized write path prevents chain fork.
+- **Audit governance P0-4 (audit §1.3/§6)**: rotation (DB>100MB or aged rows>30d → archive NDJSON + delete rows + VACUUM) + retention (archive filename timestamp>180d delete) + incremental verify (`chain_checkpoint` caches audit_id+hash anchor, O(new delta) not full table; VACUUM-stable audit_id anchor; archive-boundary checkpoint anchors remaining first row avoiding dangling false-report; empty-DB archived state empty-sentinel+last_archived_hash continues chain not genesis).
+- **Audit coverage P0-5 (audit §1.4)**: dead-letter file gains per-row HMAC chain (prev_hmac‖hmac, same token-key) + reimport path (full pre-verify → if pass, re-import to audit_events continuing main chain + clear dead-letter file; any row tampered/broken → abort, no partial import); `tcc_events` gains independent chain (prev_hash+event_hash direct columns, already append-only); `rule_mutations` append-only mutation table records each add/update/remove/epoch mutation (rules/rule_meta use INSERT OR REPLACE/DELETE which break chains, hence independent mutation chain); `verify_all_chains` aggregates audit+tcc+rules+dead_letter four chains, `guard.audit.verify` returns `{audit, tcc, rules, dead_letter, tampered}` (tampered=any sub-chain tampered). Rule tampering (controls highest-impact Block) now detectable.
+- **Concurrency model P0-6 (audit §2.1)**: `handle_method` wrapped in `tokio::task::spawn_blocking` moving blocking SQLite/chain-hash computation to an independent blocking thread pool (default 512 threads); tokio workers only await `JoinHandle` (cancellable, 2s timeout can actually interrupt); old code `async fn handle_method` with zero `.await` ran on tokio worker, confirm burst load live-locked the 8-worker pool → accept/emergency intercept unschedulable → security bypass. `confirm_atomic` double-lock elimination: `pending_actions`+`audit_events` both in guard.db file, `audit_writer` Connection sees both tables, changed to single `audit_writer` lock for full SELECT+INSERT+UPDATE (no nested `action_db` lock); `action_db` Mutex retained only for `put`/`evict_expired` (no audit write path, no contention with `audit_writer`). 4 write connections add `PRAGMA busy_timeout=5000` preventing WAL multi-writer `SQLITE_BUSY`.
+- **Key management (E/C13/C14/C15/A4)**: `zeroize` dependency, key stored as `Zeroizing<[u8;32]>`; removed `key_bytes()` leak; env key gated; Keychain failure refuses startup not ad-hoc generation; `Drop` zeroizes.
+- **Interpreter RCE (C3) + tokenizer gap (L3/L4)**: whitelist binary `-c`/`-e`/`--command`/`--eval`/`-x` flag detection → L4 absolute Block; `rm -fr`/`--recursive --force` variants classified L4; `dd of=/dev/*` L4; `diskutil eraseDisk` L4; multi-segment commands scan all segments taking max.
+- **H8 bypass (C9/L2/A8)**: confirm rebuilds verdict from `verdict_json`, risk_level read from verdict_json not action column; L4 second-check reject; consume+audit single transaction.
+- **E5 case drift (C11)**: server serialize and client parse end-to-end lowercase alignment + e2e round-trip tests.
+- **OOM/slowloris (C17/A6)**: `read_until` chunked read + cumulative > 1MiB disconnect; per-connection total deadline; rate limiting.
+- **File permissions (C21/A5)**: after `AuditStore::open`, guard.db `0o600` + dir `0o700`; socket path TOCTOU protection.
 
-### P1 — 第一 sprint
+### P1 — First sprint
 
-- **语义阶段健壮 (C4/C5)**: `semantic_check` 语法错时不短路清零 (fail-closed L3 hit); Python 专用遍历建 import/别名 map, 别名解析危险调用; 动态调度 `getattr`/`__import__`/`globals` → L3。
-- **TTL reveal (C12/P4)**: `reveal` 入口 `evict_expired`; 过期 token → H6 `[REDACTED:unrecoverable#...]` 不还原; `evict_expired` 后台 interval。
-- **脱敏 regex 扩展 (C19)**: `password` 覆盖 JSON `"password":`/`"secret":`/`"token":`; API key 加非 sk- 变体; 私钥加单行 `ssh-ed25519`/`ssh-rsa`。
-- **DLP 脱敏盲区扩展 P1-1 (audit §1.10)**: 原 4 类窄 pattern (api_key/password/id_number/private_key) 对主流云凭据失明。扩 13 模式: JWT 三段式 (`eyJ…\.eyJ…\.…`)、OAuth bearer (`Bearer <token>` 保留前缀脱敏值)、AWS Secret Access Key (40 字符 base64, 无 AKIA 前缀, validator 字符多样性 ≥6 + base64 边界防假阳性)、GCP `ya29.`/Azure `AIza`/Stripe `sk_live`/`sk_test` (归 api_key)、信用卡 (`\d{13,19}` + Luhn validator + 数字边界防吞 id_number 子段)、连接串内嵌凭据 (`postgres://user:pass@host` 保留协议+host 脱敏 pass)、手机号 (`1[3-9]\d{9}` + 数字边界)、secret/token 通用键值、.env `KEY=value` 泛化、.netrc `password XXX`。**模式顺序关键**: 凭据键值 (带显式标签, 值可含数字) + 长令牌 (PEM/JWT/bearer/api_key) 先于裸数字模式 (credit_card/phone/id_number), 先到先拒重叠 —— 否则 17 位 `id_number` 吞 40 位 AWS Secret 或 password 值内数字。**规则 5**: regex crate 不支持 lookaround, 边界 (前后非同类字符) + Luhn + 字符多样性 用代码 validator (`fn(content, span起, span止) -> bool`) 非 regex 非模型; Luhn 拒非支付 16 位数字, 字符多样性拒全同 40 字符, 边界拒子段吞入。`has_sensitive` 与 `collect_spans` 语义对齐 (validator 拒的候选不计敏感)。
-- **密钥分离 + 轮换 P1-2 (audit §1.6)**: 原 master key (Keychain/env 32B) 同时作 HMAC 审计链 key 与 AES-GCM token 加密 key —— 单点泄露 = 审计伪造 + token 解密双失守。改 HKDF (RFC5869) 域分离: master 作 PRK (高熵跳过 Extract), 经不同 `info` label 派生 `chain_key = HKDF(master, "fusion-guard/audit-chain-hmac/v<ver>")` 与 `token_key = HKDF(master, "fusion-guard/token-aes-gcm/v<ver>")` —— chain key 泄不可解 token, token key 泄不可伪造审计链。**版本化轮换**: version 嵌 `info` label, 轮换 = bump version + 落 `key_versions` 表; 派生确定 (master 不变 → 同 version 永同 key), 故 DB 只存 `key_version INT` (audit_events/tcc_events/rule_mutations/tokens 四表) 不存密钥材料, 旧行用旧版本派生 key 验链/解 token, 新行用新版本。`AuditStore::rotate_key()` bump 共享 `Arc<AtomicI64>` (drain 线程 + confirm 同步写实时见, 非 stale 闭包捕获); `current_key_version()` 活版本; `verify_chain`/`verify_tcc_chain`/`verify_rules_chain`/`verify_dead_letter` 按行 `key_version` 派生 key 验 (跨轮换混合链可验); token `get_tenant` 按行版本解 (旧 token 不随轮换失效)。验证: 4 测 (`p12_key_separation_test`) — 域分离 (chain≠token)、版本派生独立 (v1≠v2)、轮换后旧审计行验链、轮换后旧 token 解密。
-- **pending action put fail-closed P1-3 (audit §2.5)**: `evaluate` 中 `actions().put()` (落 pending_actions 供 confirm) 失败原仅 `warn` 续返带 action_id 的 verdict —— caller 持 id 调 `guard.confirm` 查无此行 → L3 确认流永久死胡同 (磁盘压力期偶发, 无告警)。改 fail-closed: put 失败 → `evaluate` 返 `Engine` 错, 不下发 action_id (L3 确认流不可建则拒评估)。与 H7 审计写 fail-closed 耐久语义对齐 (两套写同一次 evaluate, 耐久性一致)。L4 Block 同样 fail-closed (H8 无 confirm 路径, 但耐久一致)。验证: 2 测 (`p13_put_failclosed_test`) — L3/L4 故障注入 (DROP pending_actions) 后 evaluate 返 Engine err。
-- **req_sem permit 超时分离 P1-4 (audit §2.3)**: 旧码 `req_sem.acquire_owned().await` 嵌在 2s handler timeout future 内 → permit 排队耗时偷占业务预算, 高并发下 handler 实际可用 < 2s, 拦截判定时限被压缩。分离两段: (1) permit 单独短超时 `PERMIT_TIMEOUT_MS=500ms`, 拿不到 → `-32002` rate limit 即拒 (fail-fast, 不占 handler 窗口); (2) 拿到后 2s `REQ_TIMEOUT_SECS` 只包 `spawn_blocking(handle_method)` 全程给业务。`fg-ipc` 加 `test-helpers` feature: `new_with_req_permits(engine, audit, permits)` 自定义槽数 + `req_sem_handle()` 暴露 `Arc<Semaphore>` —— 测试预取并持有全部 permit 强制走 permit 等待 (确定性, 无需真实慢 handler, 无时序竞态)。验证: 2 测 (`p14_req_sem_timeout_test`) — permit 满返 -32002 且拒绝快于 2s (分离生效); permit 空闲 ping 正常返 pong (非误拒)。
-- **IpcServer 鉴权层抽 trait P1-5 (audit §3.1)**: 旧码 peercred→身份解析 (`handle_conn`) 与共享 secret 校验 (`dispatch_arc`) 散在套接字 I/O 路径, 无独立单测, 只能起真实 socket 集成测才覆盖。抽 `Authorizer` trait (`authorizer.rs` 模块) + `PeerAuthorizer` 默认实现 —— 身份解析 (`resolve_identity`: peercred uid → `CallerIdentity` 含授权租户集) + 方法级鉴权 (`authorize_method`: ping 对任意对端开放, 非 ping 须同 uid + 共享 secret) 纯逻辑剥离。`AuthDecision` 枚举 (Allow/DenyPeercred/DenySecret) 三 Deny 均映射 `-32001` 但区分原因便于审计断言; `deny_resp` 产 wire 错误字节。`TenantLookup` 最小 trait (`tenants_for_uid`) 解 AuditStore 依赖 —— 单测注入 `FakeLookup` 无需真实 DB/Keychain/env。secret env 读取 + warn 下沉 `PeerAuthorizer::new`, server 不再重复持 `shared_secret` 字段。**范围裁剪 (规则 2/7)**: audit 列 4 trait (Transport/Authorizer/Dispatcher/Policy) 仅 Authorizer 落 trait —— 它是唯一含「未被测纯逻辑 + 不需复刻 engine 接口」的层; Transport 是 I/O 包壳 (trait 化只增抽象无测试增益), Dispatcher 是 engine 薄分派 (trait 须覆盖全方法 facade = 复刻接口), Policy (tenant/limit) 已是 `CallerIdentity::tenant_allowed` 纯方法 + `cap_limit` 自由函数 (已可测)。一处 trait + 文档说明裁剪理由, 避免双模式 (规则 7)。验证: 10 测 (`p15_authorizer_test`, 需 `test-helpers`) — resolve_identity (admin 空租户/非 admin 查表/peercred 拒绝), authorize_method (ping 对拒绝对端放行/非 ping peercred 拒/dev 无 secret 放/secret 错 DenySecret/secret 对 Allow/secret 设但未带 DenySecret), deny_resp wire 错误码。
-- **audit.list 过滤 + 游标分页 P1-6 (audit §3.2)**: 旧 `guard.audit.list` 仅 tenant_id + limit —— 监控只能拉全量客户端筛, 量大且无增量能力。补 4 过滤维度 + 游标分页: `since`/`until` (RFC3339 ts 字典序比较, 时间窗), `event_type` (精确匹配, 区分 evaluate/confirm), `level_min` (`l1`..`l4` 经 `json_extract(verdict_json,'$.risk_level') >= ?` 取风险等级下限, NULL 行自然排除; store 层 `.to_lowercase()` 防御大小写 —— json_extract 返小写, 大写 `L3` 因 ASCII < `l3` 会使全行漏过过滤, 误返全量), 游标 `"ts\x1faudit_id"` 续拉 (0x1f 分隔, `LIMIT limit+1` 判 `has_more`, ORDER BY ts DESC+audit_id DESC, 游标条件 `(ts < ? OR (ts = ? AND audit_id < ?))`)。store 层 `AuditListFilter<'a>` + `AuditListPage` + `list_events_filtered` (动态 WHERE, 绑定参数 `?N` 连续递增非 fmt 拼接防注入, 绑定顺序 = 子句 push 顺序) + `list_filtered_page`; handler 解码 cursor 透传 store。监控增量拉取: `since=<上次末行 ts>` 只拉新行。**范围裁剪 (规则 2)**: audit 另提「通知通道 (webhook/SSE/UDS event stream)」但自述「PRD 未定义通知通道」—— 属无 PRD 背书的新外接口, 不引 (产品契约 lives in PRD); 过滤+分页已解暴力轮询根因 (增量 fetch)。新增 `insert_test_event` test-helper (test-helpers gated, 序列化真实 GuardVerdict 含 risk_level 供 level_min 验证, 旧 `insert_event_at_ts` verdict_json 恒 "{}" 无 risk_level 不可用)。验证: 6 测 (`p16_audit_filter_test`, 需 `test-helpers`) — 时间窗 (since+until 截 2 行)、event_type (排除 confirm)、level_min (L3 留 4 行 / L4 留 1 行 / 大写同效)、游标分页 (limit=2 翻 3 页 has_more→末页 false)、组合过滤 (since+event_type+level_min 同时留 2 行)、无过滤全 6 行 DESC。
-- **写路径物理分库 P1-7 (audit §3.5)**: 旧码 5+ SQLite 连接 (audit_writer FULL + low_writer NORMAL + read_conn + token_store + action_store) 同开 guard.db —— 共享单 WAL 写锁, 所有写在 SQLite 层串行; app 层 Mutex 是假隔离。H7 audit_writer (synchronous=FULL, per-row fsync) 热路径被 token_store put / action_store put 抢锁阻塞, 评估延迟被旁路写拖累。**物理分文件**: `AuditStore::open(db_path)` 拆 audit.db (db_path, audit_events+chain+rules+tcc+tenant_bindings+checkpoint) / token.db sibling (tokens+key_versions) / action.db sibling (pending_actions), 各持独立 WAL —— evaluate 路径的 action put / token put / audit write 不再争单 WAL。`open(db_path)` 签名不变 (测传单路径), token/action.db 经 `db_path.with_file_name("token.db")`/`"action.db"` 推导。三文件均 `harden_db_perms` 0o600 (C21 三库硬化, perm_test 补断言)。**H4 confirm 原子性保留**: `confirm_atomic` 做 SELECT pending_actions + INSERT audit_events + UPDATE consumed 单事务; 分库后 audit_writer 连接 open 时 `ATTACH DATABASE 'action.db' AS action`, 引用改 `action.pending_actions`, 跨库事务协调提交 (各 ATTACH db 独立 WAL, 原子性保) —— H4 一次性 consume + L2+A8 审计同成同败不破。ActionStore 自身连接 (put/evict_expired) 未 ATTACH, 仍走 main.pending_actions。**旧库迁移**: `drop_legacy_split_tables` 在 open 后 DROP 旧单文件 guard.db main 残留的 pending_actions/tokens/key_versions (sqlite_master 存在性检查幂等, 失败 warn-not-fatal); 三表瞬态 (pending TTL 30s / token TTL 300s) 不拷行 (旧值大概率已过期), 仅清 residual。`tamper_verdict_json` test-helper 改开 action.db sibling (旧开 audit.db 查 pending_actions 已迁 → no such table)。验证: 4 测 (`p17_write_split_test`, 需 `test-helpers`) — 三文件存在+0o600、pending_actions 在 action.db 非 audit.db + put 行落 action.db、confirm 跨库事务原子 (audit.db 有 confirm 行 + action.db consumed=1 + 重 confirm Consumed)、旧库残留表 open 后 DROP。
-- **跨租户 confirm (C20)**: `pending_actions` 加 `tenant_id` 列; confirm 校验 `action.tenant_id == caller.tenant_id`。
-- **rule 突变 stale-epoch (L7)**: `rule.add/update/remove` 校验 `caller_epoch` (非 0 且 == 当前), 否则 -32003; 种子 fail-open 修复。
-- **positional params (L8/M2/M1)**: `RpcRequest` params 必须是 object 拒 array; 未知方法 -32601 不带方法名; wire 错误只码 + 通用消息, 详细记服务端日志。
-- **tcc.report 校验 (M8)**: handler 调 `TccService::parse(permission)?`; `requester`/`reason`/`result` 限长 1024。
-- **读连接 + limit 上限 (A3/P3)**: `audit.verify`/`list_events` 开专用读连接 (无 mutex); limit 硬上限 10000 + 截断日志。
+- **Semantic stage robustness (C4/C5)**: `semantic_check` on syntax error does not short-circuit to zero (fail-closed L3 hit); Python-specific traversal builds import/alias map, alias-resolves dangerous calls; dynamic dispatch `getattr`/`__import__`/`globals` → L3.
+- **TTL reveal (C12/P4)**: `reveal` entry `evict_expired`; expired token → H6 `[REDACTED:unrecoverable#...]` not restored; `evict_expired` background interval.
+- **Redact regex expansion (C19)**: `password` covers JSON `"password":`/`"secret":`/`"token":`; API key adds non-sk- variants; private key adds single-line `ssh-ed25519`/`ssh-rsa`.
+- **DLP masking blind-spot expansion P1-1 (audit §1.10)**: original 4 narrow patterns (api_key/password/id_number/private_key) blind to mainstream cloud credentials. Expanded to 13 patterns: JWT three-segment (`eyJ…\.eyJ…\.…`), OAuth bearer (`Bearer <token>` preserves prefix masks value), AWS Secret Access Key (40-char base64, no AKIA prefix, validator char diversity ≥6 + base64 boundary prevents false positive), GCP `ya29.`/Azure `AIza`/Stripe `sk_live`/`sk_test` (folded into api_key), credit card (`\d{13,19}` + Luhn validator + digit boundary prevents swallowing id_number subfield), connection-string embedded creds (`postgres://user:pass@host` preserves protocol+host masks pass), phone number (`1[3-9]\d{9}` + digit boundary), secret/token generic key-value, .env `KEY=value` generalization, .netrc `password XXX`. **Pattern order critical**: credential key-value (explicit tag, value may contain digits) + long tokens (PEM/JWT/bearer/api_key) precede bare-digit patterns (credit_card/phone/id_number), first-accept wins on overlap — otherwise 17-digit `id_number` swallows 40-digit AWS Secret or digits inside a password value. **Rule 5**: regex crate lacks lookaround; boundaries (non-same-class chars before/after) + Luhn + char diversity use code validators (`fn(content, span start, span end) -> bool`) not regex not model; Luhn rejects non-payment 16-digit numbers, char diversity rejects all-same 40-char, boundaries reject subfield swallowing. `has_sensitive` and `collect_spans` semantically aligned (validator-rejected candidates not counted sensitive).
+- **Key separation + rotation P1-2 (audit §1.6)**: original master key (Keychain/env 32B) served double duty as HMAC audit-chain key and AES-GCM token encryption key — single-point leak = audit forgery + token decryption both compromised. Changed to HKDF (RFC5869) domain separation: master as PRK (high entropy skips Extract), derives via different `info` labels `chain_key = HKDF(master, "fusion-guard/audit-chain-hmac/v<ver>")` and `token_key = HKDF(master, "fusion-guard/token-aes-gcm/v<ver>")` — chain key leak cannot decrypt tokens, token key leak cannot forge audit chain. **Versioned rotation**: version embedded in `info` label, rotation = bump version + persist to `key_versions` table; derivation deterministic (master unchanged → same version always same key), so DB stores only `key_version INT` (audit_events/tcc_events/rule_mutations/tokens four tables) not key material; old rows verify/decrypt with old-version derived key, new rows use new version. `AuditStore::rotate_key()` bumps shared `Arc<AtomicI64>` (drain thread + confirm sync write see live, not stale closure capture); `current_key_version()` live version; `verify_chain`/`verify_tcc_chain`/`verify_rules_chain`/`verify_dead_letter` derive key per row's `key_version` (cross-rotation mixed chain verifiable); token `get_tenant` decrypts per row version (old tokens don't invalidate on rotation). Verification: 4 tests (`p12_key_separation_test`) — domain separation (chain≠token), version-derived independence (v1≠v2), post-rotation old audit rows verify, post-rotation old tokens decrypt.
+- **Pending action put fail-closed P1-3 (audit §2.5)**: `evaluate` calling `actions().put()` (persist pending_actions for confirm) failure originally only `warn` and continued returning a verdict with action_id — caller holds id, calls `guard.confirm`, finds no such row → L3 confirm flow permanent dead-end (occasional under disk pressure, no alert). Changed to fail-closed: put failure → `evaluate` returns `Engine` error, no action_id issued (L3 confirm flow cannot be built → reject evaluation). Aligns with H7 audit-write fail-closed durability semantics (two writes in one evaluate, durability consistent). L4 Block likewise fail-closed (H8 no confirm path, but durability consistent). Verification: 2 tests (`p13_put_failclosed_test`) — L3/L4 fault injection (DROP pending_actions) then evaluate returns Engine err.
+- **req_sem permit timeout separation P1-4 (audit §2.3)**: old code `req_sem.acquire_owned().await` nested inside the 2s handler timeout future → permit queue wait stole from business budget, high concurrency left handler with < 2s actual, intercept decision window compressed. Split into two stages: (1) permit has its own short timeout `PERMIT_TIMEOUT_MS=500ms`, can't acquire → `-32002` rate limit immediate reject (fail-fast, doesn't consume handler window); (2) once acquired, the 2s `REQ_TIMEOUT_SECS` only wraps `spawn_blocking(handle_method)` giving business the full window. `fg-ipc` adds `test-helpers` feature: `new_with_req_permits(engine, audit, permits)` custom slot count + `req_sem_handle()` exposes `Arc<Semaphore>` — tests pre-acquire and hold all permits forcing the permit-wait path (deterministic, no real slow handler, no timing race). Verification: 2 tests (`p14_req_sem_timeout_test`) — permit full returns -32002 and rejects faster than 2s (separation effective); permit idle ping returns pong normally (not false reject).
+- **IpcServer auth layer trait extraction P1-5 (audit §3.1)**: old code had peercred→identity resolution (`handle_conn`) and shared-secret verification (`dispatch_arc`) scattered across the socket I/O path, no independent unit tests, only real-socket integration tests covered them. Extracted `Authorizer` trait (`authorizer.rs` module) + `PeerAuthorizer` default impl — identity resolution (`resolve_identity`: peercred uid → `CallerIdentity` incl authorized tenant set) + method-level auth (`authorize_method`: ping open to any peer, non-ping requires same uid + shared secret) pure logic separated. `AuthDecision` enum (Allow/DenyPeercred/DenySecret) three Denys all map to `-32001` but distinguish reason for audit assertion; `deny_resp` produces wire error bytes. `TenantLookup` minimal trait (`tenants_for_uid`) decouples AuditStore dependency — unit tests inject `FakeLookup` no real DB/Keychain/env needed. Secret env read + warn moved down to `PeerAuthorizer::new`, server no longer redundantly holds `shared_secret` field. **Scope trimming (Rule 2/7)**: audit listed 4 traits (Transport/Authorizer/Dispatcher/Policy), only Authorizer landed as trait — it's the only layer with "untested pure logic + no need to mirror engine interface"; Transport is I/O wrapper (trait adds abstraction no test gain), Dispatcher is thin engine dispatch (trait must cover all method facades = mirror interface), Policy (tenant/limit) already `CallerIdentity::tenant_allowed` pure method + `cap_limit` free function (already testable). One trait + doc note on trim rationale, avoids dual mode (Rule 7). Verification: 10 tests (`p15_authorizer_test`, needs `test-helpers`) — resolve_identity (admin empty tenant/non-admin table lookup/peercred reject), authorize_method (ping open to rejected peer/non-ping peercred reject/dev no secret allow/secret wrong DenySecret/secret correct Allow/secret set but not carried DenySecret), deny_resp wire error code.
+- **audit.list filters + cursor pagination P1-6 (audit §3.2)**: old `guard.audit.list` only had tenant_id + limit — monitoring pulled full volume and filtered client-side, high volume and no incremental capability. Added 4 filter dimensions + cursor pagination: `since`/`until` (RFC3339 ts lexicographic compare, time window), `event_type` (exact match, distinguishes evaluate/confirm), `level_min` (`l1`..`l4` via `json_extract(verdict_json,'$.risk_level') >= ?` takes risk-level floor, NULL rows naturally excluded; store layer `.to_lowercase()` defensive — json_extract returns lowercase, uppercase `L3` due to ASCII < `l3` would make all rows miss the filter, wrongly returning full volume), cursor `"ts\x1faudit_id"` continuation (0x1f separator, `LIMIT limit+1` judges `has_more`, ORDER BY ts DESC+audit_id DESC, cursor condition `(ts < ? OR (ts = ? AND audit_id < ?))`). Store layer `AuditListFilter<'a>` + `AuditListPage` + `list_events_filtered` (dynamic WHERE, bound params `?N` continuously incrementing not fmt concatenation prevents injection, bind order = clause push order) + `list_filtered_page`; handler decodes cursor and passes through to store. Monitoring incremental pull: `since=<last row ts>` pulls only new rows. **Scope trimming (Rule 2)**: audit also proposed "notification channel (webhook/SSE/UDS event stream)" but self-noted "PRD does not define notification channels" — an un-PRD-backed new external interface, not introduced (product contract lives in PRD); filters+pagination already solve the brute-polling root cause (incremental fetch). Added `insert_test_event` test-helper (test-helpers gated, serializes real GuardVerdict with risk_level for level_min verification; old `insert_event_at_ts` verdict_json always "{}" has no risk_level, unusable). Verification: 6 tests (`p16_audit_filter_test`, needs `test-helpers`) — time window (since+until cuts 2 rows), event_type (excludes confirm), level_min (L3 keeps 4 rows / L4 keeps 1 row / uppercase same effect), cursor pagination (limit=2 pages through 3 pages has_more→last page false), combined filter (since+event_type+level_min simultaneously keeps 2 rows), no filter all 6 rows DESC.
+- **Write-path physical DB split P1-7 (audit §3.5)**: old code had 5+ SQLite connections (audit_writer FULL + low_writer NORMAL + read_conn + token_store + action_store) all opening guard.db — sharing one WAL write lock, all writes serialized at SQLite layer; app-layer Mutex is false isolation. H7 audit_writer (synchronous=FULL, per-row fsync) hot path blocked by token_store put / action_store put contending for the lock, evaluation latency dragged down by side writes. **Physical file split**: `AuditStore::open(db_path)` splits into audit.db (db_path, audit_events+chain+rules+tcc+tenant_bindings+checkpoint) / token.db sibling (tokens+key_versions) / action.db sibling (pending_actions), each with independent WAL — evaluate path's action put / token put / audit write no longer contend on one WAL. `open(db_path)` signature unchanged (tests pass single path), token/action.db derived via `db_path.with_file_name("token.db")`/`"action.db"`. All three files `harden_db_perms` 0o600 (C21 three-DB hardening, perm_test adds assertion). **H4 confirm atomicity preserved**: `confirm_atomic` does SELECT pending_actions + INSERT audit_events + UPDATE consumed in one transaction; after split, audit_writer connection opens with `ATTACH DATABASE 'action.db' AS action`, references changed to `action.pending_actions`, cross-DB transaction coordinated commit (each ATTACHed db independent WAL, atomicity preserved) — H4 one-time consume + L2+A8 audit same-success-same-failure intact. ActionStore's own connection (put/evict_expired) not ATTACHed, still uses main.pending_actions. **Legacy DB migration**: `drop_legacy_split_tables` after open DROPs legacy single-file guard.db main residual pending_actions/tokens/key_versions (sqlite_master existence check idempotent, failure warn-not-fatal); three tables are transient (pending TTL 30s / token TTL 300s) no row copy (old values likely expired), only clears residual. `tamper_verdict_json` test-helper changed to open action.db sibling (old opened audit.db querying pending_actions which migrated → no such table). Verification: 4 tests (`p17_write_split_test`, needs `test-helpers`) — three files exist+0o600, pending_actions in action.db not audit.db + put row lands in action.db, confirm cross-DB transaction atomic (audit.db has confirm row + action.db consumed=1 + re-confirm Consumed), legacy residual tables DROPped after open.
+- **Cross-tenant confirm (C20)**: `pending_actions` adds `tenant_id` column; confirm verifies `action.tenant_id == caller.tenant_id`.
+- **Rule mutation stale-epoch (L7)**: `rule.add/update/remove` verifies `caller_epoch` (non-0 and == current), else -32003; seed fail-open fixed.
+- **Positional params (L8/M2/M1)**: `RpcRequest` params must be object, reject array; unknown method -32601 without method name; wire error code + generic message only, details in server log.
+- **tcc.report validation (M8)**: handler calls `TccService::parse(permission)?`; `requester`/`reason`/`result` length-limited 1024.
+- **Read connection + limit cap (A3/P3)**: `audit.verify`/`list_events` open dedicated read connection (no mutex); limit hard cap 10000 + truncation log.
 
-### P2 — 技术债
+### P2 — Tech debt
 
-- **env key 门控 + 告警 P2-1 (audit §2.6)**: 旧 `load_or_create_key` 先查 `FUSION_GUARD_TOKEN_KEY` env 命中即用跳过 Keychain, 无 dev/prod 门控 —— 误配即主密钥进进程环境 (`/proc` 等价 `ps eww`/lsof/launchctl), 同 UID 进程 (一核九端 9 个 fusion-* 全同 UID) 可读 → AES-GCM token key + HMAC 链 key 双泄露 (§1.6 密钥复用, 已由 P1-2 HKDF 域分离缓解但仍同 master)。测试全局 `ensure_env()` 沿用 env 姿势, operator 易照搬进 launchd plist。**门控**: 抽纯决策函数 `resolve_key_source(is_debug, allow_env_flag, env_present) -> KeySource` (规则 5: 决策用代码非 token) —— `cfg(debug_assertions)` (dev) → `EnvDebug` (info 姿态); release 仅 `FUSION_GUARD_ALLOW_ENV_KEY=1` 或 `--insecure-env-key` CLI flag (fg-bin `start` 子命令置 `FUSION_GUARD_ALLOW_ENV_KEY=1`) 放行 → `EnvInsecure`; env 不放行或缺 → `KeychainRequired` (macOS 走 Keychain, 非 macOS fail-closed 拒启动, 不回退弱密钥)。**告警**: `EnvInsecure` 路径 `tracing::warn!` 级 banner ("INSECURE (P2-1): master key loaded from env in release — visible to any same-UID process; prod MUST use Keychain"), 运维审计可见; `EnvDebug` 仍 `info!` (dev 姿态)。fg-bin flag 置位时额外 warn。`decode_env_key`/`load_keychain_or_err` 拆分 (旧 `load_or_create_key` 内联三路径 → 独立 fn, 可读可测)。**范围**: §1.6 密钥复用本身由 P1-2 HKDF 修复 (master 经 HKDF 派生独立 chain/token key), 本 P2-1 只补 env 门控 + 告警 (防误配泄漏通道), 不改密钥派生。验证: 3 测 (`p21_env_key_gating_test`, 需 `test-helpers`) — 决策矩阵全 7 分支 (debug/release × flag × env_present → EnvDebug/EnvInsecure/KeychainRequired)、debug env 加载不触 Keychain (token put+reveal roundtrip 生效)、release env 无 flag → KeychainRequired 门控回归 (调真实 `resolve_key_source` 非 oracle, 规则 7 不维护两份逻辑)。
-- **A1 shell_words fail-closed**: tokenizer 增 `check_unmodeled_shell_features` —— 裸 tilde/brace 展开 `{a,b}`/`{n..m}`/glob `*`/`?`/`[abc]`/heredoc `<<`/`|&`/fd 重定向 `>&N`/`<&N`/`<>`/反斜杠续行 → Block L4 (shell_words 不建模这些特性, 每个是绕过通道, fail-closed 拒非逐文件补 arm)。
-- **peercred 瞬态失败升 warn + 区分拒绝类型 P2-3 (audit §3.4)**: 旧 `peer_uid(fd) -> Option<u32>` 把 `getpeereid`/`SO_PEERCRED` 系统调用瞬态失败 (fd 失效/EBADF/ECONNRESET) 仅 `tracing::debug!` 记录, prod info 级不可见, 且与「跨 UID 拒绝」混入同一 `None` 路径 → ghost unauthorized undiagnosable (运维无法区分「系统调用失败须诊断」与「跨 UID 攻击/误连」)。**三态分离**: 抽 `PeerUid` enum (`Resolved(u32)`/`SyscallFail`/`Unsupported`) 替 `Option<u32>` —— `peer_uid` 系统调用失败返 `SyscallFail` 并升 `tracing::warn!` 级 (附 OS errno); 平台不支持返 `Unsupported` (warn); 成功返 `Resolved(uid)` (仍 debug)。`peer_allowed` 三态入参: `Resolved` 走同 uid/root 校验, `SyscallFail`/`Unsupported` 恒拒 (无凭证 = 不可信, fail-closed)。**区分日志**: `PeerAuthorizer::resolve_identity` 拒绝分支按 `is_syscall_fail()` 分两路 warn —— `SyscallFail` 记 "peer credential syscall failed (P2-3 §3.4); fail-closed", `Resolved(other)` 记 "non-peer connection (E6 cross-UID)", 两类同 fail-closed 拒但日志分明。`PeerUid` 经 `fg-ipc` re-export (pub use fg_peercred::PeerUid), `resolve_identity` trait 签名 `Option<u32>` → `PeerUid`。`resolved()`/`is_syscall_fail()` 辅助方法供调用方取 uid + 判类。验证: +2 测 —— `peercred_test` 增 `syscall_fail_peer_denied` (SyscallFail/Unsupported 恒拒, allow_root 也不放行) + `peer_uid_resolved_and_is_syscall_fail` (三态辅助方法); `p15_authorizer_test` 增 `p23_resolve_identity_syscall_fail_distinct_from_cross_uid` (SyscallFail uid 兜底 u32::MAX vs 跨 UID 保留真实 uid 999, 两类 uid 字段可区分)。附带修 `fg-store/src/lib.rs` `CheckStage` import 既有 unused 警告 (test-helpers 默认关时 lib 不用, 拆 `#[cfg(feature="test-helpers")] use`)。全量 178 pass (176→178, +2), clippy clean (0 warning), release green。
-- **UDS 连接池 + 持久复用 P2-4 (audit §3.6)**: 旧 `UdsClient::call` 每次 connect+write+read+drop —— 每次调用付 UDS connect 握手开销 (socket 创建+bind+connect+accept 内核态往返), 高频 L1 evaluate P99 被握手主导, 9 端并发下 P99<1ms 不可达。**服务端已支持单连接多请求** (`conn_loop` read→dispatch→write 循环, EOF 才断, `CONN_DEADLINE_SECS=30s` 兜底防 slowloris), 审计原述「处理完即断」不实 → **仅客户端改, 不动服务端** (规则 2 最小化)。`UdsClient` 持 `Mutex<Option<UnixStream>>` 持久连接: `call` 委托 `call_once`, 后者 lazy connect (首次 call 才建流) + 借用流读写 (`BufReader<&UnixStream>` 不消耗/clone, 同 fd 跨调用复用) + 成功保留流供复用 + IO 错 (服务端 30s deadline 断/重启/对端 EOF/EPIPE/超时) 清空流促下次重连。`call` 对 `call_once` 失败重连一次重试 (透明自愈, 仅一次防故障放大), 调用方不感知服务端重启。**不做多路复用** —— Python 单线程阻塞模型一次一请求在途, 连接复用即消除握手开销 (规则 2)。`PyGuardClient` 持 `UdsClient` 直接 (非 `sock: PathBuf` 每次 `UdsClient::new` 新建, 那会架空连接池), `client()` 返 `&UdsClient`。验证: +1 测 `p24_persistent_conn_reuse_and_reconnect` —— (1) 同 client 5 次 ping 复用连接全成功 (复用不损坏 wire); (2) 服务端 abort+重启后, 死流被检测清空+重连, ping 仍 ok (透明自愈)。全量 179 pass (178→179, +1), clippy clean (0 warning, 顺带清 `map_err(|x| x)` identity lint), release green。
-- **category_hint 调用方风险地板 P2-6 (audit §3.2/F6, PRD §6.3 H9)**: 旧 `guard.evaluate` 无 `category_hint` 入参, 调用方主张的 category 无审计可见性, 且 v0.1「caller 自证 category」可被降级绕过 (caller 谎报 `read` 压低等级绕过 Block)。**H9 契约**: guard 从 content 推断 category 权威 (`inferred_category`), caller `category_hint` 仅作风险地板 —— `最终等级 = max(推断, 规则命中, hint)`, hint 抬等级永不压低 (双向防绕过)。wire: `guard.evaluate {action, content, context, caller_epoch, category_hint?}` (缺省 None 向后兼容)。IPC 收 `category_hint` (s_param idx 6) → 透传 `AuditEngine::evaluate(content, caller_epoch, tenant_id, content_type, category_hint: Option<&str>)`。engine 落 `verdict.category_hint` (审计可见调用方主张) + 纯 fn `hint_risk_floor(hint)` 算地板: `shell_exec`/`network`/`file_write` → L2 地板, read/clean/未知 → None (无地板)。地板封顶 L2 (L3/L4 始终由真实规则命中驱动, 非 caller 声明), `Allow`→`Redact` 当地板抬等级过 L1。`GuardVerdict` 增 `category_hint: Option<String>` 字段 (`#[serde(default, skip_serializing_if)]` 让旧 verdict JSON 缺此字段仍可解, pending_actions/audit 跨版本兼容), `PyGuardVerdict` 镜像 + `to_dict` 暴露; `fg-pyo3` evaluate pymethod 增 `category_hint: Option<String>` 签名 (default None)。验证: +5 测 `p26_category_hint_test` —— `hint_risk_floor_known_categories` (shell_exec/network/file_write→Some(L2)) + `hint_risk_floor_low_or_unknown_is_none` (read/clean/bogus/""→None) + `hint_raises_floor_from_l1_to_l2` (`ls /tmp` 无命中 L1 Allow + hint "network" → L2 Redact, inferred_category 仍 "read" hint 不覆盖推断) + `hint_never_lowers_l4_block` (`rm -rf /tmp/x` L4 Block + hint "read" → 不降, 仍 L4 Block) + `hint_floor_below_current_no_change` (L4 Block + hint "shell_exec" L2 地板 < L4 → 无变化)。纯决策 fn 可单测 (规则 5)。全量 184 pass (179→184, +5), clippy clean (0 warning), release green。
-- **A2 有界队列 + dead-letter**: 低风险审计改 `sync_channel(8192)` + `try_send` 背压; drain 内联跑 batch (非 spawn-per-batch); 队列满/断连 → 持久 dead-letter 文件 (guard.db.deadletter, 0o600), 不静默丢事件。
-- **A9 语义 SSOT**: 删死代码 `semantic_default_rules()` (产 6 条 stage=Semantic GuardRule 注入规则集, 但 evaluate 跳非 Regex stage, 从不匹配); 硬编码危险表 (PY_DANGER_L4 等) 为语义执行唯一真相源, 非 admin 可变 (文档化), 恢复 SSOT 诚实。
-- **L5 mv/cp 目的地 (M)**: `check_argv` 建模 `-t DIR`/`--target-directory=DIR`/`--target-directory DIR`/`--` 终止符, 正确解析 GNU mv/cp 目的地。
-- **L6 span 追踪**: 脱敏改原内容单趟 span 收集 (拒重叠, 首模式优先), 占位符永不写回原内容 → `id_number` 不腐蚀先前 `tok_<uuid>` 占位符 (原顺序 replace_all 在已脱敏文本上跑, id_number 匹配占位符内 17 位数字子串 → 破占位符 → reveal 撞 H6 → 可逆静默降级不可逆)。`id_number` 收紧 `\d{17}[\dXx]`。
-- **L9 PyO3 错误显式**: fg-pyo3 客户端删所有 `unwrap_or` 静默回退 —— reveal/redact/confirm/audit_verify/list_rules 缺关键字段即 `PyValueError` (防空串伪装成功 reveal、false 伪造无篡改、epoch 0 永持陈旧)。
-- **L10 category 从 hit 派生**: `infer_category` 从实际 hit scope 派生 (Network→network/Filesystem→file_write/非白名单→shell_exec/无 hit→clean), 非固定名表 fallback。
-- **L11 verdict 显式 rank**: `verdict_from_hits` 按 `(action_severity, risk_level, stage_rank)` 确定性排序取 head, 非 `max_by_key` 平局任意末 hit 胜。
-- **L12 confirm 审计 schema**: confirm 审计事件加专用字段存 outcome/approve-reject, `action` 列不再一列两义。
-- **L13 migrate 用 PRAGMA**: `migrate_audit_chain` 改 `PRAGMA table_info` 查列存在 (非 `prepare(SELECT col)` —— 后者在无列 legacy DB 返 Err 致 open 失败, 迁移路径不可达)。
-- **M3 poison 显式处理**: `PoisonError` 显式 recover (11 处 `.expect` 改 lock 宏)。
-- **M4 Redactor Result**: `Redactor::new` 返 `Result` 传播编译失败 (非 process panic); `OnceLock` 缓存静态 regex。
-- **M5/M7 build.rs**: `rerun-if-changed .git/refs` 防 FG_GIT_SHA 过期; build.rs 编译失败显式 `expect` 检查 success。
-- **M6 RiskLevel 显式 Ord**: 显式 `Ord` impl 替 `as u8` 隐式。
-- **M9 json_to_py 直转**: fg-pyo3 `Value` → Python 递归直转 (非 `to_string` + `json.loads` 往返), f64 精度保真, 零 import。
-- **P1/P2 regex 单扫**: `Lazy`/`OnceLock` 静态化 regex; `redact_counted` 单趟返 `(脱敏, 命中数)` 取代 has_sensitive+redact 二扫。
+- **env key gating + alert P2-1 (audit §2.6)**: old `load_or_create_key` checked `FUSION_GUARD_TOKEN_KEY` env first, used it if hit, skipping Keychain with no dev/prod gating — misconfig puts master key into process environment (`/proc`-equivalent `ps eww`/lsof/launchctl), readable by same-UID processes (one-core-nine-ends 9 fusion-* all same UID) → AES-GCM token key + HMAC chain key dual leak (§1.6 key reuse, mitigated by P1-2 HKDF domain separation but still same master). Test global `ensure_env()` reused the env posture, operators easily copy it into launchd plists. **Gating**: extracted pure decision function `resolve_key_source(is_debug, allow_env_flag, env_present) -> KeySource` (Rule 5: decisions in code not tokens) — `cfg(debug_assertions)` (dev) → `EnvDebug` (info posture); release only `FUSION_GUARD_ALLOW_ENV_KEY=1` or `--insecure-env-key` CLI flag (fg-bin `start` subcommand sets `FUSION_GUARD_ALLOW_ENV_KEY=1`) allows → `EnvInsecure`; env not allowed or absent → `KeychainRequired` (macOS uses Keychain, non-macOS fail-closed refuses startup, no weak-key fallback). **Alert**: `EnvInsecure` path `tracing::warn!`-level banner ("INSECURE (P2-1): master key loaded from env in release — visible to any same-UID process; prod MUST use Keychain"), visible in ops audit; `EnvDebug` still `info!` (dev posture). fg-bin flag-set additionally warns. `decode_env_key`/`load_keychain_or_err` split (old `load_or_create_key` inlined three paths → independent fn, readable testable). **Scope**: §1.6 key reuse itself fixed by P1-2 HKDF (master derives independent chain/token keys via HKDF), this P2-1 only adds env gating + alert (prevents misconfig leak channel), does not change key derivation. Verification: 3 tests (`p21_env_key_gating_test`, needs `test-helpers`) — decision matrix all 7 branches (debug/release × flag × env_present → EnvDebug/EnvInsecure/KeychainRequired), debug env loads without touching Keychain (token put+reveal roundtrip works), release env no flag → KeychainRequired gate regression (calls real `resolve_key_source` not oracle, Rule 7 no dual logic).
+- **A1 shell_words fail-closed**: tokenizer adds `check_unmodeled_shell_features` — bare tilde/brace expansion `{a,b}`/`{n..m}`/glob `*`/`?`/`[abc]`/heredoc `<<`/`|&`/fd redirect `>&N`/`<&N`/`<>`/backslash line-continuation → Block L4 (shell_words does not model these features, each is a bypass channel, fail-closed reject not per-file arm).
+- **peercred transient failure to warn + distinguish reject type P2-3 (audit §3.4)**: old `peer_uid(fd) -> Option<u32>` logged `getpeereid`/`SO_PEERCRED` transient syscall failures (fd stale/EBADF/ECONNRESET) at `tracing::debug!` only, invisible at prod info level, and mixed with "cross-UID reject" into the same `None` path → ghost unauthorized undiagnosable (ops cannot distinguish "syscall failure needs diagnosis" from "cross-UID attack/misconnect"). **Three-state separation**: extracted `PeerUid` enum (`Resolved(u32)`/`SyscallFail`/`Unsupported`) replacing `Option<u32>` — `peer_uid` syscall failure returns `SyscallFail` and escalates to `tracing::warn!` (with OS errno); platform-unsupported returns `Unsupported` (warn); success returns `Resolved(uid)` (still debug). `peer_allowed` three-state input: `Resolved` does same-uid/root check, `SyscallFail`/`Unsupported` always reject (no credential = untrusted, fail-closed). **Distinguished logging**: `PeerAuthorizer::resolve_identity` reject branch splits into two warn paths by `is_syscall_fail()` — `SyscallFail` logs "peer credential syscall failed (P2-3 §3.4); fail-closed", `Resolved(other)` logs "non-peer connection (E6 cross-UID)", both fail-closed reject but logs distinct. `PeerUid` re-exported via `fg-ipc` (pub use fg_peercred::PeerUid), `resolve_identity` trait signature `Option<u32>` → `PeerUid`. `resolved()`/`is_syscall_fail()` helper methods for callers to get uid + classify. Verification: +2 tests — `peercred_test` adds `syscall_fail_peer_denied` (SyscallFail/Unsupported always reject, allow_root doesn't pass) + `peer_uid_resolved_and_is_syscall_fail` (three-state helper methods); `p15_authorizer_test` adds `p23_resolve_identity_syscall_fail_distinct_from_cross_uid` (SyscallFail uid falls back to u32::MAX vs cross-UID keeps real uid 999, two types distinguishable by uid field). Also fixed existing unused warning for `fg-store/src/lib.rs` `CheckStage` import (test-helpers off by default, lib doesn't use it, split `#[cfg(feature="test-helpers")] use`). Full 178 pass (176→178, +2), clippy clean (0 warning), release green.
+- **UDS connection pool + persistent reuse P2-4 (audit §3.6)**: old `UdsClient::call` did connect+write+read+drop each call — each call paying UDS connect handshake overhead (socket create+bind+connect+accept kernel round-trip), high-frequency L1 evaluate P99 dominated by handshake, 9-end concurrency P99<1ms unreachable. **Server already supports single-connection multi-request** (`conn_loop` read→dispatch→write loop, disconnect only on EOF, `CONN_DEADLINE_SECS=30s` backstop prevents slowloris), audit's claim "disconnect after handling" was inaccurate → **client-side change only, server untouched** (Rule 2 minimize). `UdsClient` holds `Mutex<Option<UnixStream>>` persistent connection: `call` delegates to `call_once`, the latter lazy-connect (first call builds stream) + borrows stream for read/write (`BufReader<&UnixStream>` not consuming/clone, same fd reused across calls) + on success retains stream for reuse + IO error (server 30s deadline disconnect/restart/peer EOF/EPIPE/timeout) clears stream prompting next reconnect. `call` retries reconnect-once on `call_once` failure (transparent self-heal, only once prevents fault amplification), caller unaware of server restart. **No multiplexing** — Python single-threaded blocking model has one request in flight at a time, connection reuse already eliminates handshake overhead (Rule 2). `PyGuardClient` holds `UdsClient` directly (not `sock: PathBuf` building new `UdsClient::new` each time, which would bypass the pool), `client()` returns `&UdsClient`. Verification: +1 test `p24_persistent_conn_reuse_and_reconnect` — (1) same client 5 pings reuse connection all succeed (reuse doesn't corrupt wire); (2) after server abort+restart, dead stream detected+cleared+reconnect, ping still ok (transparent self-heal). Full 179 pass (178→179, +1), clippy clean (0 warning, also cleared `map_err(|x| x)` identity lint), release green.
+- **category_hint caller risk floor P2-6 (audit §3.2/F6, PRD §6.3 H9)**: old `guard.evaluate` had no `category_hint` param, caller-asserted category had no audit visibility, and v0.1 "caller self-certifies category" could be downgraded-bypassed (caller lies `read` to lower level and bypass Block). **H9 contract**: guard infers category authoritatively from content (`inferred_category`), caller `category_hint` acts only as risk floor — `final level = max(inferred, rule hit, hint)`, hint raises level never lowers (two-way anti-bypass). Wire: `guard.evaluate {action, content, context, caller_epoch, category_hint?}` (default None backward-compat). IPC receives `category_hint` (s_param idx 6) → passes through to `AuditEngine::evaluate(content, caller_epoch, tenant_id, content_type, category_hint: Option<&str>)`. engine sets `verdict.category_hint` (caller assertion visible in audit) + pure fn `hint_risk_floor(hint)` computes floor: `shell_exec`/`network`/`file_write` → L2 floor, read/clean/unknown → None (no floor). Floor capped at L2 (L3/L4 always driven by real rule hits, not caller assertion), `Allow`→`Redact` when floor raises level past L1. `GuardVerdict` adds `category_hint: Option<String>` field (`#[serde(default, skip_serializing_if)]` lets old verdict JSON missing this field still deserialize, pending_actions/audit cross-version compat), `PyGuardVerdict` mirrors + `to_dict` exposes; `fg-pyo3` evaluate pymethod adds `category_hint: Option<String>` signature (default None). Verification: +5 tests `p26_category_hint_test` — `hint_risk_floor_known_categories` (shell_exec/network/file_write→Some(L2)) + `hint_risk_floor_low_or_unknown_is_none` (read/clean/bogus/""→None) + `hint_raises_floor_from_l1_to_l2` (`ls /tmp` no hit L1 Allow + hint "network" → L2 Redact, inferred_category still "read" hint doesn't override inference) + `hint_never_lowers_l4_block` (`rm -rf /tmp/x` L4 Block + hint "read" → no lower, still L4 Block) + `hint_floor_below_current_no_change` (L4 Block + hint "shell_exec" L2 floor < L4 → no change). Pure decision fn unit-testable (Rule 5). Full 184 pass (179→184, +5), clippy clean (0 warning), release green.
+- **A2 bounded queue + dead-letter**: low-risk audit changed to `sync_channel(8192)` + `try_send` backpressure; drain runs batch inline (not spawn-per-batch); queue full/disconnect → persistent dead-letter file (guard.db.deadletter, 0o600), no silent event loss.
+- **A9 semantic SSOT**: removed dead code `semantic_default_rules()` (produced 6 stage=Semantic GuardRules injected into ruleset, but evaluate skips non-Regex stage, never matched); hardcoded danger tables (PY_DANGER_L4 etc.) are the semantic execution single source of truth, non-admin mutable (documented), restored SSOT honesty.
+- **L5 mv/cp destination (M)**: `check_argv` models `-t DIR`/`--target-directory=DIR`/`--target-directory DIR`/`--` terminator, correctly parses GNU mv/cp destination.
+- **L6 span tracking**: redact changed to single-pass span collection on original content (rejects overlap, first-pattern priority), placeholder never written back to original content → `id_number` doesn't corrode prior `tok_<uuid>` placeholder (old sequential replace_all ran on already-redacted text, id_number matched 17-digit subfield inside placeholder → broke placeholder → reveal hit H6 → reversible silent-degrade to irreversible). `id_number` tightened to `\d{17}[\dXx]`.
+- **L9 PyO3 errors explicit**: fg-pyo3 client removes all `unwrap_or` silent fallbacks — reveal/redact/confirm/audit_verify/list_rules missing key field → `PyValueError` (prevents empty-string masquerading as successful reveal, false forging no-tamper, epoch 0 permanently stale).
+- **L10 category derived from hit**: `infer_category` derives from actual hit scope (Network→network/Filesystem→file_write/non-whitelist→shell_exec/no hit→clean), not fixed-name table fallback.
+- **L11 verdict explicit rank**: `verdict_from_hits` deterministic sort by `(action_severity, risk_level, stage_rank)` taking head, not `max_by_key` tie-ambiguous last hit wins.
+- **L12 confirm audit schema**: confirm audit event adds dedicated field storing outcome/approve-reject, `action` column no longer one-column-two-meanings.
+- **L13 migrate uses PRAGMA**: `migrate_audit_chain` changed to `PRAGMA table_info` to check column existence (not `prepare(SELECT col)` — latter returns Err on legacy DB without column causing open failure, migration path unreachable).
+- **M3 poison explicit handling**: `PoisonError` explicit recover (11 `.expect` changed to lock macro).
+- **M4 Redactor Result**: `Redactor::new` returns `Result` propagating compile failure (not process panic); `OnceLock` caches static regex.
+- **M5/M7 build.rs**: `rerun-if-changed .git/refs` prevents stale FG_GIT_SHA; build.rs compile failure explicit `expect` checks success.
+- **M6 RiskLevel explicit Ord**: explicit `Ord` impl replaces `as u8` implicit.
+- **M9 json_to_py direct conversion**: fg-pyo3 `Value` → Python recursive direct conversion (not `to_string` + `json.loads` round-trip), f64 precision preserved, zero import.
+- **P1/P2 regex single scan**: `Lazy`/`OnceLock` static regex; `redact_counted` single-pass returns `(redacted, hit_count)` replacing has_sensitive+redact two-scan.
 
-### 产品商用审计修复 sweep (product-audit-0827)
+### Product Commercial Audit Sweep (product-audit-0827)
 
-依据 `audit/fusion-guard-audit-result-product-0827.md` (产品商用判定) 落地。与 audit-0827 静态对抗审查不同 wave, 此为商用发布前阻断硬伤修复。详见 CLAUDE.md。
+Per `audit/fusion-guard-audit-result-product-0827.md` (product commercial verdict) landed. A different wave from the audit-0827 static adversarial review; this fixes hard blockers before commercial release. See CLAUDE.md for details.
 
-- **shared secret prod 配置缺失 (H-C, audit §5)**: 旧 shared secret 仅 env 来源 (`FUSION_GUARD_SHARED_SECRET`) = 同 UID 进程可读 (`ps eww`/lsof/launchctl), 被攻陷 subagent (一核九端 9 个 fusion-* 同 UID) 可窃第二因子 → 规则突变/可逆脱敏 reveal 全权调用。**prod 来源改 macOS Keychain** (service `fusion-guard`, account `shared-secret`, 与 token-key 同 service 不同 account 域分离)。新增 `fg-store::secret_store` 模块: `resolve_shared_secret(is_debug, allow_insecure_flag, env_present) -> SharedSecretSource` 纯决策函数 (规则 5, 镜像 token-key 的 `resolve_key_source`) + `keychain_secret_get`/`keychain_secret_store` (macOS vs 非 macOS cfg) + `generate_shared_secret` (32 字节 hex 64 字符)。`load_shared_secret` 解析序 Keychain → env → none: Keychain 有即用 (prod 路径, 不入环境变量); Keychain 无 + env 放行 → env (escape hatch); Keychain 无 + env 未放行 → 不静默用 env (防漏 flag 降级) 视为无 secret; 两处皆无 + macOS release 首次启动 → 生成强随机 secret 存 Keychain (allow_mint, operator 也可预置纯 Keychain 不生成)。**Release gate** `require_shared_secret_for_release()`: release 启动检查两来源皆缺 → 拒启动 (防仅 peercred 兜底被同 UID 攻陷进程全权调用); Keychain 有 / env 放行 / `FUSION_GUARD_ALLOW_NO_SECRET=1` (应急运维 peercred-only) 三者任一放行。`ALLOW_NO_SECRET` **优先判** (启动 gate + load 双处), 跳过 Keychain 读 —— 非交互环境 `get_generic_password` 可能串行阻塞 (CLAUDE.md Keychain 挂起风险), CI/soak spawn release daemon 设此 flag 即可, 客户端无需携 secret。dev 构建 (debug) 跳过 gate, 容 secret 缺失 (测试便利)。`fg-bin` `start` 子命令增 `--insecure-secret-env` flag (置 `FUSION_GUARD_ALLOW_INSECURE_SECRET=1`, 镜像 `--insecure-env-key`)。`start.sh` shared-secret 供应块镜像 token-key 块: env 设 → flag; dev keyfile `${GUARD_DIR}/shared-secret` → 读 + flag; 两处皆无 → Keychain 路径。验证: 6 测 (`secret_store_test`) — 决策矩阵 4 分支 (Keychain/env-debug/env-insecure/release-no-flag) + 生成 hex 64 字符 + 随机性。
-- **token-test 挂起修复 (环境性)**: `ciphertext_not_plaintext` 原扫整个 `std::env::temp_dir()` (本机被其他进程污染, FIFO/大目录 entry) → `std::fs::read` → `open()` 在某 entry 阻塞, 测试挂 60s+。改 `open_conn_in_dir()` 仅扫测试自建子目录, 断言意图不变 (自建 db 目录下不得出现明文)。env-key 测试前置不变。
-- **操作文档**: 新增 `DEPLOYMENT.md` —— 两个密钥信任模型对比表 (token-key vs shared-secret, Keychain account / env 变量 / 泄露影响)、Keychain 安全路径 (首次自动生成 + operator 预置 `security add-generic-password`)、env 不安全路径表 (放行 flag CLI + env)、release gate 行为、快速 prod 部署清单、多节点集群 (shared secret 各节点一致)、launchd 常驻 (用户域 LaunchAgents)、密钥轮换。
+- **shared secret prod config missing (H-C, audit §5)**: old shared secret was env-only (`FUSION_GUARD_SHARED_SECRET`) = readable by same-UID processes (`ps eww`/lsof/launchctl), a compromised subagent (one-core-nine-ends 9 fusion-* same UID) could steal the second factor → rule mutation/reversible redact reveal full-power calls. **prod source changed to macOS Keychain** (service `fusion-guard`, account `shared-secret`, same service as token-key different account for domain separation). New `fg-store::secret_store` module: `resolve_shared_secret(is_debug, allow_insecure_flag, env_present) -> SharedSecretSource` pure decision function (Rule 5, mirrors token-key's `resolve_key_source`) + `keychain_secret_get`/`keychain_secret_store` (macOS vs non-macOS cfg) + `generate_shared_secret` (32 bytes hex 64 chars). `load_shared_secret` resolution order Keychain → env → none: Keychain present use it (prod path, not into env var); Keychain absent + env allowed → env (escape hatch); Keychain absent + env not allowed → not silently use env (prevent missed-flag degrade) treated as no secret; both absent + macOS release first start → generate strong random secret stored to Keychain (allow_mint, operator can also pre-provision pure-Keychain no generation). **Release gate** `require_shared_secret_for_release()`: release startup checks both sources absent → refuse startup (prevents peercred-only fallback being fully callable by a same-UID compromised process); Keychain present / env allowed / `FUSION_GUARD_ALLOW_NO_SECRET=1` (emergency ops peercred-only) any one allows. `ALLOW_NO_SECRET` **judged first** (startup gate + load both places), skips Keychain read — non-interactive env `get_generic_password` may serially block (CLAUDE.md Keychain hang risk), CI/soak spawn release daemon sets this flag, client need not carry secret. dev build (debug) skips gate, tolerates secret absence (test convenience). `fg-bin` `start` subcommand adds `--insecure-secret-env` flag (sets `FUSION_GUARD_ALLOW_INSECURE_SECRET=1`, mirrors `--insecure-env-key`). `start.sh` shared-secret supply block mirrors token-key block: env set → flag; dev keyfile `${GUARD_DIR}/shared-secret` → read + flag; both absent → Keychain path. Verification: 6 tests (`secret_store_test`) — decision matrix 4 branches (Keychain/env-debug/env-insecure/release-no-flag) + generates hex 64 chars + randomness.
+- **token-test hang fix (environmental)**: `ciphertext_not_plaintext` originally scanned entire `std::env::temp_dir()` (this machine polluted by other processes, FIFO/large-dir entry) → `std::fs::read` → `open()` blocked on some entry, test hung 60s+. Changed `open_conn_in_dir()` to scan only the test's self-built subdir, assertion intent unchanged (no plaintext under self-built db dir). env-key test precondition unchanged.
+- **Ops docs**: new `DEPLOYMENT.md` — two-key trust model comparison table (token-key vs shared-secret, Keychain account / env var / leak impact), Keychain secure path (first auto-generation + operator pre-provision `security add-generic-password`), env insecure path table (allow flag CLI + env), release gate behavior, quick prod deployment checklist, multi-node cluster (shared secret consistent across nodes), launchd persistence (user-domain LaunchAgents), key rotation.
 
-### 测试稳健性 (verify 阶段补强)
+### Test Robustness (verify-phase reinforcement)
 
-- **semantic_verdict_block payload 修正**: 原 payload `os.system('rm -rf /')` 同时命中 regex rm-rf (Block L4) + semantic os.system (Block L4), L11 stage_rank Regex>Semantic → verdict.stage=Regex 非 Semantic (测试误报 fail)。后改 `subprocess.run(['ls', '-la'])` 又撞 A1 glob `[...]` Ast L4 平局。终定 `os.system('id')`: Ast 仅非白名单 L3, semantic os.system L4 — L4 risk > L3 → semantic 确定性胜。L11 排序设计正确, 错在 payload 未隔离单一 stage。
-- **fg-pyo3 测 flake 消除**: `evaluate_block_returns_verdict` 在 workspace 高并发负载下偶发 `-32010` (server.serve accept 循环未被 worker_threads=2 调度 → 首请求 2s read 超时)。补 `wait_for_sock` 轮询 1s→5s + `call_retry`/`call_retry_err` 瞬态 -32010 重试 3 次 × 200ms, 非 -32010 业务错 (如 -32003 stale epoch) 原样返不重试。
+- **semantic_verdict_block payload fix**: original payload `os.system('rm -rf /')` hit both regex rm-rf (Block L4) + semantic os.system (Block L4); L11 stage_rank Regex>Semantic → verdict.stage=Regex not Semantic (test false-failed). Then changed to `subprocess.run(['ls', '-la'])` which also collided with A1 glob `[...]` Ast L4 tie. Finally settled on `os.system('id')`: Ast only non-whitelist L3, semantic os.system L4 — L4 risk > L3 → semantic deterministically wins. L11 sort design correct, error was payload not isolating a single stage.
+- **fg-pyo3 test flake elimination**: `evaluate_block_returns_verdict` under workspace high-concurrency load occasionally `-32010` (server.serve accept loop not scheduled by worker_threads=2 → first request 2s read timeout). Added `wait_for_sock` polling 1s→5s + `call_retry`/`call_retry_err` transient -32010 retry 3 × 200ms; non-32010 business errors (e.g. -32003 stale epoch) returned as-is not retried.
 
-## IPC 协议
+## IPC Protocol
 
 UDS socket: `/tmp/fusion-guard.sock` (env `FUSION_GUARD_SOCK`)
-帧格式: JSON-RPC 2.0 + `0x0A` 分隔, 1MiB 上限, 2s 超时 fail-closed
+Frame format: JSON-RPC 2.0 + `0x0A` delimiter, 1MiB cap, 2s timeout fail-closed
 
-方法:
-- `guard.ping` — `{pong: bool, version, rules_epoch}` (`pong` 为 boolean —— 跨仓消费方 fusion-cli #9 / fusion-studio #344 按 `Bool` 读; 勿返 string)
-- `guard.evaluate` — `{action, content, caller_epoch?, tenant_id?, requester?}` → GuardVerdict (caller_epoch != 0 且 != guard epoch → `-32003` stale epoch)
+Methods:
+- `guard.ping` — `{pong: bool, version, rules_epoch}` (`pong` is boolean — cross-repo consumers fusion-cli #9 / fusion-studio #344 read as `Bool`; never return string)
+- `guard.evaluate` — `{action, content, caller_epoch?, tenant_id?, requester?}` → GuardVerdict (caller_epoch != 0 and != guard epoch → `-32003` stale epoch)
 - `guard.rule.list` — `{rules: [GuardRule], epoch}`
-- `guard.rules.dump` — `{rules, epoch}` (同 rule.list)
+- `guard.rules.dump` — `{rules, epoch}` (same as rule.list)
 - `guard.rule.add` — `{rule: GuardRule}` → `{new_epoch}`
 - `guard.rule.update` — `{name, rule}` → `{new_epoch}`
 - `guard.rule.remove` — `{name}` → `{new_epoch}`
-- `guard.tcc.status` — `{statuses: [TccStatus]}` (Swift bridge, source `swift-bridge:live` 或 `tccutil:stub`)
-- `guard.tcc.report` — `{permission, requester, result, reason}` → `{audit_id}` (审计聚合 H1, 各子项目自请求 TCC, guard 只聚合)
+- `guard.tcc.status` — `{statuses: [TccStatus]}` (Swift bridge, source `swift-bridge:live` or `tccutil:stub`)
+- `guard.tcc.report` — `{permission, requester, result, reason}` → `{audit_id}` (audit aggregation H1, each subproject self-requests TCC, guard only aggregates)
 - `guard.tcc.events` — `{limit?}` → `{events: [TccEventRecord]}`
 - `guard.audit.list` — `{tenant_id?, limit?}` → `{records: [AuditRecord]}`
-- `guard.audit.verify` — `{}` → `{audit:{...}, tcc:{...}, rules:{...}, dead_letter:{...}, tampered}` (全链聚合校验, P0-5: audit+tcc+rules+dead_letter 四子链; 各子链 `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at?}`; 顶层 `tampered`=任一子链被篡改, PRD §13.3)
-- `guard.redact` — `{content, reversible:bool}` → `{redacted_content, token_map_id?}` (可逆: token AES-GCM 加密落盘, in-flight 标记 R3; 不可逆: `[REDACTED:type#last4]`)
-- `guard.redact.patterns.dump` — `{}` → `{patterns: [{name, regex, validator}]}` (issue #7: 15 条脱敏 pattern 定义只读 dump, 优先序保留, validator tag `none|ipv4|aws_secret|luhn|phone`; 消费方拉取代 vendoring, 消手动 lockstep)
-- `guard.reveal` — `{content, token_map_id}` → `{content}` (还原; token 丢失回退 `[REDACTED:unrecoverable#...]` H6)
-- `guard.confirm` — `{action_id, approved:bool, approved_by?, tenant_id?}` → `{verdict: GuardVerdict}` (L3 人机确认; L4 拒绝 H8; action_id 一次性兑现 H4; TTL 30s 过期拒绝; approve→Allow, reject→Block)
+- `guard.audit.verify` — `{}` → `{audit:{...}, tcc:{...}, rules:{...}, dead_letter:{...}, tampered}` (all-chain aggregation verify, P0-5: audit+tcc+rules+dead_letter four sub-chains; each sub-chain `{total_rows, unhashed_rows, verified_links, broken_links, tampered, first_broken_at?}`; top-level `tampered`=any sub-chain tampered, PRD §13.3)
+- `guard.redact` — `{content, reversible:bool}` → `{redacted_content, token_map_id?}` (reversible: token AES-GCM encrypted persisted, in-flight flag R3; irreversible: `[REDACTED:type#last4]`)
+- `guard.redact.patterns.dump` — `{}` → `{patterns: [{name, regex, validator}]}` (issue #7: 15 redaction pattern definitions read-only dump, priority order preserved, validator tag `none|ipv4|aws_secret|luhn|phone`; consumers pull instead of vendoring, eliminates manual lockstep)
+- `guard.reveal` — `{content, token_map_id}` → `{content}` (restore; token missing falls back to `[REDACTED:unrecoverable#...]` H6)
+- `guard.confirm` — `{action_id, approved:bool, approved_by?, tenant_id?}` → `{verdict: GuardVerdict}` (L3 human confirmation; L4 rejected H8; action_id one-time consume H4; TTL 30s expired rejected; approve→Allow, reject→Block)
 
-GuardRule 字段: `name, pattern, stage(Regex|Ast|Semantic), action(Allow|Preview|Redact|Block), risk_level(L1-L4), reason, scope(Command|Content|Network|Filesystem)`
+GuardRule fields: `name, pattern, stage(Regex|Ast|Semantic), action(Allow|Preview|Redact|Block), risk_level(L1-L4), reason, scope(Command|Content|Network|Filesystem)`
 
-规则 SSOT: guard 是规则权威源, epoch 单调递增。caller 持 caller_epoch, 规则变更后 guard 拒绝 stale epoch。规则持久化到 SQLite, 跨重启不丢失。
+Rule SSOT: guard is the rule authority, epoch monotonically increments. Caller holds caller_epoch; after rule changes guard rejects stale epoch. Rules persisted to SQLite, survive restart.
 
-错误码: `-32700` parse / `-32600` invalid / `-32601` not found / `-32001` unauthorized / `-32002` rate limit / `-32003` stale epoch / `-32010` internal (BLOCK = `result.action="block"`, 非错误码 — E5)
+Error codes: `-32700` parse / `-32600` invalid / `-32601` not found / `-32001` unauthorized / `-32002` rate limit / `-32003` stale epoch / `-32010` internal (BLOCK = `result.action="block"`, not an error code — E5)
 
-## 使用
+## Usage
 
 ```bash
 cargo build --release
-./start.sh start    # 启动守护进程
+./start.sh start    # launch daemon
 ./start.sh status
 ./start.sh stop
 ./start.sh log
@@ -305,7 +307,7 @@ cargo build --release
 ./target/release/fusion-guard ping
 ```
 
-## 开发
+## Development
 
 ```bash
 make build    # cargo build
@@ -314,52 +316,52 @@ make lint     # clippy + fmt
 make check    # lint + test
 ```
 
-代码规范: 4 空格缩进, 无 docstring, 必带日志, `unsafe_code = "deny"` (workspace lint)。
+Code conventions: 4-space indentation, no docstrings, logging always included, `unsafe_code = "deny"` (workspace lint).
 
-## 生产部署
+## Production Deployment
 
-**两个生产密钥** (token-key 主密钥 + shared-secret 第二因子) 部署方式不同, prod 必须用 macOS Keychain (service `fusion-guard`, account `token-key`/`shared-secret`), env 仅 dev/CI/应急 escape hatch (release 须显式 flag 放行)。
+**Two production keys** (token-key master + shared-secret second factor) deploy differently; prod must use macOS Keychain (service `fusion-guard`, account `token-key`/`shared-secret`), env is dev/CI/emergency escape hatch only (release requires explicit flag to allow).
 
-完整部署文档: **`DEPLOYMENT.md`** (Keychain 安全路径 + env 不安全路径 + release gate H-C + 快速 prod 清单 + 多节点集群 + launchd 常驻 + 密钥轮换)。
+Full deployment doc: **`DEPLOYMENT.md`** (Keychain secure path + env insecure path + release gate H-C + quick prod checklist + multi-node cluster + launchd persistence + key rotation).
 
-release 二进制启动前须预置 Keychain secret, 否则 release gate 拒启动 (除非 `FUSION_GUARD_ALLOW_NO_SECRET=1` 应急放行):
+Before launching the release binary, pre-provision the Keychain secret or the release gate refuses startup (unless `FUSION_GUARD_ALLOW_NO_SECRET=1` emergency allows):
 
 ```bash
 SS=$(python3 -c "import secrets;print(secrets.token_hex(32))")
 security add-generic-password -s fusion-guard -a shared-secret -w "${SS}"
-./start.sh start    # 客户端非 ping 请求须携 secret
+./start.sh start    # client non-ping requests must carry secret
 ```
 
-### 压测 / soak (商用阻塞点 #6)
+### Soak / Stress Test (commercial blocker #6)
 
-`crates/fg-ipc/tests/soak_test.rs` — 长跑并发压测, 验生产形态: 持续高并发负载下延迟不退化、子进程内存不泄漏、fail-closed 不破。
+`crates/fg-ipc/tests/soak_test.rs` — long-running concurrency stress test, validates production form: under sustained high-concurrency load latency doesn't degrade, child process memory doesn't leak, fail-closed holds.
 
 ```bash
-# 先建 release daemon (soak spawn 子进程, 非在进程内)
+# Build release daemon first (soak spawns a child process, not in-process)
 cargo build --release -p fg-bin
 
-# 跑 soak (需 release binary, 缺失自动 skip 不挂全套 cargo test)
+# Run soak (needs release binary, auto-skips if missing without failing full cargo test)
 export FUSION_GUARD_TOKEN_KEY=$(python3 -c "import secrets;print(secrets.token_hex(32))")
 cargo test -p fg-ipc --test soak_test -- --nocapture
 ```
 
-模型: spawn `target/release/fusion-guard start` 子进程 (隔离 SOCK+DATA_DIR+TOKEN_KEY+LOG_DIR), 48 并发 UDS 连接循环 `guard.evaluate` 跑 10s, 每 2s 采子进程 RSS (`ps -o rss=`) + DB 磁盘占用。子进程模式 = RSS 量纯 server, 无客户端线程栈/malloc 污染, 无 debug 膨胀。
+Model: spawn `target/release/fusion-guard start` child process (isolated SOCK+DATA_DIR+TOKEN_KEY+LOG_DIR), 48 concurrent UDS connections looping `guard.evaluate` for 10s, sampling child process RSS (`ps -o rss=`) every 2s + DB disk usage. Child-process mode = RSS measures pure server, no client-thread-stack/malloc pollution, no debug bloat.
 
-断言: 吞吐 ≥5000 reqs/10s, 错误率 <1%, p50 ≤25ms, p99 ≤200ms, DB 磁盘 ≤200MB (rotation 有界), daemon RSS ≤1200MB (容 macOS libmalloc 不归还 + tokio 池驻留)。fail-closed 用例 (`rm -rf /`) 验 Block L4 高并发下不误判 allow。
+Assertions: throughput ≥5000 reqs/10s, error rate <1%, p50 ≤25ms, p99 ≤200ms, DB disk ≤200MB (rotation bounded), daemon RSS ≤1200MB (tolerates macOS libmalloc non-return + tokio pool residency). Fail-closed case (`rm -rf /`) verifies Block L4 not misjudged as allow under high concurrency.
 
-**测试前置**: `cargo test` 必先 `export FUSION_GUARD_TOKEN_KEY=<hex 32B>`, 否则 `AuditStore::open` → macOS Keychain `SecItemCopyMatching` 非交互环境挂 60s+。
+**Test precondition**: `cargo test` must first `export FUSION_GUARD_TOKEN_KEY=<hex 32B>`, else `AuditStore::open` → macOS Keychain `SecItemCopyMatching` hangs 60s+ in non-interactive env.
 
-## 路线图 (PRD §17)
+## Roadmap (PRD §17)
 
-- **Phase 0** ✅ 工程骨架: workspace + 8 crate + start.sh + CI + launchd
-- **Phase -1** ✅ 门控: fusion-security 决策 A (只收敛重叠能力, SAST 独立保留) — issue #23
-- **Phase 1** 规则收敛: ✅ SSOT + epoch + 持久化, ✅ SQLite WAL 审计, ✅ encrypted token store (redact/reveal), ✅ confirm + action_id (H4/H8)
-- **Phase 2** AST 阶段: ✅ Stage 2 tokenizer (shell-words MVP), ✅ category 推断 (H9), ✅ seatbelt_required (E7), ✅ SENSITIVE_PATHS/WHITELIST 收敛
-- **Phase 3** fail-closed 本地缓存 + seatbelt 编译内联 (blocked-on-upstream-PR: executor E2)
-- **Phase 5** ✅ TCC 审计聚合 (H1) + Swift tcc-bridge (status query, C stub 兜底, 独立 CI lane — E1)
-- **Phase 6** agent-studio/studio 集成 (blocked-on-upstream-PR: E2)
-- **Phase 7** 审计链式 hash 防篡改 ✅ (PRD §13.3); Endpoint Security ✅ (fg-es, stub 降级 → TCC, Q#3); PyO3 绑定 ✅ (fg-pyo3, UDS 客户端暴露 Python, Q#4); Stage 3 tree-sitter 语义阶段 ✅ (feature=semantic, PRD §7.4 R5)
+- **Phase 0** ✅ Engineering skeleton: workspace + 8 crate + start.sh + CI + launchd
+- **Phase -1** ✅ Gate: fusion-security decision A (converge overlapping capability only, SAST retained independently) — issue #23
+- **Phase 1** Rule convergence: ✅ SSOT + epoch + persistence, ✅ SQLite WAL audit, ✅ encrypted token store (redact/reveal), ✅ confirm + action_id (H4/H8)
+- **Phase 2** AST stage: ✅ Stage 2 tokenizer (shell-words MVP), ✅ category inference (H9), ✅ seatbelt_required (E7), ✅ SENSITIVE_PATHS/WHITELIST convergence
+- **Phase 3** fail-closed local cache + seatbelt compile inline (blocked-on-upstream-PR: executor E2)
+- **Phase 5** ✅ TCC audit aggregation (H1) + Swift tcc-bridge (status query, C stub fallback, independent CI lane — E1)
+- **Phase 6** agent-studio/studio integration (blocked-on-upstream-PR: E2)
+- **Phase 7** Audit chain hash tamper-evidence ✅ (PRD §13.3); Endpoint Security ✅ (fg-es, stub degraded → TCC, Q#3); PyO3 binding ✅ (fg-pyo3, UDS client exposed to Python, Q#4); Stage 3 tree-sitter semantic stage ✅ (feature=semantic, PRD §7.4 R5)
 
-## Monorepo 上下文
+## Monorepo Context
 
-27 个 `fusion-*` 子项目共享 `/Users/dahai/fusion/.venv`。fusion-guard 是 Rust + Swift 工程, 非 Python。IPC 对齐 monorepo JSON-RPC 2.0 over UDS 契约。详见 `/Users/dahai/fusion/CLAUDE.md`。
+27 `fusion-*` subprojects share `/Users/dahai/fusion/.venv`. fusion-guard is a Rust + Swift project, not Python. IPC aligns with the monorepo JSON-RPC 2.0 over UDS contract. See `/Users/dahai/fusion/CLAUDE.md`.
