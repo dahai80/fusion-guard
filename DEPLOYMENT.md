@@ -104,6 +104,27 @@ dev 构建 (debug) 跳过 gate, 容许 secret 缺失 (测试便利)。
 
 token key 无独立 release gate, 但 `FUSION_GUARD_TOKEN_KEY` 在 release 未放行时 → `KeychainRequired` 路径: macOS 走 Keychain, 非 macOS 拒启动。
 
+## 无头环境 (CI / SSH / launchd-without-GUI, issue #17)
+
+macOS Keychain (`SecItemCopyMatching` / `get_generic_password`) 在非交互会话 (无 WindowServer) **串行阻塞**, 守护进程启动挂死。`start.sh` 自动检测无头环境并跳过 Keychain, 回退文件密钥:
+
+**无头判定** (任一):
+- `./start.sh start --headless` 显式 flag
+- `FUSION_GUARD_HEADLESS=1` env
+- stdin 非 tty (管道/重定向输入)
+- SSH 环境 (`SSH_CONNECTION`/`SSH_TTY`/`SSH_CLIENT` 已设)
+
+**行为**: 无头 + 无 env + 无 keyfile → 自动生成 `~/.fusion-guard/token-key` (32 字节 hex, 600) + `~/.fusion-guard/shared-secret` (32 字节 base64, 600), 导入 env + 传 `--insecure-env-key`/`--insecure-secret-env`。keyfile 跨重启复用 (同主密钥 → 审计链可验 + token 可解), 仅首次生成。
+
+**优于 `FUSION_GUARD_ALLOW_NO_SECRET=1`**: 保 §12.1 第二因子 (文件 secret, 客户端携带), 非 peercred-only 降级。
+
+**桌面 prod 回收**: 删除两 keyfile → 交互会话重启 → Keychain 路径 (密钥不入 env, 同 UID 不可读)。
+
+```bash
+./start.sh start --headless          # CI / SSH / 无 GUI launchd
+FUSION_GUARD_HEADLESS=1 ./start.sh start   # 等价
+```
+
 ## 快速部署清单 (prod, macOS 单节点)
 
 ```bash
