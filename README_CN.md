@@ -8,7 +8,7 @@ Fusion local AI OS 的零信任动作授权守护进程 (zero-trust action autho
 
 ## 状态
 
-Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审计链式 hash + PyO3 + Endpoint Security + tree-sitter 语义阶段) 完成。14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。当前版本 **v0.2.0-rc.2** (H-E 主密钥丢失 vs 真篡改区分 + pong:bool 契约修复 + 7/7 上游集成 issue 全闭合, 代码级 production-ready)。
+Phase 2 完成, Phase 5 (TCC 审计聚合 + Swift bridge) 完成, Phase 7 (审计链式 hash + PyO3 + Endpoint Security + tree-sitter 语义阶段) 完成。14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL 审计 + 规则 SSOT/epoch 持久化。当前版本 **v0.2.0-rc.3** (无头/CI/SSH 启动 escape hatch + H-E 主密钥丢失 vs 真篡改区分 + pong:bool 契约修复 + 7/7 上游集成 issue 全闭合, 代码级 production-ready)。
 
 | 验收项 | 状态 |
 |--------|------|
