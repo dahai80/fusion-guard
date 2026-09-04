@@ -8,7 +8,7 @@ Zero-trust action authorization daemon for the Fusion local AI OS. Intercepts hi
 
 ## Status
 
-Phase 2 complete, Phase 5 (TCC audit aggregation + Swift bridge) complete, Phase 7 (audit chain hash + PyO3 + Endpoint Security + tree-sitter semantic stage) complete. 14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL audit + rule SSOT/epoch persistence. Current version **v0.2.0-rc.2** (H-E master-key loss vs real tamper distinction + pong:bool contract fix + 7/7 upstream integration issues all closed, code-level production-ready).
+Phase 2 complete, Phase 5 (TCC audit aggregation + Swift bridge) complete, Phase 7 (audit chain hash + PyO3 + Endpoint Security + tree-sitter semantic stage) complete. 14-crate Cargo workspace + UDS JSON-RPC daemon + SQLite WAL audit + rule SSOT/epoch persistence. Current version **v0.2.0-rc.3** (headless/CI/SSH startup escape hatch + H-E master-key loss vs real tamper distinction + pong:bool contract fix + 7/7 upstream integration issues all closed, code-level production-ready).
 
 | Acceptance item | Status |
 |-----------------|--------|
