@@ -332,6 +332,24 @@ security add-generic-password -s fusion-guard -a shared-secret -w "${SS}"
 ./start.sh start    # 客户端非 ping 请求须携 secret
 ```
 
+### 无头 / CI / SSH (issue #17)
+
+macOS Keychain (`SecItemCopyMatching` / `get_generic_password`) 在非交互会话 (无 WindowServer — SSH、CI、无 GUI 的 launchd) **串行阻塞**。release 守护进程在既无 env 又无 keyfile escape hatch 时启动静默挂死 —— `start.sh` 的 `kill -0` 存活检查可能在进程卡在阻塞 Keychain 调用内时仍通过, 故失败形态为「守护进程看似已启动但永不绑定 socket」。
+
+`start.sh` 自动检测无头环境并**跳过 Keychain**, 回退文件密钥 (保 DLP + 审计链跨重启可验, 不以 `allow-no-key` 削弱安全):
+
+- **无头判定**: `--headless` flag (`./start.sh start --headless`)、`FUSION_GUARD_HEADLESS=1` env、无 tty (stdin 非 tty)、或 SSH 环境 (`SSH_CONNECTION`/`SSH_TTY`/`SSH_CLIENT` 已设)。桌面交互会话默认走 Keychain (prod)。
+- **行为**: 无头 + 无 env + 无 keyfile → 自动生成 `~/.fusion-guard/token-key` (32 字节 hex, 600 权限) 和 `~/.fusion-guard/shared-secret` (32 字节 base64, 600 权限), 导入 env + 传 `--insecure-env-key`/`--insecure-secret-env`。keyfile 跨重启持久 (同主密钥 → 审计链可验、token 可解) —— 仅生成一次, 之后复用。
+- **强于 `FUSION_GUARD_ALLOW_NO_SECRET=1`**: 保 §12.1 shared-secret 第二因子 (文件密钥, 客户端携带) 而非降级为仅 peercred 鉴权。
+- **桌面 prod 回收**: 删除 keyfile (`~/.fusion-guard/token-key`、`~/.fusion-guard/shared-secret`) 后在交互会话重启 → Keychain 路径 (密钥不入 env, 同 UID 不可读)。或预置 Keychain + 跑 `./start.sh start` (不加 `--headless`)。
+
+```bash
+# CI / SSH / 无 GUI launchd
+./start.sh start --headless
+# 或自动检测 (管道 stdin / SSH) —— 无需 flag
+FUSION_GUARD_HEADLESS=1 ./start.sh start
+```
+
 ### 压测 / soak (商用阻塞点 #6)
 
 `crates/fg-ipc/tests/soak_test.rs` — 长跑并发压测, 验生产形态: 持续高并发负载下延迟不退化、子进程内存不泄漏、fail-closed 不破。

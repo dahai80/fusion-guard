@@ -332,6 +332,24 @@ security add-generic-password -s fusion-guard -a shared-secret -w "${SS}"
 ./start.sh start    # client non-ping requests must carry secret
 ```
 
+### Headless / CI / SSH (issue #17)
+
+macOS Keychain (`SecItemCopyMatching` / `get_generic_password`) **serially blocks** in non-interactive sessions (no WindowServer — SSH, CI, launchd-without-gui). The release daemon hangs silently on startup when neither an env var nor a keyfile escape hatch is set — `start.sh`'s `kill -0` liveness check may pass while the process is stuck inside the blocking Keychain call, so the failure mode is "daemon appears started but never binds the socket".
+
+`start.sh` auto-detects headless and **skips Keychain**, falling back to file-backed keys (preserves DLP + audit-chain cross-restart verifiability, no `allow-no-key` weakening):
+
+- **Headless when**: `--headless` flag (`./start.sh start --headless`), `FUSION_GUARD_HEADLESS=1` env, no tty (stdin not a tty), or under SSH (`SSH_CONNECTION`/`SSH_TTY`/`SSH_CLIENT` set). Desktop interactive sessions default to Keychain (prod).
+- **Behavior**: headless + no env + no keyfile → auto-generates `~/.fusion-guard/token-key` (32-byte hex, 600 perms) and `~/.fusion-guard/shared-secret` (32-byte base64, 600 perms), exports to env + passes `--insecure-env-key`/`--insecure-secret-env`. Keyfiles persist across restarts (same master → audit chain verifies, tokens decrypt) — generated once, reused after.
+- **Stronger than `FUSION_GUARD_ALLOW_NO_SECRET=1`**: keeps the §12.1 shared-secret second factor (file-backed secret, clients carry it) instead of degrading to peercred-only auth.
+- **Desktop prod recovery**: delete the keyfiles (`~/.fusion-guard/token-key`, `~/.fusion-guard/shared-secret`) and restart in an interactive session → Keychain path (keys not in env, not same-UID readable). Or pre-provision Keychain + run `./start.sh start` (no `--headless`).
+
+```bash
+# CI / SSH / launchd-without-gui
+./start.sh start --headless
+# or auto-detected (piped stdin / SSH) — no flag needed
+FUSION_GUARD_HEADLESS=1 ./start.sh start
+```
+
 ### Soak / Stress Test (commercial blocker #6)
 
 `crates/fg-ipc/tests/soak_test.rs` — long-running concurrency stress test, validates production form: under sustained high-concurrency load latency doesn't degrade, child process memory doesn't leak, fail-closed holds.
