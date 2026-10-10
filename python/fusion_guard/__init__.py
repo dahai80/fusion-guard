@@ -13,6 +13,7 @@ from ._native import (
     NativeAllChainsVerification,
     version_info,
 )
+from .laya_guard import LayaGuardClient, GuardResult, DimensionScore
 
 __all__ = [
     "NativeGuardClient",
@@ -23,6 +24,9 @@ __all__ = [
     "NativeAllChainsVerification",
     "version_info",
     "_native",
+    "LayaGuardClient",
+    "GuardResult",
+    "DimensionScore",
 ]
 
-__version__ = "0.2.0-rc.4"
+__version__ = "0.2.0-rc.5"
