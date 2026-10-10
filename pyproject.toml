@@ -1,11 +1,11 @@
 [project]
 name = "fusion-guard"
-version = "0.2.0-rc.4"
+version = "0.2.0-rc.5"
 description = "Fusion-Guard — zero-trust action authorization + DLP firewall daemon"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Fusion-MLX Team" }]
-dependencies = []
+dependencies = ["httpx>=0.27"]
 
 [project.optional-dependencies]
 test = [
@@ -16,6 +16,10 @@ test = [
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.maturin]
 manifest-path = "crates/fg-pyo3/Cargo.toml"
