@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Current release: v0.2.0-rc.3 (2026-09-04, release candidate).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 + Phase 5 (TCC audit aggregation + Swift bridge) + Phase 7 (audit chain hash tamper-evidence + ES monitor + PyO3 binding + semantic stage) + P0-P2 audit hardening sweep (22 fixes: G1-G9 release-blockers + P1/P2 waves) + H-E key-loss/tamper distinction (per-version key_anchor + rotation verify + escrow doc) + pong:bool contract fix + GitHub issues #1/#2/#3/#5/#10 landed on `main` + **issue #4 (cluster/multi-node consumer) landed** in v0.1.2 + **issue #7 (redact pattern dump) landed** v0.1.2 + **PR#12 audit-sweep (P1-5/P1-6/P1-7/P2-1/P2-2/H-G + soak H-C fix) merged** v0.2.0-rc.1 + **H-E + pong fix** v0.2.0-rc.2 + **issue #17 headless startup** v0.2.0-rc.3, pushed to dahai80/fusion-guard. **7/7 上游集成 issue 全 closed** (executor#23 PR#30 / fusion-cli#9 / agent-studio#252 / studio#344 / cowork#73 / gateway#128 / multi-nodes#52), H-F (零消费者) 解除。Phases 3/4/6 集成落地 (executor/agent-studio/studio, issue→PR→land flow done).
+**Current release: v0.2.0-rc.3 (2026-09-04, release candidate).** Phase 0 + Phase 1 (checkpoints 1-4) + Phase 2 Checkpoint 5 + Phase 5 (TCC audit aggregation + Swift bridge) + Phase 7 (audit chain hash tamper-evidence + ES monitor + PyO3 binding + semantic stage) + P0-P2 audit hardening sweep (22 fixes: G1-G9 release-blockers + P1/P2 waves) + H-E key-loss/tamper distinction (per-version key_anchor + rotation verify + escrow doc) + pong:bool contract fix + GitHub issues #1/#2/#3/#5/#10 landed on `main` + **issue #4 (cluster/multi-node consumer) landed** in v0.1.2 + **issue #7 (redact pattern dump) landed** v0.1.2 + **PR#12 audit-sweep (P1-5/P1-6/P1-7/P2-1/P2-2/H-G + soak H-C fix) merged** v0.2.0-rc.1 + **H-E + pong fix** v0.2.0-rc.2 + **issue #17 headless startup** v0.2.0-rc.3, pushed to dahai80/fusion-guard. **7/7 上游集成 issue 全 closed** (executor#23 PR#30 / fusion-cli#9 / agent-studio#252 / studio#344 / cowork#73 / gateway#128 / multi-nodes#52), H-F (零消费者) 解除。Phases 3/4/6 集成落地 (executor/agent-studio/studio, issue→PR→land flow done). **Open: issue #20** (laya-mlx guardrails — Python `fusion_guard/laya_guard.py`, zero-latency `noul`/`score` safety scoring via fusion-mlx `POST /v1/laya/decide`, spec `architecture/laya-mlx-2-fusion-mlx-1010.md` §二.2).
 
 **产品商用审计修复 sweep (2026-08-28, audit/fusion-guard-audit-result-product-0827.md):** 全 P0-P2 code-fixable 项落地。242 tests pass (177 baseline + 65 new), clippy clean, fmt green, release green。
 
@@ -68,7 +68,7 @@ Verification: `cargo test -p fg-es` 6 pass (event_kind_roundtrip, monitor_degrad
 - **tokio runtime 硬化 (fg-bin):** `main` 从 `#[tokio::main]` (默认 max_blocking_threads=512 × 2MB 栈 = 潜在 1GB) 改显式 `Builder::new_multi_thread().max_blocking_threads(64).thread_stack_size(256*1024)`。实际并发 handler ≤ MAX_CONCURRENT_REQS=16, 512 纯浪费。worker_threads=CPU 核数保持 (异步 IO), blocking 池独立给 spawn_blocking。非 RSS 根因 (实测改后 RSS 不降) 但 sensible 硬化。
 - **RSS 根因结论:** RSS 增长 = SQLite B-tree + page cache 跟踪 audit_events 表增长 + macOS libmalloc 不归还小对象页 (MADV_FREE retained), 非 guard 逻辑泄漏 (已证: DB 数据 rotation+VACUUM 有界, 延迟不退化, 错误率低)。drain→retention 缺口是唯一可修真 bug。
 
-The product contract lives in the monorepo PRD: `/Users/dahai/fusion/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
+The product contract lives in the monorepo PRD: `/Users/dahai/fusion/architecture/fusion-guard-prd-plan-v2-0826.md` (v0.2 — the implementation spec; supersedes the v0.1 audit target at `architecture/fusion-guard-prd-0826.md`). Read it before any implementation work; it is the single source of truth for scope, mechanism, and API shape.
 
 ## Crate Layout (landed)
 
@@ -82,6 +82,7 @@ crates/
 ├── fg-tcc-bridge     # Swift FFI: @_cdecl TCC status queries, compiled to static lib via build.rs, C stub fallback (unsafe_code=allow)
 ├── fg-es             # Endpoint Security 高危系统事件监控: EsEventKind/EsEvent/EsMonitorState/EsStatus/EsMonitor (safe types, unsafe_code=deny)
 ├── fg-es-bridge      # ES C FFI 桥: 无 entitlement → C stub 兜底 (cfg(es_bridge_stub), degraded → TCC — Q#3), unsafe_code=allow, is_stub() exposes cfg to fg-es
+├── fg-peercred       # UDS peer credential FFI (E6): getpeereid (macOS) / SO_PEERCRED (Linux) → peer uid, unsafe_code=allow, consumed by fg-ipc for same-uid/root gate
 ├── fg-ipc            # UDS JSON-RPC server: 2s timeout fail-closed, 64 conn, rate limit; guard.evaluate/rule.*/tcc.status/tcc.report/tcc.events/audit/redact/reveal/confirm/cluster.* (audit.fetch/epoch.sync/confirm.relay/confirm.list)
 ├── fg-store          # SQLite WAL: audit_events append-only (链式 hash 防篡改) + rules/rule_meta + encrypted token store (AES-GCM) + pending action store (H4) + tcc_events table
 ├── fg-pyo3           # PyO3 绑定: NativeGuardClient (UDS JSON-RPC 客户端暴露 Python, 对齐 fe-pyo3, pyo3 0.29, cdylib+rlib)
@@ -89,7 +90,40 @@ crates/
 └── fg-bin            # fusion-guard binary: start/ping subcommands
 ```
 
-Workspace lint: `unsafe_code = "deny"` (fg-tcc-bridge + fg-es-bridge are the sole `allow` crates — FFI requires it; fg-tcc + fg-es stay deny). Workspace-level `[workspace.lints.rust] unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)', 'cfg(es_bridge_stub)'] }` for the stub cfgs.
+Workspace lint: `unsafe_code = "deny"` (fg-tcc-bridge + fg-es-bridge + fg-peercred are the sole `allow` crates — FFI requires it; fg-tcc + fg-es stay deny). Workspace-level `[workspace.lints.rust] unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tcc_bridge_stub)', 'cfg(es_bridge_stub)'] }` for the stub cfgs.
+
+## Build / Test / Lint
+
+```bash
+# Build (debug + release)
+cargo build
+cargo build --release          # binary: target/release/fusion-guard
+
+# Tests (209 pass; all #[cfg(test)] inline + crates/*/tests/)
+cargo test                     # full workspace
+cargo test -p fg-store         # single crate
+cargo test -p fg-store token_db_is_virgin -v   # single test fn
+cargo test -p fg-rules --features semantic    # semantic stage (tree-sitter, default OFF)
+
+# Lint + format (CI gates)
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+
+# Semantic feature (PRD §7.4 R5, tree-sitter grammars locked 0.23)
+cargo build -p fg-bin --features semantic --release
+
+# Python wheel (maturin, pyo3 0.29, Python 3.14)
+pip install -e .               # editable install (PEP 660 via maturin)
+maturin develop                # rebuild cdylib into venv
+
+# Daemon lifecycle (release binary must exist first)
+./start.sh start|stop|status|log|doctor
+./install-launchd.sh install|uninstall|status   # launchd plist (LaunchAgents user domain)
+```
+
+**CRITICAL — test env**: tests opening `AuditStore` need `FUSION_GUARD_TOKEN_KEY` env (hex, 32 bytes) or macOS Keychain `SecItemCopyMatching` blocks 60s+ in non-interactive sessions. Test helpers (`ensure_env_key()` in store_test.rs/tcc_store_test.rs) set it. fg-pyo3 tests need `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` (sync `UdsClient::call` starves a current-thread runtime). Soak test (`crates/fg-ipc/tests/soak_test.rs`) auto-skips if no release binary.
+
+**Rust toolchain**: edition 2021, `rust-version = "1.87"`. Release profile: `strip=true`, `lto="thin"`, `codegen-units=1`.
 
 ## Rule SSOT + Epoch (Checkpoint 2 contract)
 
