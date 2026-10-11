@@ -259,7 +259,26 @@ class TestLayaIntegration:
         assert result.blocked is True
         assert result.dimensions["sensitive_data"].exceeded is True
 
-    def test_real_latency_under_50ms(self):
+    def test_real_latency_under_15ms(self):
         client = LayaGuardClient()
+        warm = client.evaluate("warmup prompt")
+        if warm.fallback:
+            pytest.skip("laya endpoint unavailable, cannot verify latency")
         result = client.evaluate("hello world")
-        assert result.latency_ms < 50.0
+        assert result.fallback is False
+        assert result.latency_ms < 15.0, "laya decision latency {}ms >= 15ms AC7 threshold".format(result.latency_ms)
+
+    def test_real_latency_p50_under_15ms(self):
+        client = LayaGuardClient()
+        warm = client.evaluate("warmup")
+        if warm.fallback:
+            pytest.skip("laya endpoint unavailable")
+        latencies = []
+        for p in ["hello world", "what is python", "bake a cake", "explain rust", "math question"]:
+            r = client.evaluate(p)
+            if not r.fallback:
+                latencies.append(r.latency_ms)
+        assert len(latencies) >= 3
+        latencies.sort()
+        p50 = latencies[len(latencies) // 2]
+        assert p50 < 15.0, "laya P50 latency {}ms >= 15ms AC7 threshold".format(p50)
