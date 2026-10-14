@@ -307,6 +307,62 @@ cargo build --release
 ./target/release/fusion-guard ping
 ```
 
+## Laya Content-Safety Guardrails (issue #20, #26, #27)
+
+Python module `fusion_guard.laya_guard.LayaGuardClient` scores prompts via
+fusion-mlx `POST /v1/laya/decide` (preset=guard) and returns a block/allow
+verdict with per-dimension scores. Fail-open when the laya endpoint is
+unavailable (non-fatal, `fallback=True`).
+
+```python
+from fusion_guard import LayaGuardClient
+
+client = LayaGuardClient(api_key="...")
+result = client.evaluate("user prompt here")
+if result.blocked:
+    print(result.reasons)  # e.g. ["jailbreak=1.0000 >= 0.5000"]
+```
+
+Thresholds (env-overridable, defaults chosen from live laya score
+distribution — see issue #26):
+
+| Dimension       | Env var                              | Default |
+|-----------------|--------------------------------------|---------|
+| jailbreak       | `LAYA_GUARD_JAILBREAK_THRESHOLD`     | 0.5     |
+| prompt_injection| `LAYA_GUARD_INJECTION_THRESHOLD`     | 0.5     |
+| sensitive_data  | `LAYA_GUARD_SENSITIVE_THRESHOLD`     | 0.2     |
+| harm_severity   | `LAYA_GUARD_HARM_SEVERITY_THRESHOLD` | 2.0     |
+
+### PRD dimension mapping (issue #27)
+
+The PRD (`architecture/laya-mlx-2-fusion-mlx-1010.md`) names the safety
+dimensions in Chinese; the implementation (and the laya model itself) uses
+English names. Mapping:
+
+| PRD name            | Implementation name | Notes                              |
+|---------------------|---------------------|------------------------------------|
+| malicious instruction | `prompt_injection` | Intent-overriding instruction attacks |
+| sensitive word      | `sensitive_data`    | PII / credentials / secrets leakage |
+| jailbreak           | `jailbreak`         | Same name                          |
+| (not in PRD)        | `harm_severity`     | Added: 0-3 harm scale              |
+| (not in PRD)        | `topic`             | Informational, never blocks        |
+
+### Scope limits
+
+- **Rust crates**: `fg-rules`/`fg-core`/`fg-ipc` have no laya integration
+  (issue #27 gap 3). Rust-side callers consume laya scoring through the
+  Python module (`pip install -e .` builds the `fg-pyo3` binding, but laya
+  evaluation itself lives only in Python). Exposing it via a new IPC method
+  is future work.
+- **Gateway-side thresholds**: fusion-gateway maintains its own
+  `intent_classifier.guard_*_threshold` config — operators must tune them
+  independently (the Python defaults here do not propagate).
+- **Known model limits** (tracked upstream): fusion-mlx #1161 laya latency
+  under multi-model load; fusion-mlx #1164 `harm_severity` false positive on
+  benign math prompts. Guard E2E tests (`TestGatewayBlockE2E`,
+  `TestLayaIntegration`) skip automatically when fusion-mlx / gateway are
+  not running.
+
 ## Development
 
 ```bash

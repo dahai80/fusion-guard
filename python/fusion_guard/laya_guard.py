@@ -11,7 +11,11 @@ logger = logging.getLogger("fusion_guard.laya_guard")
 DEFAULT_THRESHOLDS = {
     "jailbreak": 0.5,
     "prompt_injection": 0.5,
-    "sensitive_data": 0.5,
+    # issue #26: laya scores explicit-PII prompts low (credit-card/SSN prompt
+    # = 0.2369, aws-key prompt = 0.9998, benign prompts <= 0.0151). 0.5 missed
+    # 1/20 of the bench #22 guardrail testset. 0.2 catches the low tail with
+    # 13x margin above the observed benign max.
+    "sensitive_data": 0.2,
     "harm_severity": 2.0,
 }
 
