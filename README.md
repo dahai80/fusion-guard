@@ -323,6 +323,13 @@ if result.blocked:
     print(result.reasons)  # e.g. ["jailbreak=1.0000 >= 0.5000"]
 ```
 
+API-key resolution (issue #30) goes through `fusion_core.config.client_key()`
+(the workspace single-point resolver, `architecture/config-conventions.md` §2):
+explicit `api_key` param wins, then `FUSION_CLIENT_KEY`, then deprecated
+legacy MLX aliases (warn). Dev with no key resolves to anonymous (warning
+logged, no `Authorization` header); `FUSION_PROFILE=prod` with no key raises
+`RuntimeError`.
+
 Thresholds (env-overridable, defaults chosen from live laya score
 distribution — see issue #26):
 

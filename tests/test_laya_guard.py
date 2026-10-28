@@ -200,6 +200,7 @@ def test_evaluate_missing_dimension():
 
 
 def test_api_key_from_env(monkeypatch):
+    monkeypatch.delenv("FUSION_CLIENT_KEY", raising=False)
     monkeypatch.setenv("FUSION_MLX_API_KEY", "env-key-123")
     client = LayaGuardClient(base_url="http://127.0.0.1:99999")
     assert client.api_key == "env-key-123"
@@ -213,10 +214,41 @@ def test_api_key_explicit_overrides_env(monkeypatch):
 
 
 def test_no_api_key_no_auth_header(monkeypatch):
-    monkeypatch.delenv("FUSION_MLX_API_KEY", raising=False)
+    for k in ("FUSION_CLIENT_KEY", "FUSION_MLX_API_KEY", "MLX_API_KEY", "FUSION_PROFILE"):
+        monkeypatch.delenv(k, raising=False)
     client = LayaGuardClient(base_url="http://127.0.0.1:99999")
     assert client.api_key is None
     assert "Authorization" not in client._headers
+
+
+def test_api_key_client_key_precedence(monkeypatch):
+    # issue #30: FUSION_CLIENT_KEY (config-conventions §1) beats the deprecated
+    # FUSION_MLX_API_KEY alias in the fusion_core.config resolution chain.
+    monkeypatch.delenv("FUSION_PROFILE", raising=False)
+    monkeypatch.setenv("FUSION_CLIENT_KEY", "client-k")
+    monkeypatch.setenv("FUSION_MLX_API_KEY", "legacy-k")
+    client = LayaGuardClient(base_url="http://127.0.0.1:99999")
+    assert client.api_key == "client-k"
+    assert client._headers["Authorization"] == "Bearer client-k"
+
+
+def test_api_key_prod_missing_raises(monkeypatch):
+    # issue #30 acceptance: FUSION_PROFILE=prod with no key -> RuntimeError
+    # (fail-fast, no silent anonymous fallback).
+    for k in ("FUSION_CLIENT_KEY", "FUSION_MLX_API_KEY", "MLX_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FUSION_PROFILE", "prod")
+    with pytest.raises(RuntimeError, match="FUSION_CLIENT_KEY not set"):
+        LayaGuardClient(base_url="http://127.0.0.1:99999")
+
+
+def test_api_key_prod_explicit_param_ok(monkeypatch):
+    # explicit api_key param wins even in prod profile (no env lookup at all).
+    for k in ("FUSION_CLIENT_KEY", "FUSION_MLX_API_KEY", "MLX_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FUSION_PROFILE", "prod")
+    client = LayaGuardClient(base_url="http://127.0.0.1:99999", api_key="explicit")
+    assert client.api_key == "explicit"
 
 
 def test_guard_result_to_dict():
@@ -247,7 +279,7 @@ def _check_laya():
         return _LAYA_AVAILABLE
     try:
         import httpx
-        key = os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
+        key = os.environ.get("FUSION_CLIENT_KEY") or os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
         base = os.environ.get("FUSION_GUARD_LAYA_BASE", "http://127.0.0.1:11434")
         resp = httpx.get(base + "/v1/laya/status", headers={"Authorization": "Bearer " + key}, timeout=3)
         _LAYA_AVAILABLE = resp.status_code == 200

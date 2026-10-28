@@ -307,6 +307,63 @@ cargo build --release
 ./target/release/fusion-guard ping
 ```
 
+## Laya 内容安全护栏 (issue #20, #26, #27)
+
+Python 模块 `fusion_guard.laya_guard.LayaGuardClient` 通过 fusion-mlx
+`POST /v1/laya/decide` (preset=guard) 对 prompt 打分，返回 block/allow 判定
+及各维度分数。laya 端点不可用时 fail-open (非致命, `fallback=True`)。
+
+```python
+from fusion_guard import LayaGuardClient
+
+client = LayaGuardClient(api_key="...")
+result = client.evaluate("user prompt here")
+if result.blocked:
+    print(result.reasons)  # 如 ["jailbreak=1.0000 >= 0.5000"]
+```
+
+API key 解析 (issue #30) 走 `fusion_core.config.client_key()`
+(全仓单点解析器, `architecture/config-conventions.md` §2)：
+显式 `api_key` 参数优先，其次 `FUSION_CLIENT_KEY`，再次已废弃的 legacy
+MLX 别名 (告警)。dev 缺 key = 匿名模式 (记 warning，不带
+`Authorization` 头)；`FUSION_PROFILE=prod` 缺 key = `RuntimeError`。
+
+阈值 (可用 env 覆盖，默认值来自 laya 实测分数分布 — 见 issue #26)：
+
+| 维度            | 环境变量                             | 默认值 |
+|-----------------|--------------------------------------|--------|
+| jailbreak       | `LAYA_GUARD_JAILBREAK_THRESHOLD`     | 0.5    |
+| prompt_injection| `LAYA_GUARD_INJECTION_THRESHOLD`     | 0.5    |
+| sensitive_data  | `LAYA_GUARD_SENSITIVE_THRESHOLD`     | 0.2    |
+| harm_severity   | `LAYA_GUARD_HARM_SEVERITY_THRESHOLD` | 2.0    |
+
+### PRD 维度映射 (issue #27)
+
+PRD (`architecture/laya-mlx-2-fusion-mlx-1010.md`) 用中文命名安全维度；
+实现 (及 laya 模型本身) 用英文名。映射：
+
+| PRD 名称          | 实现名称            | 说明                               |
+|-------------------|---------------------|------------------------------------|
+| 恶意指令          | `prompt_injection`  | 意图覆盖类指令攻击                 |
+| 敏感词            | `sensitive_data`    | PII / 凭据 / 密钥泄露              |
+| 越狱              | `jailbreak`         | 同名                               |
+| (PRD 未列)        | `harm_severity`     | 新增: 0-3 危害分级                 |
+| (PRD 未列)        | `topic`             | 信息性，永不阻断                   |
+
+### 范围限制
+
+- **Rust crates**: `fg-rules`/`fg-core`/`fg-ipc` 无 laya 集成
+  (issue #27 缺口 3)。Rust 侧调用方通过 Python 模块消费 laya 打分
+  (`pip install -e .` 构建 `fg-pyo3` 绑定，但 laya 评估本身只在 Python)。
+  通过新 IPC 方法暴露属后续工作。
+- **Gateway 侧阈值**: fusion-gateway 维护自己的
+  `intent_classifier.guard_*_threshold` 配置 — 运维需独立调参
+  (此处 Python 默认值不会传播过去)。
+- **已知模型限制** (上游跟踪): fusion-mlx #1161 多模型负载下 laya 延迟；
+  fusion-mlx #1164 `harm_severity` 对良性数学题的误报。Guard E2E 测试
+  (`TestGatewayBlockE2E`, `TestLayaIntegration`) 在 fusion-mlx / gateway
+  未运行时自动 skip。
+
 ## 开发
 
 ```bash

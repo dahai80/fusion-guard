@@ -6,6 +6,8 @@ from typing import Optional
 
 import httpx
 
+from fusion_core.config import client_key
+
 logger = logging.getLogger("fusion_guard.laya_guard")
 
 DEFAULT_THRESHOLDS = {
@@ -121,7 +123,12 @@ class LayaGuardClient:
 
     def __post_init__(self):
         if self.api_key is None:
-            self.api_key = os.environ.get("FUSION_MLX_API_KEY")
+            # issue #30: single-point resolution via fusion_core.config
+            # (config-conventions §2). Alias chain with deprecated legacy names
+            # lives only in fusion-core; dev missing = "" + warning, prod
+            # missing = RuntimeError. Empty string -> None keeps the
+            # no-auth-header behavior for anonymous dev mode.
+            self.api_key = client_key() or None
         self._endpoint = self.base_url.rstrip("/") + "/v1/laya/decide"
         self._headers = {"Content-Type": "application/json"}
         if self.api_key:
