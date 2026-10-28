@@ -5,7 +5,7 @@ description = "Fusion-Guard — zero-trust action authorization + DLP firewall d
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Fusion-MLX Team" }]
-dependencies = ["httpx>=0.27"]
+dependencies = ["httpx>=0.27", "fusion-core"]
 
 [project.optional-dependencies]
 test = [
