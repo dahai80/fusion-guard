@@ -413,6 +413,17 @@ macOS Keychain (`SecItemCopyMatching` / `get_generic_password`) **serially block
 FUSION_GUARD_HEADLESS=1 ./start.sh start
 ```
 
+### Registry Self-check on Start (config Phase 3.3, issue #33)
+
+`start.sh start` verifies its own entry in the monorepo port registry (`architecture/port-registry.yaml`) before serving — register-then-start, fail at start instead of being caught later by CI `check-ports.py`. fusion-guard is UDS-only (no TCP listener), so its registry entry carries `sock:` instead of a real port (`port: 0` = portless, `supervise: false` = lifecycle via own `start.sh`/`install-launchd.sh`).
+
+- **Entry missing / socket mismatch** → refuses to start (exit 1), before any state mutation.
+- **`FUSION_SKIP_REGISTRY_CHECK=1`** bypasses the check (warn logged).
+- **Registry file absent** (standalone deploy outside the monorepo) → warn + continue.
+- Registry path override: `FUSION_REGISTRY=<path>`.
+
+The H-C release gate (`require_shared_secret_for_release`) checks the env+flag escape hatch **before** any Keychain read — a headless session with `FUSION_GUARD_SHARED_SECRET` + `--insecure-secret-env` no longer hangs inside `SecItemCopyMatching` (same issue #17 class of block, previously missed on the gate path).
+
 ### Soak / Stress Test (commercial blocker #6)
 
 `crates/fg-ipc/tests/soak_test.rs` — long-running concurrency stress test, validates production form: under sustained high-concurrency load latency doesn't degrade, child process memory doesn't leak, fail-closed holds.

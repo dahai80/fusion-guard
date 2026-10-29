@@ -48,6 +48,24 @@ if [ "${HEADLESS}" -eq 1 ]; then
 fi
 
 start() {
+    # Config governance Phase 3.3 (issue #33): register-then-start self-check.
+    # fusion-guard is UDS-only (JSON-RPC over Unix socket, no TCP listener), so
+    # its registry entry carries sock: instead of a real port. Refuse to serve
+    # on a socket not registered in architecture/port-registry.yaml — fail at
+    # start instead of being caught later by CI check-ports. Runs before any
+    # state mutation (pid/sock) so a refusal is clean. FUSION_SKIP_REGISTRY_CHECK=1
+    # bypasses; missing registry file = warn + continue (standalone deploy).
+    local service="fusion-guard"
+    local registry="${FUSION_REGISTRY:-$HOME/fusion/architecture/port-registry.yaml}"
+    if [ ! -f "${registry}" ]; then
+        echo "warn: port-registry.yaml not found at ${registry} — registry self-check skipped" >&2
+    elif ! grep -A3 "^  ${service}:" "${registry}" 2>/dev/null | grep -q "sock: ${GUARD_SOCK}$"; then
+        if [ "${FUSION_SKIP_REGISTRY_CHECK:-}" != "1" ]; then
+            echo "socket ${GUARD_SOCK} for ${service} not registered in ${registry} — refusing to start" >&2
+            exit 1
+        fi
+        echo "warn: registry check bypassed (FUSION_SKIP_REGISTRY_CHECK=1)" >&2
+    fi
     if [ -f "${GUARD_PID}" ] && kill -0 "$(cat "${GUARD_PID}")" 2>/dev/null; then
         echo "[${GUARD_NAME}] already running, pid=$(cat "${GUARD_PID}")"
         return 0
