@@ -293,14 +293,16 @@ pub fn require_shared_secret_for_release() -> std::result::Result<(), String> {
         );
         return Ok(());
     }
-    // 来源 1: Keychain (macOS prod 推荐路径)。
-    let keychain_has = matches!(keychain_secret_get(), Ok(Some(_)));
-    if keychain_has {
-        return Ok(());
-    }
-    // 来源 2: env (escape hatch, release 须显式 flag 放行)。
+    // 来源 1: env (escape hatch, release 须显式 flag 放行)。必须先于 Keychain 读短路 ——
+    // headless/CI 下 SecItemCopyMatching 串行阻塞 (issue #17 class), env+flag 已显式授权
+    // 却仍先读 Keychain = 白设。与 resolve_shared_secret 语义一致 (env+flag 优先于 Keychain)。
     let env_authorized = shared_secret_env_present() && allow_insecure_secret_flag_set();
     if env_authorized {
+        return Ok(());
+    }
+    // 来源 2: Keychain (macOS prod 推荐路径)。
+    let keychain_has = matches!(keychain_secret_get(), Ok(Some(_)));
+    if keychain_has {
         return Ok(());
     }
     tracing::error!(

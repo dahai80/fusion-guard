@@ -407,6 +407,17 @@ macOS Keychain (`SecItemCopyMatching` / `get_generic_password`) 在非交互会�
 FUSION_GUARD_HEADLESS=1 ./start.sh start
 ```
 
+### 启动注册自检 (config Phase 3.3, issue #33)
+
+`start.sh start` 在对外服务前校验自己在 monorepo 端口注册表 (`architecture/port-registry.yaml`) 的登记 —— register-then-start, 启动即失败, 而非等 CI `check-ports.py` 事后抓。fusion-guard 是 UDS-only daemon (无 TCP listener), 注册表条目带 `sock:` 而非真实端口 (`port: 0` = 无端口, `supervise: false` = 生命周期走自身 `start.sh`/`install-launchd.sh`)。
+
+- **条目缺失 / socket 不匹配** → 拒绝启动 (exit 1), 先于任何状态变更。
+- **`FUSION_SKIP_REGISTRY_CHECK=1`** 跳过自检 (打 warn)。
+- **注册表文件不存在** (脱离 monorepo 的独立部署) → warn + 继续。
+- 注册表路径覆盖: `FUSION_REGISTRY=<path>`。
+
+H-C release 闸门 (`require_shared_secret_for_release`) 现在**先**判 env+flag 逃生通道再读 Keychain —— headless 会话配 `FUSION_GUARD_SHARED_SECRET` + `--insecure-secret-env` 不再卡死在 `SecItemCopyMatching` (issue #17 同类阻塞, 此前漏在闸门路径)。
+
 ### 压测 / soak (商用阻塞点 #6)
 
 `crates/fg-ipc/tests/soak_test.rs` — 长跑并发压测, 验生产形态: 持续高并发负载下延迟不退化、子进程内存不泄漏、fail-closed 不破。
