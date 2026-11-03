@@ -248,6 +248,115 @@ async fn p24_persistent_conn_reuse_and_reconnect() {
     let _ = std::fs::remove_file(&sock);
 }
 
+// Issue #36: NativeGuardClient 无法对 shared-secret daemon 鉴权 —— 客户端从不发 params["secret"]。
+// 修: UdsClient 持 Option<String> shared_secret, call() 对非 ping 请求注入 params["secret"]。
+// mock UDS server (std UnixListener) 逐请求断言 wire 上 secret 有/无 —— ping 不注入 (服务端
+// 对任意对端开放), 非 ping 注入; 无 secret 客户端不注入 (dev daemon 无 secret 行为不变)。
+fn spawn_mock_server(
+    sock: std::path::PathBuf,
+    n_requests: usize,
+) -> std::thread::JoinHandle<Vec<bool>> {
+    std::thread::spawn(move || {
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // bind 完成即通知 (client 侧 poll sock 文件, 防连接早于 bind 竞速)。
+        let ready = sock.with_extension("ready");
+        std::fs::write(&ready, b"ok").unwrap();
+        let mut saw_secret: Vec<bool> = Vec::new();
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        for _ in 0..n_requests {
+            let mut line = Vec::new();
+            use std::io::BufRead;
+            if reader.read_until(0x0Au8, &mut line).is_err() {
+                break;
+            }
+            line.pop(); // framing \n
+            let req: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            saw_secret.push(req["params"]["secret"].is_string());
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": { "pong": true },
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(0x0Au8);
+            use std::io::Write;
+            let _ = stream.write_all(&bytes);
+        }
+        saw_secret
+    })
+}
+
+// mock server bind 完成信号 (sock.with_extension("ready") 文件) 轮询等待, 防竞速。
+fn wait_mock_ready(sock: &std::path::Path) {
+    let ready = sock.with_extension("ready");
+    for _ in 0..500 {
+        if ready.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("mock server never became ready: {}", ready.display());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_injected_on_non_ping_only() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let sock = std::path::PathBuf::from(format!(
+        "/tmp/fg-pyo3-{}-{}.sock",
+        std::process::id(),
+        &short[..8]
+    ));
+    let _ = std::fs::remove_file(&sock);
+
+    // 两个请求: evaluate (注入) → ping (不注入)。同持久连接顺序到达。
+    let mock = spawn_mock_server(sock.clone(), 2);
+    wait_mock_ready(&sock);
+
+    let client = fg_pyo3::UdsClient::new_with_secret(sock.clone(), Some("s3cret".into()));
+    let res = client
+        .call("guard.evaluate", serde_json::json!({ "content": "ls" }))
+        .expect("evaluate with secret");
+    assert_eq!(res["pong"], true);
+    let res = client
+        .call("guard.ping", serde_json::json!({}))
+        .expect("ping");
+    assert_eq!(res["pong"], true);
+
+    let saw = mock.join().unwrap();
+    assert_eq!(
+        saw,
+        vec![true, false],
+        "非 ping 请求须携 params[\"secret\"], ping 须不携带"
+    );
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_secret_param_when_client_unset() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let sock = std::path::PathBuf::from(format!(
+        "/tmp/fg-pyo3-{}-{}.sock",
+        std::process::id(),
+        &short[..8]
+    ));
+    let _ = std::fs::remove_file(&sock);
+
+    let mock = spawn_mock_server(sock.clone(), 1);
+    wait_mock_ready(&sock);
+
+    let client = fg_pyo3::UdsClient::new(sock.clone());
+    let res = client
+        .call("guard.evaluate", serde_json::json!({ "content": "ls" }))
+        .expect("evaluate without secret");
+    assert_eq!(res["pong"], true);
+
+    let saw = mock.join().unwrap();
+    assert_eq!(saw, vec![false], "无 secret 客户端不注入 (dev 行为不变)");
+    let _ = std::fs::remove_file(&sock);
+}
+
 // 防止未使用 import 警告 (verdict helper 保留供未来扩展用)
 #[allow(dead_code)]
 fn _verdict() -> GuardVerdict {

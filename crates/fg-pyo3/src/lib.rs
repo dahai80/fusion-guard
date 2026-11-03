@@ -19,6 +19,8 @@ use fg_core::GuardVerdict;
 
 const DEFAULT_SOCK: &str = "/tmp/fusion-guard.sock";
 const ENV_SOCK: &str = "FUSION_GUARD_SOCK";
+// Issue #36: shared secret env 回退 (与 start.sh/daemon 侧同名变量)。
+const ENV_SHARED_SECRET: &str = "FUSION_GUARD_SHARED_SECRET";
 const FRAMING_BYTE: u8 = 0x0A;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const REQ_TIMEOUT_SECS: u64 = 2;
@@ -236,6 +238,9 @@ impl PyAllChainsVerification {
 pub struct UdsClient {
     sock: PathBuf,
     conn: std::sync::Mutex<Option<UnixStream>>,
+    // Issue #36: §12.1 shared secret —— Some 时注入每个非 ping 请求 params["secret"]
+    // (服务端 PeerAuthorizer 非 ping 强校验, ping 对任意对端开放)。
+    shared_secret: Option<String>,
 }
 
 #[derive(Debug)]
@@ -249,10 +254,29 @@ impl UdsClient {
         Self {
             sock,
             conn: std::sync::Mutex::new(None),
+            shared_secret: None,
         }
     }
 
-    pub fn call(&self, method: &str, params: Value) -> std::result::Result<Value, RpcError> {
+    // Issue #36: 显式携带 shared secret (None = 不注入, dev daemon 无 secret 时行为不变)。
+    pub fn new_with_secret(sock: PathBuf, shared_secret: Option<String>) -> Self {
+        Self {
+            sock,
+            conn: std::sync::Mutex::new(None),
+            shared_secret,
+        }
+    }
+
+    pub fn call(&self, method: &str, mut params: Value) -> std::result::Result<Value, RpcError> {
+        // Issue #36: 非 ping 请求注入 params["secret"] (§12.1 第二因子)。
+        // ping 服务端对任意对端开放, 不注入 (与 server 语义对齐)。
+        if method != "guard.ping" {
+            if let Some(secret) = &self.shared_secret {
+                if let Some(obj) = params.as_object_mut() {
+                    obj.insert("secret".into(), Value::String(secret.clone()));
+                }
+            }
+        }
         let id = REQ_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -436,15 +460,28 @@ fn parse_rule(val: &Value) -> PyResult<PyGuardRule> {
 #[pymethods]
 impl PyGuardClient {
     #[new]
-    #[pyo3(signature = (sock_path=None))]
-    fn new(sock_path: Option<String>) -> Self {
+    #[pyo3(signature = (sock_path=None, shared_secret=None))]
+    fn new(sock_path: Option<String>, shared_secret: Option<String>) -> Self {
         let sock = sock_path
             .map(PathBuf::from)
             .or_else(|| std::env::var(ENV_SOCK).ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCK));
-        tracing::info!(sock = %sock.display(), "PyGuardClient construct (P2-4 persistent conn)");
+        // Issue #36: 显式参数 > FUSION_GUARD_SHARED_SECRET env > None。
+        // daemon 开 secret (Keychain 或 --insecure-secret-env) 时非 ping 调用须携带,
+        // 否则 -32001 unauthorized: secret denied (GuardSafetyBackend 全降级 fail-closed)。
+        let secret = shared_secret
+            .or_else(|| std::env::var(ENV_SHARED_SECRET).ok())
+            .filter(|s| !s.is_empty());
+        match &secret {
+            Some(_) => {
+                tracing::info!(sock = %sock.display(), "PyGuardClient construct with shared secret (issue #36)")
+            }
+            None => {
+                tracing::info!(sock = %sock.display(), "PyGuardClient construct WITHOUT shared secret — non-ping calls will be rejected if daemon enforces secret")
+            }
+        }
         Self {
-            client: UdsClient::new(sock),
+            client: UdsClient::new_with_secret(sock, secret),
         }
     }
 
