@@ -307,6 +307,20 @@ cargo build --release
 ./target/release/fusion-guard ping
 ```
 
+### Python client (NativeGuardClient, issue #36)
+
+When the daemon enforces the shared secret (Keychain or `--insecure-secret-env` + `FUSION_GUARD_SHARED_SECRET`), the Python client must present it — `ping` is open, every other call returns `unauthorized: secret denied` otherwise:
+
+```python
+from fusion_guard import NativeGuardClient
+
+# explicit arg (wins) or FUSION_GUARD_SHARED_SECRET env fallback
+c = NativeGuardClient(shared_secret="...")   # or just NativeGuardClient() with env set
+v = c.evaluate("rm -rf /tmp/x", 0)
+```
+
+The secret is injected into `params["secret"]` for all non-ping calls (§12.1 second factor). Unset client + non-enforcing daemon = unchanged behavior.
+
 ## Laya Content-Safety Guardrails (issue #20, #26, #27)
 
 Python module `fusion_guard.laya_guard.LayaGuardClient` scores prompts via

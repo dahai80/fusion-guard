@@ -307,6 +307,20 @@ cargo build --release
 ./target/release/fusion-guard ping
 ```
 
+### Python 客户端 (NativeGuardClient, issue #36)
+
+daemon 开启 shared secret 校验 (Keychain 或 `--insecure-secret-env` + `FUSION_GUARD_SHARED_SECRET`) 时, Python 客户端必须携带 —— `ping` 开放, 其余调用一律 `unauthorized: secret denied`:
+
+```python
+from fusion_guard import NativeGuardClient
+
+# 显式参数 (优先) 或 FUSION_GUARD_SHARED_SECRET env 回退
+c = NativeGuardClient(shared_secret="...")   # 或 env 已设时直接 NativeGuardClient()
+v = c.evaluate("rm -rf /tmp/x", 0)
+```
+
+secret 注入所有非 ping 请求的 `params["secret"]` (§12.1 第二因子)。客户端未设 + daemon 未开校验 = 行为不变。
+
 ## Laya 内容安全护栏 (issue #20, #26, #27)
 
 Python 模块 `fusion_guard.laya_guard.LayaGuardClient` 通过 fusion-mlx
