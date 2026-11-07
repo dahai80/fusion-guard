@@ -7,7 +7,7 @@ doc_type: changelog
 title: {zh: "fusion-guard 变更日志", en: "fusion-guard Changelog"}
 audience: engineer
 status: draft
-version: 0.2.0-rc.10
+version: 0.2.0-rc.11
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -20,8 +20,30 @@ All notable changes to fusion-guard are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
-### Changed
-- Adopted the fusion docs-system v1.1 contract: added `docs/` (product-page, get-started, api-reference, config-reference, architecture, troubleshooting, guides), `ci/validate_docs.py`, and `.github/workflows/docs.yml`. Grid classification: platform x service. No functional code changes.
+## [0.2.0-rc.11] — 2026-11-07 (patch)
+
+Docs-system onboarding + validator fix. No functional code changes.
+
+### Added
+- Adopted the fusion docs-system v1.1 contract: `docs/` (product-page, get-started, api-reference, config-reference, architecture, troubleshooting, guides), `ci/validate_docs.py` (stdlib-only v1.1 validator), `.github/workflows/docs.yml` (PR-gated). Grid classification: platform x service. 12-key frontmatter added to README, README_CN, CLAUDE, AGENTS, DEPLOYMENT, UPSTREAM_BLOCKERS, CHANGELOG.
+- `ci/validate_docs.py`: always skip build/vendor output dirs (`target`/`node_modules`/`dist`/`build`) — cargo doc drops vendored `.md` under `target/doc/static.files/` causing spurious FM-MISSING errors.
+
+## [0.2.0-rc.11] — 2026-11-03 (patch)
+
+Python client shared-secret support — closes issue #36.
+
+### Fixed
+- `NativeGuardClient` never sent `params["secret"]`: against a shared-secret-enforcing daemon (Keychain or `--insecure-secret-env`), every non-ping call was rejected (`unauthorized: secret denied`), degrading consumers (fusion-agent-studio GuardSafetyBackend) to permanent fail-closed. `UdsClient` now carries an optional shared secret and injects `params["secret"]` into all non-ping requests (`ping` stays open). `NativeGuardClient(shared_secret=...)` constructor arg, `FUSION_GUARD_SHARED_SECRET` env fallback. Secret value never logged. 211 tests, E2E verified.
+
+## [0.2.0-rc.9] — 2026-10-30 (patch)
+
+Registry self-check on start — closes issue #33 (config governance Phase 3.3).
+
+### Added
+- `start.sh start` verifies its own `architecture/port-registry.yaml` entry before serving (register-then-start). fusion-guard is UDS-only: registry entry carries `sock:` + `port: 0` (portless) + `supervise: false` + `boot: T1`. Unregistered socket → refuse to start; `FUSION_SKIP_REGISTRY_CHECK=1` bypass; missing registry file → warn + continue; `FUSION_REGISTRY` path override.
+
+### Fixed
+- H-C release-gate headless hang: `require_shared_secret_for_release()` read the macOS Keychain before checking the env+flag escape hatch, so headless sessions with `FUSION_GUARD_SHARED_SECRET` + `--insecure-secret-env` blocked forever inside `SecItemCopyMatching` (issue #17 class, missed on the gate path). Env-authorized now short-circuits before any Keychain I/O.
 
 ## [0.1.2] — 2026-08-28 (minor)
 
