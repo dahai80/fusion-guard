@@ -661,7 +661,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERROR] root does not exist: {root}", file=sys.stderr)
         return 2
 
-    skip = tuple(x.strip() for x in args.skip_dirs.split(",") if x.strip())
+    # Build/vendor output dirs always skipped: they contain vendored .md files
+    # (e.g. target/doc/static.files/*.md from `cargo doc`) that are not
+    # repository docs. User-supplied --skip-dirs are appended.
+    skip = ("target", "node_modules", "dist", "build") + tuple(
+        x.strip() for x in args.skip_dirs.split(",") if x.strip()
+    )
     findings: List[Finding] = []
 
     if args.product:
