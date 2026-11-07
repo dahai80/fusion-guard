@@ -1,3 +1,18 @@
+---
+doc_id: fusion-guard/readme-cn
+product: fusion-guard
+class: platform
+entry: service
+doc_type: readme
+title: {zh: "fusion-guard 中文说明", en: "fusion-guard README (Chinese)"}
+audience: engineer
+status: draft
+version: 0.2.0-rc.10
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - README_CN.md
+---
 # fusion-guard
 
 [English](README.md) | 中文

@@ -1,6 +1,27 @@
+---
+doc_id: fusion-guard/changelog
+product: fusion-guard
+class: platform
+entry: service
+doc_type: changelog
+title: {zh: "fusion-guard 变更日志", en: "fusion-guard Changelog"}
+audience: engineer
+status: draft
+version: 0.2.0-rc.10
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - CHANGELOG.md
+  - Cargo.toml
+---
 # Changelog
 
 All notable changes to fusion-guard are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
+
+## [Unreleased]
+
+### Changed
+- Adopted the fusion docs-system v1.1 contract: added `docs/` (product-page, get-started, api-reference, config-reference, architecture, troubleshooting, guides), `ci/validate_docs.py`, and `.github/workflows/docs.yml`. Grid classification: platform x service. No functional code changes.
 
 ## [0.1.2] — 2026-08-28 (minor)
 

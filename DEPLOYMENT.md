@@ -1,3 +1,19 @@
+---
+doc_id: fusion-guard/deployment
+product: fusion-guard
+class: platform
+entry: service
+doc_type: guide
+title: {zh: "fusion-guard 生产部署指南", en: "fusion-guard Deployment Guide"}
+audience: engineer
+status: draft
+version: 0.2.0-rc.10
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - DEPLOYMENT.md
+  - start.sh
+---
 # Deployment Guide — fusion-guard 生产部署
 
 fusion-guard 守护进程依赖**两个生产密钥**, 二者信任模型不同, 部署方式不同。本文档覆盖安全 (Keychain) 与不安全 (env) 路径、release gate 行为、launchd 常驻配置。
