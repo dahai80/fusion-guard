@@ -1,3 +1,18 @@
+---
+doc_id: fusion-guard/upstream-blockers
+product: fusion-guard
+class: platform
+entry: service
+doc_type: guide
+title: {zh: "fusion-guard 上游阻塞清单", en: "fusion-guard Upstream Blockers"}
+audience: engineer
+status: draft
+version: 0.2.0-rc.10
+updated: 2026-11-07
+owner: "@dahai"
+source_of_truth:
+  - UPSTREAM_BLOCKERS.md
+---
 # Upstream Blockers — Product Audit P0-P3 Sweep
 
 来源: `audit/fusion-guard-audit-result-product-0827.md` (2026-08-28 产品商用审计).
