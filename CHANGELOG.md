@@ -28,7 +28,7 @@ Docs-system onboarding + validator fix. No functional code changes.
 - Adopted the fusion docs-system v1.1 contract: `docs/` (product-page, get-started, api-reference, config-reference, architecture, troubleshooting, guides), `ci/validate_docs.py` (stdlib-only v1.1 validator), `.github/workflows/docs.yml` (PR-gated). Grid classification: platform x service. 12-key frontmatter added to README, README_CN, CLAUDE, AGENTS, DEPLOYMENT, UPSTREAM_BLOCKERS, CHANGELOG.
 - `ci/validate_docs.py`: always skip build/vendor output dirs (`target`/`node_modules`/`dist`/`build`) — cargo doc drops vendored `.md` under `target/doc/static.files/` causing spurious FM-MISSING errors.
 
-## [0.2.0-rc.11] — 2026-11-03 (patch)
+## [0.2.0-rc.10] — 2026-11-03 (patch)
 
 Python client shared-secret support — closes issue #36.
 
