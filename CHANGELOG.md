@@ -7,8 +7,8 @@ doc_type: changelog
 title: {zh: "fusion-guard 变更日志", en: "fusion-guard Changelog"}
 audience: engineer
 status: draft
-version: 0.2.0-rc.11
-updated: 2026-11-07
+version: 0.2.0-rc.12
+updated: 2026-11-16
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -19,6 +19,15 @@ source_of_truth:
 All notable changes to fusion-guard are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.0-rc.12] — 2026-11-16 (patch)
+
+CI efficiency retrofit per fusion#2 checklist — closes issue #42.
+
+### Changed
+- `.github/workflows/ci.yml` + `docs.yml`: `concurrency` group `${{ github.workflow }}-${{ github.ref }}` with `cancel-in-progress` — superseded pushes no longer queue duplicate runs.
+- `ci.yml`: `pull_request` `paths-ignore` for docs-only changes (`**.md`, `docs/**`, `ci/validate_docs.py`, `LICENSE`, `.gitignore`) — those are covered by `docs.yml`; docs-only PRs no longer burn a macos runner.
+- Assessment (recorded in PR#43): full suite ~80s wall on macos-latest (last 5 runs 62-85s) — matrix sharding and nightly tiered gate not warranted. Dependency cache (`Swatinem/rust-cache`) and `docs.yml` path filters already present.
 
 ## [0.2.0-rc.11] — 2026-11-07 (patch)
 
