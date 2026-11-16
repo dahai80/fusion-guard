@@ -4,6 +4,18 @@ on:
   push:
     branches: [main, master]
   pull_request:
+    # Docs-only changes never touch Rust code; docs.yml covers them.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "ci/validate_docs.py"
+      - "LICENSE"
+      - ".gitignore"
+
+# Supersede in-progress runs on the same ref (fusion#2 CI retrofit).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
