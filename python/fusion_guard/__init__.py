@@ -29,4 +29,4 @@ __all__ = [
     "DimensionScore",
 ]
 
-__version__ = "0.2.0-rc.11"
+__version__ = "0.2.0-rc.12"
