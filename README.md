@@ -399,6 +399,47 @@ English names. Mapping:
   `TestLayaIntegration`) skip automatically when fusion-mlx / gateway are
   not running.
 
+### Two-tier evaluation (issue #45)
+
+`fusion_guard.two_tier.TwoTierGuard` runs the laya pre-check first; clean +
+high-confidence prompts are allowed locally and skip the full guard
+evaluation entirely. Everything else (blocked dimensions, low confidence,
+missing answers, laya unavailable, prompts over the laya max_len bound)
+escalates to the full evaluation — the pre-check only removes traffic that
+would certainly pass, so verdict semantics never change.
+
+```python
+from fusion_guard import TwoTierGuard, LayaGuardClient
+
+tt = TwoTierGuard(
+    laya=LayaGuardClient(api_key="..."),
+    full_evaluate=lambda prompt: native_client.evaluate(prompt),  # full path
+)
+r = tt.evaluate("how do I bake a chocolate cake")
+r.tier            # "fast_allow" (full eval skipped) or "escalated"
+r.pass_through    # True when the full evaluation was removed
+tt.stats          # {"total", "fast_allow", "escalated", "precheck_fallback", "truncated_prompts"}
+tt.pass_through_rate()
+```
+
+Gate rules:
+- Confidence gate applies only to the three `noul` dimensions
+  (`jailbreak`/`prompt_injection`/`sensitive_data`, default min 0.8, env
+  `LAYA_GUARD_MIN_CONFIDENCE`). `harm_severity` confidence is
+  server-discounted by calibration and is NOT gated — its safety is
+  enforced by the threshold.
+- All four scored dimensions must be present; a missing answer escalates.
+- Laya unavailable = explicit fail-open to the full evaluation (never a
+  silent allow; `precheck_fallback` counter + warning log).
+- Prompts longer than the laya max_len bound (1024 chars) always escalate —
+  the tail was never scanned.
+- `validate_agreement(samples)` runs both tiers on a sample and reports the
+  fast-allow vs full-verdict agreement rate (issue #45 zero-verdict-change
+  acceptance).
+
+Known upstream limit: laya lane latency under multi-model load
+(fusion-mlx #1161) — fresh-instance p50 ~20ms vs the 6.4ms AC7 baseline.
+
 ## Development
 
 ```bash

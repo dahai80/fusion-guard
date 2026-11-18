@@ -14,6 +14,7 @@ from ._native import (
     version_info,
 )
 from .laya_guard import LayaGuardClient, GuardResult, DimensionScore
+from .two_tier import TwoTierGuard, TwoTierResult, LAYA_MAX_PROMPT_CHARS
 
 __all__ = [
     "NativeGuardClient",
@@ -27,6 +28,9 @@ __all__ = [
     "LayaGuardClient",
     "GuardResult",
     "DimensionScore",
+    "TwoTierGuard",
+    "TwoTierResult",
+    "LAYA_MAX_PROMPT_CHARS",
 ]
 
 __version__ = "0.2.0-rc.12"
