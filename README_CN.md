@@ -393,6 +393,42 @@ PRD (`architecture/laya-mlx-2-fusion-mlx-1010.md`) 用中文命名安全维度�
   (`TestGatewayBlockE2E`, `TestLayaIntegration`) 在 fusion-mlx / gateway
   未运行时自动 skip。
 
+### 两级评估 (issue #45)
+
+`fusion_guard.two_tier.TwoTierGuard` 先跑 laya 预检；干净且高置信的 prompt
+本地直接放行，完全跳过完整 guard 评估。其余情况 (维度超阈、低置信、答案
+缺失、laya 不可用、超 laya max_len 上限的 prompt) 一律升级到完整评估 —
+预检只移除"必然通过"的流量，判定语义不变。
+
+```python
+from fusion_guard import TwoTierGuard, LayaGuardClient
+
+tt = TwoTierGuard(
+    laya=LayaGuardClient(api_key="..."),
+    full_evaluate=lambda prompt: native_client.evaluate(prompt),  # 完整路径
+)
+r = tt.evaluate("how do I bake a chocolate cake")
+r.tier            # "fast_allow" (跳过完整评估) 或 "escalated"
+r.pass_through    # True 表示完整评估被移除
+tt.stats          # {"total", "fast_allow", "escalated", "precheck_fallback", "truncated_prompts"}
+tt.pass_through_rate()
+```
+
+门控规则：
+- 置信门控只作用于三个 `noul` 维度
+  (`jailbreak`/`prompt_injection`/`sensitive_data`，默认最小 0.8，env
+  `LAYA_GUARD_MIN_CONFIDENCE`)。`harm_severity` 的置信度被服务端校准折减
+  (干净时折减)，不参与门控 — 其安全性由阈值保证。
+- 四个打分维度必须齐全；缺答案即升级。
+- laya 不可用 = 显式 fail-open 落到完整评估 (绝不静默放行；
+  `precheck_fallback` 计数 + warning 日志)。
+- 超过 laya max_len 上限 (1024 字符) 的 prompt 一律升级 — 尾部未被扫描。
+- `validate_agreement(samples)` 对样本双跑两路，报告 fast-allow 与完整
+  判定的一致率 (issue #45 零判定变更验收)。
+
+已知上游限制：多模型负载下 laya 通道延迟 (fusion-mlx #1161) —
+冷启实例 p50 ~20ms，对比 AC7 基线 6.4ms。
+
 ## 开发
 
 ```bash
