@@ -33,4 +33,4 @@ __all__ = [
     "LAYA_MAX_PROMPT_CHARS",
 ]
 
-__version__ = "0.2.0-rc.12"
+__version__ = "0.2.0-rc.13"

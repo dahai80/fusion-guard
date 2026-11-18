@@ -7,8 +7,8 @@ doc_type: changelog
 title: {zh: "fusion-guard 变更日志", en: "fusion-guard Changelog"}
 audience: engineer
 status: draft
-version: 0.2.0-rc.12
-updated: 2026-11-16
+version: 0.2.0-rc.13
+updated: 2026-11-18
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -19,6 +19,17 @@ source_of_truth:
 All notable changes to fusion-guard are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.0-rc.13] — 2026-11-18 (patch)
+
+Two-tier laya pre-check — closes issue #45.
+
+### Added
+- `fusion_guard.two_tier.TwoTierGuard`: runs fusion-mlx `/v1/laya/decide` (preset=guard) as a fast pre-check ahead of the full guard evaluation; clean + high-confidence prompts allow locally and skip the full path. Blocked dimensions, low confidence, missing answers, laya unavailability, and over-max_len prompts (1024 chars) all escalate — the pre-check only removes traffic that would certainly pass, so verdict semantics never change.
+- Gate calibration (live laya): confidence floor (default 0.8, env `LAYA_GUARD_MIN_CONFIDENCE`) on the three `noul` dims only — `harm_severity` confidence is server-discounted on clean prompts (0.08-0.27) and not gated; all four scored dims must be present.
+- Explicit fail-open: laya timeout/HTTP error falls through to the full evaluation with warning log + `precheck_fallback` counter — never a silent allow (issue #45 constraint).
+- Measured pass-through (`stats` + `pass_through_rate()`) and zero-verdict-change validation (`validate_agreement(samples)` reports fast-allow vs full-verdict agreement rate) per issue #45 acceptance.
+- 23 unit tests + 5 live integration tests (auto-skip when laya endpoint down); live sample: 0 disagreements.
 
 ## [0.2.0-rc.12] — 2026-11-16 (patch)
 
