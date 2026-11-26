@@ -1,26 +1,26 @@
-// 共享 secret (§12.1 第二鉴权因子) Keychain 来源辅助。
+// Shared secret (§12.1 second auth factor) Keychain source helpers.
 //
-// token-key (token_store.rs) 是 32 字节对称 AES-GCM 主密钥, 走 bytes Keychain 路径 (私有)。
-// shared-secret 是字符串第二因子 (client 走 wire 携带, 常量时间比对), 走 string Keychain 路径。
-// 两者 Keychain service 同为 "fusion-guard", account 不同 ("token-key" / "shared-secret") —— 域分离。
+// token-key (token_store.rs) is a 32-byte symmetric AES-GCM master key, using the bytes Keychain path (private).
+// shared-secret is the string second factor (carried by the client over the wire, constant-time compare), using the string Keychain path.
+// Both share the same Keychain service "fusion-guard" with different accounts ("token-key" / "shared-secret") — domain separation.
 //
-// 设计 (规则 5: 决策用代码非 token): resolve_shared_secret 纯函数决定来源 (Keychain/env/none),
-// 实际加载由 PeerAuthorizer 调 keychain_secret_get / keychain_secret_store 执行。
-// 这与 token_store::resolve_key_source 对齐 (同一审计缺陷 H-C + P2-1 的 secret 侧镜像)。
+// Design (rule 5: decide with code, not tokens): resolve_shared_secret is a pure function deciding the source (Keychain/env/none),
+// actual loading is done by PeerAuthorizer calling keychain_secret_get / keychain_secret_store.
+// This mirrors token_store::resolve_key_source (the secret-side mirror of the same audit findings H-C + P2-1).
 
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 
 pub const KEYCHAIN_SERVICE: &str = "fusion-guard";
 pub const KEYCHAIN_ACCOUNT: &str = "shared-secret";
-// 与 fg-ipc::SHARED_SECRET_ENV 同值 (fg-ipc 是权威定义; fg-store 本地镜像避免跨 crate 循环依赖)。
+// Same value as fg-ipc::SHARED_SECRET_ENV (fg-ipc is the authoritative definition; fg-store keeps a local mirror to avoid a cross-crate circular dependency).
 pub const SHARED_SECRET_ENV: &str = "FUSION_GUARD_SHARED_SECRET";
 
-// shared secret 来源决策 (镜像 token_store::KeySource + resolve_key_source)。
-// Keychain = prod 推荐 (密钥不入环境变量, 同 UID 进程不可读)。
-// EnvDebug = dev 放行 env (debug_assertions, info 姿态)。
-// EnvInsecure = release 用 env (FUSION_GUARD_ALLOW_INSECURE_SECRET=1 显式放行, warn 告警 —— prod 不应用)。
-// None = 未提供任何来源 (release 启动拒, dev 跳过 secret 校验)。
+// Shared secret source decision (mirrors token_store::KeySource + resolve_key_source).
+// Keychain = recommended for prod (key never enters environment variables; unreadable by same-UID processes).
+// EnvDebug = dev allows env (debug_assertions, info posture).
+// EnvInsecure = release uses env (requires FUSION_GUARD_ALLOW_INSECURE_SECRET=1 explicit opt-in, warns — not for prod).
+// None = no source provided (release refuses to start, dev skips secret verification).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SharedSecretSource {
     Keychain,
@@ -42,11 +42,11 @@ pub fn resolve_shared_secret(
             SharedSecretSource::EnvInsecure
         }
     } else if env_present {
-        // env 提供但未显式放行 (release 无 flag) —— 视为未授权, 走 Keychain; 若 Keychain 也缺 → None。
-        // 不静默用 env (防 release 漏 flag 意外降级); 由 PeerAuthorizer 再判 Keychain。
+        // env present but not explicitly authorized (release without flag) — treat as unauthorized, use Keychain; if Keychain is also missing → None.
+        // Do not silently use env (prevents accidental downgrade when release misses the flag); PeerAuthorizer decides on Keychain.
         SharedSecretSource::Keychain
     } else {
-        // env 无 → Keychain (prod); Keychain 也缺 → None (release 拒)。
+        // no env → Keychain (prod); Keychain also missing → None (release refuses).
         SharedSecretSource::Keychain
     }
 }
@@ -61,8 +61,8 @@ pub fn shared_secret_env_present() -> bool {
     std::env::var(SHARED_SECRET_ENV).is_ok()
 }
 
-// Keychain 读 shared secret (macOS)。缺/读失败 → Ok(None) (首次启动或未配置)。
-// 非 macOS → Ok(None) (无 Keychain, 走 env 路径)。
+// Read shared secret from Keychain (macOS). Missing/read failure → Ok(None) (first start or unset).
+// Non-macOS → Ok(None) (no Keychain, env path instead).
 #[cfg(target_os = "macos")]
 pub fn keychain_secret_get() -> Result<Option<String>, SecretError> {
     match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
@@ -87,7 +87,7 @@ pub fn keychain_secret_get() -> Result<Option<String>, SecretError> {
     Ok(None)
 }
 
-// Keychain 存 shared secret (macOS 首次启动生成)。
+// Store shared secret in Keychain (generated on first macOS start).
 #[cfg(target_os = "macos")]
 pub fn keychain_secret_store(secret: &str) -> Result<(), SecretError> {
     set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, secret.as_bytes())
@@ -102,8 +102,8 @@ pub fn keychain_secret_store(_secret: &str) -> Result<(), SecretError> {
     ))
 }
 
-// 生成强随机 shared secret (hex, 32 字节 = 64 hex 字符)。
-// 用 rand::thread_rng (与 token_store 主密钥生成同源)。
+// Generate a strong random shared secret (hex, 32 bytes = 64 hex chars).
+// Uses rand::thread_rng (same source as token_store master key generation).
 pub fn generate_shared_secret() -> String {
     let mut buf = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);

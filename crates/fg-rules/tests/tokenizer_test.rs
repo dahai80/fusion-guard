@@ -10,7 +10,7 @@ fn ast_hit(eng: &RuleEngine, content: &str) -> Option<fg_rules::RuleHit> {
 #[test]
 fn non_whitelisted_binary_blocks() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
-    // P0-2 (audit §1.8): 非白名单 binary fail-closed L4 (原 L3 可被 confirm 放行 = 绕过)。
+    // P0-2 (audit §1.8): non-whitelisted binary fails closed as L4 (the former L3 could be approved via confirm = bypass).
     let hit = ast_hit(&eng, "nc -l 4444").expect("nc not in whitelist -> ast hit");
     assert_eq!(hit.rule.risk_level, RiskLevel::L4);
     assert_eq!(hit.rule.action, SafetyAction::Block);
@@ -26,11 +26,11 @@ fn whitelisted_binary_no_ast_hit() {
 
 #[test]
 fn cat_sensitive_path_blocks_l4() {
-    // A1: 避免裸 ~ (tilde 展开触发 A1 fail-closed), 用 /etc 敏感路径测 check_argv 分支。
+    // A1: avoid bare ~ (tilde expansion triggers A1 fail-closed); use the /etc sensitive path to test the check_argv branch.
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
     let hit = ast_hit(&eng, "cat /etc/shadow").expect("cat sensitive path");
     assert_eq!(hit.rule.risk_level, RiskLevel::L4);
-    assert!(hit.rule.reason.contains("敏感路径"));
+    assert!(hit.rule.reason.contains("sensitive path"));
 }
 
 #[test]
@@ -95,14 +95,15 @@ fn redirect_to_sensitive_blocks() {
 #[test]
 fn chain_split_detects_each_segment() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
-    // P0-2: 非白名单 binary (nc) fail-closed L4 (原 L3 可被 confirm 放行)。
+    // P0-2: non-whitelisted binary (nc) fails closed as L4 (the former L3 could be approved via confirm).
     let hit = ast_hit(&eng, "ls -la && nc -l 4444").expect("nc in 2nd segment");
     assert_eq!(hit.rule.risk_level, RiskLevel::L4);
 }
 
-// A1: shell_words 无法建模的 shell 特性 → fail-closed L4 (硬伤 B 根因修)。
-// 裸 tilde/brace 展开/glob/heredoc/|& />&N/反斜杠续行 —— shell 会展开, shell_words 不做,
-// 每个未建模特性是绕过通道。拒 (非逐文件补 arm)。
+// A1: shell features shell_words cannot model -> fail-closed L4 (root fix for flaw B).
+// Bare tilde/brace expansion/glob/heredoc/|& />&N/backslash continuation — the
+// shell expands them, shell_words does not; every unmodeled feature is a bypass
+// channel. Reject (not arm-by-arm patching).
 #[test]
 fn a1_unmodeled_shell_features_fail_closed() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -120,37 +121,38 @@ fn a1_unmodeled_shell_features_fail_closed() {
         "cat <>file",
         "echo backslash \\\ncontinues",
     ] {
-        let hit = ast_hit(&eng, cmd).unwrap_or_else(|| panic!("A1 应 Block: {cmd}"));
+        let hit = ast_hit(&eng, cmd).unwrap_or_else(|| panic!("A1 must block: {cmd}"));
         assert_eq!(
             hit.rule.risk_level,
             RiskLevel::L4,
-            "A1 fail-closed 须 L4: {cmd}"
+            "A1 fail-closed must be L4: {cmd}"
         );
         assert!(
             hit.rule.name == "ast:",
-            "A1 hit binary 须空 (语法级): {cmd}"
+            "A1 hit binary must be empty (syntax level): {cmd}"
         );
     }
 }
 
 #[test]
 fn a1_quoted_glob_not_blocked() {
-    // 引号内 glob 是字面量, shell 不展开 → 不触发 A1 (且非白名单/敏感)。
+    // Globs inside quotes are literals; the shell does not expand them -> A1 not triggered (and non-whitelisted/sensitive is irrelevant here).
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
-    // echo 在白名单, 引号内 * 字面 → 无 hit
+    // echo is whitelisted; the quoted * stays literal -> no hit
     let hit = ast_hit(&eng, "echo \"*.txt\"");
-    assert!(hit.is_none(), "引号内 glob 不展开, 非 A1 命中");
+    assert!(hit.is_none(), "quoted glob is not expanded, not an A1 hit");
 }
 
 #[test]
 fn a1_find_exec_brace_not_false_positive() {
-    // find -exec {} 是 find 占位符非 shell brace 展开, 不触发 A1; find -exec 自身 L4。
+    // find -exec {} is the find placeholder, not a shell brace expansion; A1 not
+    // triggered; find -exec itself is L4.
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
     let hit = ast_hit(&eng, "find . -exec rm {} \\;").expect("find -exec ban");
     assert_eq!(hit.rule.risk_level, RiskLevel::L4);
     assert!(
         hit.rule.reason.contains("-exec"),
-        "须是 find -exec 命中非 A1 brace"
+        "must be the find -exec hit, not an A1 brace hit"
     );
 }
 
@@ -197,7 +199,8 @@ fn infer_category_empty() {
 #[test]
 fn seatbelt_required_l3_and_l4() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
-    // P0-2: 非白名单 binary 现 L4 (fail-closed)。L3 源改用命令替换 $(...) (sensitive_target=false → L3)。
+    // P0-2: non-whitelisted binary is now L4 (fail-closed). The L3 source is
+    // changed to command substitution $(...) (sensitive_target=false -> L3).
     let hits = eng.evaluate_full("echo $(whoami)");
     let v = verdict_from_hits(&hits, eng.epoch());
     assert!(
@@ -239,7 +242,7 @@ fn sensitive_filename_helpers() {
     assert!(!tokenizer::is_sensitive_filename("readme.md"));
 }
 
-// C3/P0-G5: 白名单解释器 -c/-e 内联代码 RCE 零拦截修复
+// C3/P0-G5: fix for whitelisted interpreters' -c/-e inline-code RCE going unintercepted
 #[test]
 fn python_dash_c_rce_blocks_l4() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -250,7 +253,7 @@ fn python_dash_c_rce_blocks_l4() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "python3 -c 内联 RCE 必须 L4 绝对 Block"
+        "python3 -c inline RCE must be L4 absolute Block"
     );
     assert_eq!(v.action, SafetyAction::Block);
 }
@@ -262,7 +265,7 @@ fn node_dash_e_rce_blocks_l4() {
         &eng.evaluate_full("node -e \"require('child_process').execSync('rm -rf /')\""),
         eng.epoch(),
     );
-    assert_eq!(v.risk_level, RiskLevel::L4, "node -e 内联 RCE 必须 L4");
+    assert_eq!(v.risk_level, RiskLevel::L4, "node -e inline RCE must be L4");
     assert_eq!(v.action, SafetyAction::Block);
 }
 
@@ -273,7 +276,11 @@ fn deno_eval_subcmd_blocks_l4() {
         &eng.evaluate_full("deno eval \"Deno.removeSync('/')\""),
         eng.epoch(),
     );
-    assert_eq!(v.risk_level, RiskLevel::L4, "deno eval 子命令 RCE 必须 L4");
+    assert_eq!(
+        v.risk_level,
+        RiskLevel::L4,
+        "deno eval subcommand RCE must be L4"
+    );
 }
 
 #[test]
@@ -283,11 +290,11 @@ fn cargo_build_not_overblocked() {
     assert_ne!(
         v.risk_level,
         RiskLevel::L4,
-        "cargo build 不应被解释器 arm 误杀 L4"
+        "cargo build must not be false-killed as L4 by the interpreter arm"
     );
 }
 
-// L3/P0-G5: rm -fr / --recursive --force 变体统一 L4 (与 rm -rf 一致)
+// L3/P0-G5: rm -fr / --recursive --force variants uniformly L4 (same as rm -rf)
 #[test]
 fn rm_fr_variant_blocks_l4() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -295,7 +302,7 @@ fn rm_fr_variant_blocks_l4() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "rm -fr 递归+强制变体必须 L4 (与 rm -rf 一致)"
+        "rm -fr recursive+force variant must be L4 (same as rm -rf)"
     );
     assert_eq!(v.action, SafetyAction::Block);
 }
@@ -307,11 +314,11 @@ fn rm_recursive_only_blocks_l4() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "rm --recursive --force 必须 L4"
+        "rm --recursive --force must be L4"
     );
 }
 
-// L4/P0-G5: dd of=/dev/* 磁盘擦除
+// L4/P0-G5: dd of=/dev/* disk wipe
 #[test]
 fn dd_of_dev_blocks_l4() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -322,16 +329,17 @@ fn dd_of_dev_blocks_l4() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "dd of=/dev/sda 磁盘擦除必须 L4"
+        "dd of=/dev/sda disk wipe must be L4"
     );
     assert_eq!(v.action, SafetyAction::Block);
 }
 
-// L4/P0-G5: 多段命令后段 L4 不被首段 L3 掩盖 (全段扫描)
+// L4/P0-G5: a later L4 segment of a multi-segment command is not masked by an earlier L3 (full-segment scan)
 #[test]
 fn multi_segment_l4_not_masked_by_l3() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
-    // 首段 cat 敏感 (L4), 二段 python3 -c (L4); 全段扫描后 verdict 取 max = L4
+    // First segment cat sensitive (L4), second segment python3 -c (L4); after the
+    // full-segment scan the verdict takes max = L4
     let v = verdict_from_hits(
         &eng.evaluate_full("cat ~/.ssh/id_rsa ; python3 -c \"rm -rf /\""),
         eng.epoch(),
@@ -339,11 +347,11 @@ fn multi_segment_l4_not_masked_by_l3() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "多段命令必须全段扫描取 max risk"
+        "multi-segment commands must be fully scanned taking max risk"
     );
 }
 
-// L4/P0-G5: diskutil 破坏性操作统一 L4
+// L4/P0-G5: diskutil destructive operations uniformly L4
 #[test]
 fn diskutil_erasedisk_blocks_l4() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -351,30 +359,32 @@ fn diskutil_erasedisk_blocks_l4() {
         &eng.evaluate_full("diskutil eraseDisk JHFS+ Test /dev/disk0"),
         eng.epoch(),
     );
-    assert_eq!(v.risk_level, RiskLevel::L4, "diskutil eraseDisk 必须 L4");
+    assert_eq!(v.risk_level, RiskLevel::L4, "diskutil eraseDisk must be L4");
 }
 
-// P0-2 (audit §1.7): content_type 分派扫描阶段。
-//   Shell  → tokenizer 跑 (代码内容 `os.system(x)` 当非白名单 binary → Ast hit)。
-//   Code   → tokenizer 跳 (代码内容不跑 shell_words, 无 Ast 假阳)。
-//   Json/Text → tokenizer 跳 (结构化/自由文本非可执行)。
+// P0-2 (audit §1.7): content_type gates the scan stages.
+//   Shell  -> tokenizer runs (code content `os.system(x)` treated as a
+//            non-whitelisted binary -> Ast hit).
+//   Code   -> tokenizer skipped (code content does not run shell_words; no Ast
+//            false-positive).
+//   Json/Text -> tokenizer skipped (structured/free text is not executable).
 #[test]
 fn p0_2_content_type_gates_tokenizer() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
     let code = "os.system('id')";
-    // Shell: tokenizer 把 os.system 当非白名单 binary → Ast hit。
+    // Shell: the tokenizer treats os.system as a non-whitelisted binary -> Ast hit.
     let shell_hits = eng.evaluate_full_typed(code, ContentType::Shell);
     assert!(
         shell_hits.iter().any(|h| h.stage == CheckStage::Ast),
         "Shell content_type must run tokenizer (Ast hit on non-whitelist binary)"
     );
-    // Code: tokenizer 跳过, 无 Ast hit (semantic os.system L4 由 semantic_test 覆盖)。
+    // Code: tokenizer skipped, no Ast hit (semantic os.system L4 is covered by semantic_test).
     let code_hits = eng.evaluate_full_typed(code, ContentType::Code);
     assert!(
         !code_hits.iter().any(|h| h.stage == CheckStage::Ast),
         "Code content_type must skip tokenizer (no Ast false-positive on code)"
     );
-    // Json/Text: tokenizer 跳过。
+    // Json/Text: tokenizer skipped.
     for ct in [ContentType::Json, ContentType::Text] {
         let hits = eng.evaluate_full_typed(code, ct);
         assert!(
@@ -385,9 +395,10 @@ fn p0_2_content_type_gates_tokenizer() {
     }
 }
 
-// P0-2 (audit §1.8): 非白名单 binary fail-closed L4 (env 前缀绕过修复)。
-// `FOO=bar nc evil 4444` —— 跳 env 前缀后 argv[0]=nc (非白名单) → L4 绝对 Block,
-// 非 L3 (L3 可被 guard.confirm 二次放行 = 绕过通道)。
+// P0-2 (audit §1.8): non-whitelisted binary fails closed as L4 (env-prefix bypass fix).
+// `FOO=bar nc evil 4444` — after skipping the env prefix, argv[0]=nc
+// (non-whitelisted) -> L4 absolute Block, not L3 (L3 could be second-approved
+// via guard.confirm = a bypass channel).
 #[test]
 fn p0_2_non_whitelist_fail_closed_l4_env_prefix_bypass() {
     let eng = RuleEngine::new(fg_rules::default_ruleset()).unwrap();
@@ -396,8 +407,11 @@ fn p0_2_non_whitelist_fail_closed_l4_env_prefix_bypass() {
     assert_eq!(
         v.risk_level,
         RiskLevel::L4,
-        "非白名单 binary 必须 L4 fail-closed (斩 confirm 绕过)"
+        "non-whitelisted binary must be L4 fail-closed (cuts the confirm bypass)"
     );
     assert_eq!(v.action, SafetyAction::Block);
-    assert!(!v.requires_approval, "L4 绝对 Block 无 confirm 路径 (H8)");
+    assert!(
+        !v.requires_approval,
+        "L4 absolute Block has no confirm path (H8)"
+    );
 }

@@ -1,10 +1,11 @@
-// P0-4 (audit §1.3/§6): rotation + retention + archive + 增量 verify。
-// 注入旧行 (超 30d) → enforce_retention 归档到 NDJSON + 删行 + VACUUM;
-// 归档后剩余行链仍连续 (增量 verify 透过 checkpoint 锚定剩余首行, 不撞归档边界)。
-// test-helpers feature 暴露 insert_event_at_ts (注入带指定 ts 合法链行)。
+// P0-4 (audit §1.3/§6): rotation + retention + archive + incremental verify.
+// Inject old rows (>30d) -> enforce_retention archives to NDJSON + deletes rows + VACUUM;
+// after archiving, the remaining rows' chain stays continuous (incremental verify anchors the first remaining row
+// via checkpoint, avoiding the archive boundary).
+// test-helpers feature exposes insert_event_at_ts (inject a valid chain row with a specified ts).
 //
-// 需要 FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore 加载密钥)。
-// 归档目录隔离: FUSION_GUARD_ARCHIVE_DIR 指向临时目录, 避免污染 ~/.fusion-guard。
+// Requires FUSION_GUARD_TOKEN_KEY (AuditStore::open -> TokenStore loads the key).
+// Archive dir isolation: FUSION_GUARD_ARCHIVE_DIR points at a temp dir, avoiding pollution of ~/.fusion-guard.
 
 use std::path::PathBuf;
 
@@ -18,9 +19,9 @@ fn ensure_env_key() {
     }
 }
 
-// 临时数据目录: db + 独立归档目录 (per-store 解析自 db_path 同级, 隔离, 测试后清理)。
-// 不设全局 FUSION_GUARD_ARCHIVE_DIR (并发测试 store 抢同一 env 会串扰);
-// resolve_archive_dir(db_path) → db 同级 audit-archive/, 每 store 独立。
+// Temp data dir: db + a dedicated archive dir (resolved per-store next to db_path, isolated, cleaned after tests).
+// The global FUSION_GUARD_ARCHIVE_DIR is not set (concurrent test stores grabbing the same env would crosstalk);
+// resolve_archive_dir(db_path) -> audit-archive/ next to the db, independent per store.
 fn temp_env() -> (PathBuf, PathBuf, PathBuf) {
     ensure_env_key();
     let dir = std::env::temp_dir().join(format!(
@@ -41,8 +42,8 @@ fn cleanup(dir: &std::path::Path, archive: &std::path::Path) {
     let _ = archive;
 }
 
-// 归档触发: 注入 5 旧行 (40d 前) + 2 新行 (now) → enforce_retention。
-// 旧行归档到 NDJSON, 主库剩 2 新行; 增量 verify 干净 (不误报归档边界)。
+// Archive trigger: inject 5 old rows (40d ago) + 2 fresh rows (now) -> enforce_retention.
+// Old rows archive to NDJSON, 2 fresh rows remain in the main DB; incremental verify clean (no false archive-boundary report).
 #[tokio::test]
 async fn rotation_archives_old_rows_and_keeps_chain() {
     let (db, dir, archive) = temp_env();
@@ -61,7 +62,7 @@ async fn rotation_archives_old_rows_and_keeps_chain() {
             .unwrap();
     }
 
-    // 触发前: 7 行在主库。
+    // Before trigger: 7 rows in the main DB.
     let before = store.list_events(Some("alpha"), 100).unwrap();
     assert_eq!(before.len(), 7, "7 rows before rotation");
 
@@ -79,16 +80,16 @@ async fn rotation_archives_old_rows_and_keeps_chain() {
         "archive file is .ndjson"
     );
 
-    // 归档文件含 5 行 JSON (每行一事件, 含 prev_hash/event_hash)。
+    // Archive file holds 5 JSON lines (one event per line, with prev_hash/event_hash).
     let ndjson = std::fs::read_to_string(&archive_path).unwrap();
     let line_count = ndjson.lines().filter(|l| !l.is_empty()).count();
     assert_eq!(line_count, 5, "archive NDJSON has 5 event lines");
 
-    // 主库剩 2 新行 (旧行已归档删)。
+    // 2 fresh rows remain in the main DB (old rows archived and deleted).
     let after = store.list_events(Some("alpha"), 100).unwrap();
     assert_eq!(after.len(), 2, "2 rows remain after rotation");
 
-    // 归档后增量 verify 干净 (checkpoint 锚定剩余首行, 不撞归档边界悬空 prev_hash)。
+    // After archiving, incremental verify is clean (checkpoint anchors the first remaining row; no dangling prev_hash at the archive boundary).
     let v = store.verify_chain(None).unwrap();
     assert!(
         !v.tampered,
@@ -97,15 +98,16 @@ async fn rotation_archives_old_rows_and_keeps_chain() {
     assert_eq!(v.broken_links, 0, "no broken links post-archive");
     assert_eq!(v.total_rows, 2, "total_rows reflects remaining scope rows");
 
-    // 再次 verify (纯增量, 无新增段) 仍干净 + 不重扫。
+    // Verify again (pure incremental, no new segments): still clean + no rescan.
     let v2 = store.verify_chain(None).unwrap();
     assert!(!v2.tampered, "second incremental verify clean");
 
     cleanup(&dir, &archive);
 }
 
-// 归档后空库: 全部行超龄归档 → 主库空。下次插入须续链到归档段末 (非 genesis)。
-// insert_audit_event 回退读 checkpoint 的 last_archived_hash 作 prev_hash。
+// Empty DB after archiving: all rows aged out -> main DB empty. The next insert must continue the chain from the
+// archive tail (not genesis).
+// insert_audit_event falls back to reading the checkpoint's last_archived_hash as prev_hash.
 #[tokio::test]
 async fn rotation_to_empty_then_append_continues_chain() {
     let (db, dir, archive) = temp_env();
@@ -124,13 +126,13 @@ async fn rotation_to_empty_then_append_continues_chain() {
     let after = store.list_events(Some("beta"), 100).unwrap();
     assert_eq!(after.len(), 0, "main DB empty after full archive");
 
-    // 空库 verify (checkpoint 锚定归档段末) 干净。
+    // Empty-DB verify (checkpoint anchored at the archive tail) clean.
     let v = store.verify_chain(None).unwrap();
     assert!(!v.tampered, "empty-DB verify clean post-archive");
     assert_eq!(v.total_rows, 0);
 
-    // 新插入续链 (prev_hash = 归档段末 hash, 非 genesis)。读回行验证 prev_hash (insert_event_at_ts
-    // 返回的 ev.prev_hash 未回填, 真值在落盘行)。
+    // The new insert continues the chain (prev_hash = archive tail hash, not genesis). Verify prev_hash via the
+    // read-back row (the ev.prev_hash returned by insert_event_at_ts is not backfilled; the true value lives in the persisted row).
     let now_ts = chrono::Utc::now();
     store
         .insert_event_at_ts("beta", now_ts, "echo new")
@@ -147,7 +149,7 @@ async fn rotation_to_empty_then_append_continues_chain() {
         "post-archive insert prev_hash must NOT be genesis (continues archive tail)"
     );
 
-    // 增量 verify 干净 (新行续链正确)。
+    // Incremental verify clean (new row continues the chain correctly).
     let v2 = store.verify_chain(None).unwrap();
     assert!(!v2.tampered, "verify clean after post-archive append");
     assert_eq!(v2.total_rows, 1);
@@ -156,22 +158,22 @@ async fn rotation_to_empty_then_append_continues_chain() {
     cleanup(&dir, &archive);
 }
 
-// retention: 归档目录内超 180d 的 .ndjson 文件被删除 (冷存到期)。
-// retention 按文件名时间戳 (audit-YYYYMMDDTHHMMSS.ndjson) 判龄, 非 mtime。
-// 直接写一个超期文件名 (200d 前) 的归档文件 → enforce_retention → 文件删除。
+// retention: .ndjson files older than 180d inside the archive dir are deleted (cold storage expiry).
+// retention judges age by the filename timestamp (audit-YYYYMMDDTHHMMSS.ndjson), not mtime.
+// Write an archive file whose filename is expired (200d ago) directly -> enforce_retention -> file deleted.
 #[tokio::test]
 async fn retention_prunes_expired_archive_files() {
     let (db, dir, archive) = temp_env();
     let store = AuditStore::open(&db).unwrap();
 
-    // 直接在归档目录写一个文件名时间戳超 180d 的 .ndjson (模拟历史归档冷存到期)。
+    // Write an .ndjson with a filename timestamp older than 180d directly into the archive dir (simulating historical cold storage expiry).
     let expired_ts = chrono::Utc::now() - chrono::Duration::days(200);
     let expired_name = format!("audit-{}.ndjson", expired_ts.format("%Y%m%dT%H%M%S"));
     let expired_path = archive.join(&expired_name);
     std::fs::write(&expired_path, "{}\n").unwrap();
     assert!(expired_path.exists());
 
-    // 同时写一个近期归档文件 (30d 前), 不应被删。
+    // Also write a recent archive file (30d ago); it must not be deleted.
     let recent_ts = chrono::Utc::now() - chrono::Duration::days(30);
     let recent_name = format!("audit-{}.ndjson", recent_ts.format("%Y%m%dT%H%M%S"));
     let recent_path = archive.join(&recent_name);

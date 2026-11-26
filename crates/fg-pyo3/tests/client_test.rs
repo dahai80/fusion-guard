@@ -1,6 +1,6 @@
-// fg-pyo3 集成测试 — UDS 客户端对真实 fg-ipc server 往返
-// 不依赖 Python (纯 Rust 测 UdsClient wire contract); PyO3 层由 maturin build + Python smoke 覆盖
-// 隔离 env: 独立 SOCK + DATA_DIR + TOKEN_KEY (测守护进程交互必须隔离, 防污染本机 guard)
+// fg-pyo3 integration tests — UDS client round trip against a real fg-ipc server
+// No Python dependency (pure-Rust UdsClient wire contract tests); the PyO3 layer is covered by maturin build + Python smoke
+// Isolated env: dedicated SOCK + DATA_DIR + TOKEN_KEY (daemon interaction must be isolated to avoid polluting the local guard)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ fn ensure_env() -> (PathBuf, PathBuf) {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("guard-pyo3.db");
-    // UDS SUN_LEN 限制 (~104 字节) — socket 须短路径, 放 /tmp 直下, 非长 temp_dir 子目录
-    // 每测试唯一 socket (并行测试不冲突): 8 字符 uuid 前缀
+    // UDS SUN_LEN limit (~104 bytes) — the socket path must be short, directly under /tmp, not in a long temp_dir subdirectory
+    // Unique socket per test (no collisions between parallel tests): 8-character uuid prefix
     let short = uuid::Uuid::new_v4().simple().to_string();
     let sock = PathBuf::from(format!(
         "/tmp/fg-pyo3-{}-{}.sock",
@@ -47,9 +47,9 @@ async fn spawn_server(db: &std::path::Path, sock: PathBuf) -> tokio::task::JoinH
     })
 }
 
-// 轮询 500 次 × 10ms = 5s (原 100×10ms=1s 在 workspace 高并发负载下 server spawn
-// 调度延迟 >1s → 测得 socket 未出现假 panic)。worker_threads=2 下 server task 与 client
-// 竞争调度, 编译/并发压力时启动更慢, 5s 给足余量。
+// Poll 500 × 10ms = 5s (the old 100×10ms=1s hit server spawn scheduling delays >1s under
+// heavy workspace concurrency → false panic on the socket never appearing). With worker_threads=2
+// the server task competes with the client for scheduling; startup is slower under compile/concurrency pressure, so 5s leaves ample margin.
 async fn wait_for_sock(sock: &std::path::Path) {
     for _ in 0..500 {
         if sock.exists() {
@@ -60,10 +60,10 @@ async fn wait_for_sock(sock: &std::path::Path) {
     panic!("server sock never appeared: {}", sock.display());
 }
 
-// flake 兜底: socket 文件已出现但 server.serve 的 accept 循环尚未被 worker 调度
-// (workspace 高并发负载, multi_thread worker_threads=2 调度抖动) → 客户端 connect 成功但
-// 首请求 read 2s 超时 (-32010)。重试瞬态 -32010 (connect/read/write 超时) 3 次 × 200ms
-// 给 accept 循环被 poll 的机会。非瞬态错 (stale epoch -32003, parse -32700) 不重试原样返。
+// Flake guard: the socket file exists but server.serve's accept loop has not been scheduled by a worker yet
+// (heavy workspace concurrency, multi_thread worker_threads=2 scheduling jitter) → the client connects successfully but
+// the first request times out on read after 2s (-32010). Retry transient -32010 (connect/read/write timeout) up to 3 × 200ms
+// to give the accept loop a chance to be polled. Non-transient errors (stale epoch -32003, parse -32700) are returned as-is without retry.
 fn call_retry(
     client: &fg_pyo3::UdsClient,
     method: &str,
@@ -90,8 +90,8 @@ fn call_retry(
     unreachable!()
 }
 
-// 同 call_retry, 但用于期望失败的调用 (如 stale_epoch -32003)。重试瞬态 -32010
-// (connect/read 超时), 非 -32010 错立即返 (保留真实业务错如 -32003 供断言)。
+// Same as call_retry, but for calls expected to fail (e.g. stale_epoch -32003). Retries transient -32010
+// (connect/read timeout); non--32010 errors return immediately (preserving real business errors like -32003 for assertions).
 fn call_retry_err(
     client: &fg_pyo3::UdsClient,
     method: &str,
@@ -115,9 +115,9 @@ fn call_retry_err(
     unreachable!()
 }
 
-// multi_thread: UdsClient.call 是同步阻塞 (std UnixStream), 阻塞 current-thread runtime
-// 会导致同 runtime 上的 server.serve 任务饿死 (accept 永不被 poll) → read 超时 EAGAIN。
-// multi_thread 让 server 任务在另一 worker 上跑, 与阻塞客户端并发。
+// multi_thread: UdsClient.call is synchronous blocking (std UnixStream); blocking a current-thread runtime
+// would starve the server.serve task on the same runtime (accept never polled) → read timeout EAGAIN.
+// multi_thread lets the server task run on another worker, concurrent with the blocking client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_roundtrip() {
     let (db, sock) = ensure_env();
@@ -147,7 +147,7 @@ async fn evaluate_block_returns_verdict() {
         "guard.evaluate",
         serde_json::json!({ "action": "evaluate", "content": "rm -rf /", "caller_epoch": 0 }),
     );
-    // C11/P0-G7: 服务端 serde rename_all=lowercase → "block"/"l4" (非 PascalCase)。
+    // C11/P0-G7: server serde rename_all=lowercase → "block"/"l4" (not PascalCase).
     assert_eq!(res["action"], "block");
     assert_eq!(res["risk_level"], "l4");
 
@@ -182,7 +182,7 @@ async fn audit_verify_roundtrip() {
 
     let sock_for_cleanup = sock.clone();
     let client = fg_pyo3::UdsClient::new(sock);
-    // 先 evaluate 触发审计落盘
+    // Run evaluate first to trigger an audit write
     let _ = call_retry(
         &client,
         "guard.evaluate",
@@ -191,8 +191,8 @@ async fn audit_verify_roundtrip() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let res = call_retry(&client, "guard.audit.verify", serde_json::json!({}));
-    // P0-5: 响应是 AllChainsVerification (audit/tcc/rules/dead_letter 子链 + 顶层 tampered)。
-    // audit 子链至少 1 行 (上面 evaluate 落盘), 全链 tampered=false。
+    // P0-5: the response is AllChainsVerification (audit/tcc/rules/dead_letter subchains + top-level tampered).
+    // The audit subchain has at least 1 row (evaluate above persisted), all chains tampered=false.
     assert!(res["audit"]["total_rows"].as_u64().unwrap() >= 1);
     assert_eq!(res["tampered"], false);
     assert_eq!(res["audit"]["tampered"], false);
@@ -204,61 +204,64 @@ async fn audit_verify_roundtrip() {
     let _ = std::fs::remove_file(&sock_for_cleanup);
 }
 
-// P2-4 (audit §3.6): UdsClient 连接池 —— 持久连接复用 + 透明重连。
-// 服务端 conn_loop 已循环处理单连接多请求 (read→dispatch→write, EOF 才断),
-// 客户端 UdsClient 持 Mutex<Option<UnixStream>> 复用流; IO 错 (服务端重启/deadline 断)
-// → drop 旧流重连一次重试, 调用方不感知。此测验证两点:
-//   1) 同一 client 多次 call 复用连接, 全成功 (不因复用损坏 wire)。
-//   2) 服务端重启后, 持久流已死 → 首次 call_once 失败 (read EOF) → 清流重连 → 第二次成功 (透明自愈)。
+// P2-4 (audit §3.6): UdsClient connection pool — persistent connection reuse + transparent reconnect.
+// The server conn_loop already loops over multiple requests per connection (read→dispatch→write, disconnects only on EOF);
+// the client UdsClient holds a Mutex<Option<UnixStream>> reused stream; on IO error (server restart/deadline disconnect)
+// → drop the old stream, reconnect, retry once, invisible to the caller. This test verifies two points:
+//   1) the same client's repeated calls reuse the connection, all succeeding (reuse does not corrupt the wire).
+//   2) after a server restart, the persistent stream is dead → the first call_once fails (read EOF) → clear the stream, reconnect → the second call succeeds (transparent self-healing).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p24_persistent_conn_reuse_and_reconnect() {
     let (db, sock) = ensure_env();
 
-    // 服务端 A
+    // Server A
     let handle_a = spawn_server(&db, sock.clone()).await;
     wait_for_sock(&sock).await;
 
     let client = fg_pyo3::UdsClient::new(sock.clone());
 
-    // (1) 同 client 多次 call 复用连接 —— ping 5 次全 ok, 证明复用不损坏 wire。
+    // (1) Same client, repeated calls reusing the connection — 5 pings all ok, proving reuse does not corrupt the wire.
     for i in 0..5u8 {
         let res = call_retry(&client, "guard.ping", serde_json::json!({}));
-        assert_eq!(res["pong"], true, "reuse call #{i} 须成功");
+        assert_eq!(res["pong"], true, "reuse call #{i} must succeed");
         assert!(
             res["rules_epoch"].as_u64().is_some(),
-            "reuse call #{i} 须带 epoch"
+            "reuse call #{i} must carry an epoch"
         );
     }
 
-    // (2) 重启服务端: abort A, 起新 B (同 sock, serve 重绑)。
-    //     client 持久流连的是 A 的 listener, A abort → 对端 EOF → 流已死。
-    //     下次 call_once 读失败 → 清流 → 重连一次重试 → 连 B 成功 (透明自愈)。
+    // (2) Restart the server: abort A, start a new B (same sock, serve rebinds).
+    //     The client's persistent stream is connected to A's listener; A abort → peer EOF → the stream is dead.
+    //     The next call_once fails on read → clear the stream → reconnect and retry once → connects to B successfully (transparent self-healing).
     handle_a.abort();
-    // A abort 不删 sock 文件; B 的 serve 会 remove_file+重绑。等 B 出现前旧文件可能在,
-    // wait_for_sock 见旧文件立即返 → connect 旧 (已关) 失败 -32010 → call_retry 重试到 B 绑定。
+    // A's abort does not delete the sock file; B's serve will remove_file + rebind. Before B appears the old file may still exist,
+    // so wait_for_sock returns immediately on the old file → connect to the old (closed) endpoint fails -32010 → call_retry retries until B binds.
     let handle_b = spawn_server(&db, sock.clone()).await;
     wait_for_sock(&sock).await;
 
-    // 重启后 ping 仍 ok —— 证明死流被检测+清空+重连, 调用方不感知服务端重启。
-    // call_retry 内重试瞬态 -32010 兜底重启竞态 (B 绑定前 connect 旧失败)。
+    // After the restart ping still works — proving the dead stream was detected + cleared + reconnected, with the server restart invisible to the caller.
+    // call_retry's internal transient -32010 retries cover the restart race (connect to the old endpoint failing before B binds).
     let res = call_retry(&client, "guard.ping", serde_json::json!({}));
-    assert_eq!(res["pong"], true, "服务端重启后须透明重连成功 (P2-4)");
+    assert_eq!(
+        res["pong"], true,
+        "must reconnect transparently after server restart (P2-4)"
+    );
 
     handle_b.abort();
     let _ = std::fs::remove_file(&sock);
 }
 
-// Issue #36: NativeGuardClient 无法对 shared-secret daemon 鉴权 —— 客户端从不发 params["secret"]。
-// 修: UdsClient 持 Option<String> shared_secret, call() 对非 ping 请求注入 params["secret"]。
-// mock UDS server (std UnixListener) 逐请求断言 wire 上 secret 有/无 —— ping 不注入 (服务端
-// 对任意对端开放), 非 ping 注入; 无 secret 客户端不注入 (dev daemon 无 secret 行为不变)。
+// Issue #36: NativeGuardClient could not authenticate against a shared-secret daemon — the client never sent params["secret"].
+// Fix: UdsClient holds Option<String> shared_secret; call() injects params["secret"] into non-ping requests.
+// A mock UDS server (std UnixListener) asserts per request whether the secret is present on the wire — ping does not inject (the server
+// is open to any peer), non-ping injects; a secret-less client does not inject (behavior unchanged when the dev daemon has no secret).
 fn spawn_mock_server(
     sock: std::path::PathBuf,
     n_requests: usize,
 ) -> std::thread::JoinHandle<Vec<bool>> {
     std::thread::spawn(move || {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        // bind 完成即通知 (client 侧 poll sock 文件, 防连接早于 bind 竞速)。
+        // Signal as soon as bind completes (client side polls the sock file, avoiding a connect-before-bind race).
         let ready = sock.with_extension("ready");
         std::fs::write(&ready, b"ok").unwrap();
         let mut saw_secret: Vec<bool> = Vec::new();
@@ -288,7 +291,7 @@ fn spawn_mock_server(
     })
 }
 
-// mock server bind 完成信号 (sock.with_extension("ready") 文件) 轮询等待, 防竞速。
+// Poll-wait for the mock server's bind-complete signal (sock.with_extension("ready") file) to avoid races.
 fn wait_mock_ready(sock: &std::path::Path) {
     let ready = sock.with_extension("ready");
     for _ in 0..500 {
@@ -310,7 +313,7 @@ async fn secret_injected_on_non_ping_only() {
     ));
     let _ = std::fs::remove_file(&sock);
 
-    // 两个请求: evaluate (注入) → ping (不注入)。同持久连接顺序到达。
+    // Two requests: evaluate (inject) → ping (no inject). Arrive in order on the same persistent connection.
     let mock = spawn_mock_server(sock.clone(), 2);
     wait_mock_ready(&sock);
 
@@ -328,7 +331,7 @@ async fn secret_injected_on_non_ping_only() {
     assert_eq!(
         saw,
         vec![true, false],
-        "非 ping 请求须携 params[\"secret\"], ping 须不携带"
+        "non-ping requests must carry params[\"secret\"], ping must not carry it"
     );
     let _ = std::fs::remove_file(&sock);
 }
@@ -353,11 +356,15 @@ async fn no_secret_param_when_client_unset() {
     assert_eq!(res["pong"], true);
 
     let saw = mock.join().unwrap();
-    assert_eq!(saw, vec![false], "无 secret 客户端不注入 (dev 行为不变)");
+    assert_eq!(
+        saw,
+        vec![false],
+        "secret-less client does not inject (dev behavior unchanged)"
+    );
     let _ = std::fs::remove_file(&sock);
 }
 
-// 防止未使用 import 警告 (verdict helper 保留供未来扩展用)
+// Prevent unused import warnings (verdict helper kept for future extension)
 #[allow(dead_code)]
 fn _verdict() -> GuardVerdict {
     GuardVerdict {

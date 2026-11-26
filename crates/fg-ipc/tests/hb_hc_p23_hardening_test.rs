@@ -1,10 +1,16 @@
-// H-B / H-C / P2-3 (product-audit §5/§3.4): fg-ipc 鉴权与协议硬化回归。
+// H-B / H-C / P2-3 (product-audit §5/§3.4): fg-ipc authorization and protocol
+// hardening regression.
 //
-// H-B: 规则突变方法 (guard.rule.add/update/remove) 仅 admin (root) 可调。非 admin → -32001 拒。
-//      防普通租户用户自行改 blocklist 致拦截失效或植入恶意规则。本机 uid 非 root → 走非 admin 路径。
-// H-C: release 构建启动须设共享 secret (第二鉴权因子)。require_shared_secret_for_release 纯函数单测
-//      验证决策门控 (dev 放行 / release+secret 放行 / release 无 secret 拒 / 应急 flag 放行)。
-// P2-3: JSON-RPC 协议版本必须 "2.0"。非 "2.0" → -32600 Invalid Request (JSON-RPC 规范码)。
+// H-B: rule mutation methods (guard.rule.add/update/remove) are admin-only (root).
+//      Non-admin -> rejected with -32001. Prevents ordinary tenant users from
+//      altering the blocklist themselves, which would disable interception or
+//      plant malicious rules. Local uid is not root -> takes the non-admin path.
+// H-C: release builds must have a shared secret set to start (second auth factor).
+//      Pure-function unit tests of require_shared_secret_for_release verify the
+//      decision gating (dev allows / release+secret allows / release without
+//      secret rejects / emergency flag allows).
+// P2-3: the JSON-RPC protocol version must be "2.0". Anything else -> -32600
+//      Invalid Request (JSON-RPC spec code).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -87,7 +93,7 @@ fn cleanup(sock: &std::path::Path) {
     }
 }
 
-// H-B: 非 admin 调 guard.rule.add → -32001 拒 (规则突变仅 admin)。
+// H-B: non-admin calling guard.rule.add -> rejected with -32001 (rule mutations are admin-only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hb_rule_add_non_admin_denied() {
     if is_root() {
@@ -105,7 +111,7 @@ async fn hb_rule_add_non_admin_denied() {
         .expect("H-B: non-admin rule.add must error, not result");
     assert_eq!(
         err["code"], -32001,
-        "H-B: non-admin rule.add 须 -32001 (Forbidden → wire 同 Unauthorized 码防 admin 枚举), got: {}",
+        "H-B: non-admin rule.add must get -32001 (Forbidden reuses the Unauthorized wire code to prevent admin enumeration), got: {}",
         err
     );
 
@@ -113,7 +119,7 @@ async fn hb_rule_add_non_admin_denied() {
     cleanup(&sock);
 }
 
-// H-B: 非 admin 调 guard.rule.remove → -32001 拒。
+// H-B: non-admin calling guard.rule.remove -> rejected with -32001.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hb_rule_remove_non_admin_denied() {
     if is_root() {
@@ -131,7 +137,7 @@ async fn hb_rule_remove_non_admin_denied() {
         .expect("H-B: non-admin rule.remove must error");
     assert_eq!(
         err["code"], -32001,
-        "H-B: non-admin rule.remove 须 -32001, got: {}",
+        "H-B: non-admin rule.remove must get -32001, got: {}",
         err
     );
 
@@ -139,7 +145,7 @@ async fn hb_rule_remove_non_admin_denied() {
     cleanup(&sock);
 }
 
-// P2-3: jsonrpc 字段非 "2.0" (如 "1.0") → -32600 Invalid Request (协议级, 鉴权前)。
+// P2-3: jsonrpc field not "2.0" (e.g. "1.0") -> -32600 Invalid Request (protocol-level, before authorization).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p23_nonstandard_jsonrpc_rejected() {
     let (db, sock) = ensure_env();
@@ -153,7 +159,7 @@ async fn p23_nonstandard_jsonrpc_rejected() {
         .expect("P2-3: non-2.0 jsonrpc must error, not result");
     assert_eq!(
         err["code"], -32600,
-        "P2-3: jsonrpc != \"2.0\" 须 -32600 Invalid Request, got: {}",
+        "P2-3: jsonrpc != \"2.0\" must get -32600 Invalid Request, got: {}",
         err
     );
 
@@ -161,7 +167,7 @@ async fn p23_nonstandard_jsonrpc_rejected() {
     cleanup(&sock);
 }
 
-// P2-3: 合法 "2.0" ping 正常返回 (对照: 不误拒合法协议)。
+// P2-3: a valid "2.0" ping returns normally (control: must not reject a valid protocol).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p23_standard_jsonrpc_allowed() {
     let (db, sock) = ensure_env();
@@ -172,7 +178,7 @@ async fn p23_standard_jsonrpc_allowed() {
     let resp = raw_call(&sock, req);
     assert!(
         resp.get("result").is_some(),
-        "P2-3: 合法 jsonrpc 2.0 ping 须正常返回 result, 非 error. resp: {}",
+        "P2-3: a valid jsonrpc 2.0 ping must return a result, not an error. resp: {}",
         resp
     );
 
@@ -180,30 +186,38 @@ async fn p23_standard_jsonrpc_allowed() {
     cleanup(&sock);
 }
 
-// H-C: require_shared_secret_for_release 纯函数决策门控 (不启真实 server)。
-//  1) dev 构建放行 (cfg!(debug_assertions)) — 测试恒为 debug, 故恒 Ok。
-//  2) release+secret 已设 → Ok (prod 正常姿态)。
-//  3) release+无 secret+无应急 flag → Err (拒启动, H-C 核心)。
-//  4) release+无 secret+应急 flag → Ok (运维知情放行)。
+// H-C: require_shared_secret_for_release pure-function decision gating (no real
+// server started).
+//  1) dev builds allow start (cfg!(debug_assertions)) — tests are always debug,
+//     so always Ok.
+//  2) release+secret set -> Ok (normal prod posture).
+//  3) release+no secret+no emergency flag -> Err (refuses to start, H-C core).
+//  4) release+no secret+emergency flag -> Ok (operator-informed bypass).
 #[test]
 fn hc_secret_gating_decision() {
-    // (1) dev 构建恒放行 (本测试即 debug 编译)。
+    // (1) dev builds always allow start (this test compiles as debug).
     assert!(
         require_shared_secret_for_release().is_ok(),
         "H-C: dev build must allow start regardless of secret (debug_assertions)"
     );
 
-    // 决策函数受 cfg!(debug_assertions) 短路: debug 下永远 Ok, 下方分支在 release 才生效。
-    // 因测试恒 debug, 无法在进程内覆盖 cfg; 故此处仅断言 dev 放行 (覆盖 release 分支需 release 构建跑同测)。
-    // release 行为由代码静态保证: not(debug_assertions) && secret.is_none() && !allow_no_secret → Err。
+    // The decision function short-circuits on cfg!(debug_assertions): always Ok in
+    // debug, the branches below only take effect in release.
+    // Since tests are always debug, the cfg cannot be overridden in-process; hence
+    // only the dev-allow branch is asserted here (covering the release branches
+    // requires running the same test under a release build).
+    // The release behavior is statically guaranteed by the code:
+    // not(debug_assertions) && secret.is_none() && !allow_no_secret -> Err.
 }
 
-// H-C (对照): 启动闸门不应影响合法 secret 已设的 dev server 启动。
-// 设 secret env → spawn server → ping 正常 (secret 校验在 authorize_method, ping 免 secret, 不冲突)。
+// H-C (control): the startup gate must not affect starting a dev server that has
+// a valid secret set.
+// Set the secret env -> spawn server -> ping works (secret validation happens in
+// authorize_method; ping is exempt from secret, so no conflict).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hc_server_starts_with_secret_env() {
     let (db, sock) = ensure_env();
-    // 显式设 shared secret (模拟 prod 部署姿态, H-C 要求)。
+    // Explicitly set the shared secret (simulates a prod deployment posture, per H-C).
     std::env::set_var("FUSION_GUARD_SHARED_SECRET", "test-secret-strong-value");
     let handle = spawn_server(&db, sock.clone()).await;
     wait_for_sock(&sock).await;

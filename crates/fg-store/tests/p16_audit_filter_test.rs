@@ -1,16 +1,17 @@
-// P1-6 (audit §3.2): audit.list 过滤 + 游标分页。
-// 旧 handler 仅 tenant_id + limit, 监控只能暴力轮询全量。补 since/until/event_type/level_min
-// 过滤 + 游标分页 → since=<上次末行 ts> 只拉增量。本测直接验证 store 层 list_filtered_page
-// (纯 SQL 过滤, 不依赖套接字, 确定性覆盖各过滤维度 + 游标续拉 + has_more)。
+// P1-6 (audit §3.2): audit.list filters + cursor pagination.
+// The old handler only supported tenant_id + limit, forcing monitors to brute-force poll the full set. Added
+// since/until/event_type/level_min filters + cursor pagination -> since=<last row ts> pulls only the increment.
+// This test verifies the store-level list_filtered_page directly (pure SQL filtering, no socket dependency,
+// deterministic coverage of every filter dimension + cursor continuation + has_more).
 //
-// 插入可控 ts/event_type/risk_level 行 (insert_test_event, test-helpers), 断言:
-//   - since/until 时间窗过滤 (RFC3339 字典序比较)。
-//   - event_type 精确匹配 (只返 evaluate, 排除 confirm)。
-//   - level_min 风险等级下限 (L3+ 过滤掉 L1/L2, json_extract NULL 行排除)。
-//   - 游标分页: limit 截断 + has_more=true + next_cursor 续拉更旧行, 续完 has_more=false。
-//   - 组合过滤: since + level_min + event_type 同时生效。
+// Inserts rows with controlled ts/event_type/risk_level (insert_test_event, test-helpers) and asserts:
+//   - since/until time-window filtering (RFC3339 lexicographic comparison).
+//   - event_type exact match (returns only evaluate, excludes confirm).
+//   - level_min risk-level floor (L3+ filters out L1/L2, json_extract NULL rows excluded).
+//   - Cursor pagination: limit truncation + has_more=true + next_cursor pulls older rows; exhausted -> has_more=false.
+//   - Combined filters: since + level_min + event_type applied simultaneously.
 //
-// 需 test-helpers feature (insert_test_event)。需 FUSION_GUARD_TOKEN_KEY。
+// Requires the test-helpers feature (insert_test_event). Requires FUSION_GUARD_TOKEN_KEY.
 
 use fg_core::{RiskLevel, SafetyAction};
 use fg_store::{AuditListFilter, AuditStore};
@@ -33,7 +34,7 @@ fn temp_db() -> std::path::PathBuf {
     dir.join("guard-p16.db")
 }
 
-// 固定时间锚: 2026-08-27 12:00:00 UTC, 各行隔 10 分钟 (ts 字典序 == 时间序)。
+// Fixed time anchor: 2026-08-27 12:00:00 UTC, rows 10 minutes apart (ts lexicographic order == chronological order).
 fn ts(minute_offset: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-08-27T12:00:00Z")
         .unwrap()
@@ -45,9 +46,9 @@ fn rfc(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339()
 }
 
-// 插入 6 行混合: ts 0..50min, event_type evaluate/confirm, risk L1/L3/L4。
+// Insert 6 mixed rows: ts 0..50min, event_type evaluate/confirm, risk L1/L3/L4.
 fn seed(store: &AuditStore) {
-    // DESC 排序下顺序: ts50 > ts40 > ... > ts0。
+    // DESC order: ts50 > ts40 > ... > ts0.
     store
         .insert_test_event("t1", ts(0), "evaluate", RiskLevel::L1, SafetyAction::Allow)
         .unwrap();
@@ -75,7 +76,7 @@ fn time_window_since_until_filter() {
     let store = AuditStore::open(&db).unwrap();
     seed(&store);
 
-    // since=ts15, until=ts35 → 窗口内 [ts20, ts30], 排除 ts0/10/40/50。
+    // since=ts15, until=ts35 -> in-window [ts20, ts30], excluding ts0/10/40/50.
     let page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         since: Some(&rfc(ts(15))),
@@ -87,11 +88,14 @@ fn time_window_since_until_filter() {
     assert_eq!(
         page.records.len(),
         2,
-        "时间窗内须 2 行 (ts20+ts30), got {}",
+        "time window must keep 2 rows (ts20+ts30), got {}",
         page.records.len()
     );
-    // DESC: ts30 先于 ts20。
-    assert!(page.records[0].ts > page.records[1].ts, "须按 ts DESC 排序");
+    // DESC: ts30 precedes ts20.
+    assert!(
+        page.records[0].ts > page.records[1].ts,
+        "must be sorted ts DESC"
+    );
 
     std::fs::remove_file(&db).ok();
 }
@@ -109,11 +113,11 @@ fn event_type_filter_excludes_confirm() {
         limit: 100,
         ..Default::default()
     });
-    // 6 行中 5 行 evaluate (ts20 是 confirm), 须排除 ts20。
+    // 5 of the 6 rows are evaluate (ts20 is confirm), ts20 must be excluded.
     assert_eq!(
         page.records.len(),
         5,
-        "event_type=evaluate 须 5 行 (排除 confirm), got {}",
+        "event_type=evaluate must keep 5 rows (excluding confirm), got {}",
         page.records.len()
     );
 
@@ -126,7 +130,7 @@ fn event_type_filter_excludes_confirm() {
     assert_eq!(
         page_confirm.records.len(),
         1,
-        "event_type=confirm 须 1 行, got {}",
+        "event_type=confirm must keep 1 row, got {}",
         page_confirm.records.len()
     );
 
@@ -140,8 +144,8 @@ fn level_min_filter_keeps_high_risk_only() {
     let store = AuditStore::open(&db).unwrap();
     seed(&store);
 
-    // level_min=l3 → risk >= L3: ts10(L3), ts20(L3 confirm), ts30(L4), ts50(L3) = 4 行。
-    // 排除 ts0(L1), ts40(L2)。
+    // level_min=l3 -> risk >= L3: ts10(L3), ts20(L3 confirm), ts30(L4), ts50(L3) = 4 rows.
+    // Excludes ts0(L1), ts40(L2).
     let page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         level_min: Some("l3"),
@@ -151,11 +155,11 @@ fn level_min_filter_keeps_high_risk_only() {
     assert_eq!(
         page.records.len(),
         4,
-        "level_min=l3 须 4 行 (L3+L4), 排除 L1/L2, got {}",
+        "level_min=l3 must keep 4 rows (L3+L4), excluding L1/L2, got {}",
         page.records.len()
     );
 
-    // level_min=l4 → 仅 ts30(L4) = 1 行。
+    // level_min=l4 -> only ts30(L4) = 1 row.
     let page_l4 = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         level_min: Some("l4"),
@@ -165,11 +169,11 @@ fn level_min_filter_keeps_high_risk_only() {
     assert_eq!(
         page_l4.records.len(),
         1,
-        "level_min=l4 须 1 行 (仅 L4), got {}",
+        "level_min=l4 must keep 1 row (L4 only), got {}",
         page_l4.records.len()
     );
 
-    // level_min 大写兼容 → 同小写结果。
+    // level_min uppercase compatibility -> same result as lowercase.
     let page_upper = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         level_min: Some("L3"),
@@ -179,7 +183,7 @@ fn level_min_filter_keeps_high_risk_only() {
     assert_eq!(
         page_upper.records.len(),
         4,
-        "level_min 大写须与小写同效, got {}",
+        "level_min uppercase must behave identically to lowercase, got {}",
         page_upper.records.len()
     );
 
@@ -193,19 +197,22 @@ fn cursor_pagination_walks_all_pages() {
     let store = AuditStore::open(&db).unwrap();
     seed(&store);
 
-    // limit=2: 第 1 页 2 行 (ts50, ts40) + has_more + next_cursor。
+    // limit=2: page 1 holds 2 rows (ts50, ts40) + has_more + next_cursor.
     let mut page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         limit: 2,
         ..Default::default()
     });
-    assert_eq!(page.records.len(), 2, "第 1 页须 2 行");
-    assert!(page.has_more, "6 行 limit=2 须 has_more");
-    let cursor1 = page.next_cursor.clone().expect("有更多须返 next_cursor");
-    assert_eq!(page.records[0].ts, ts(50), "DESC 首行须 ts50");
-    assert_eq!(page.records[1].ts, ts(40), "DESC 次行须 ts40");
+    assert_eq!(page.records.len(), 2, "page 1 must hold 2 rows");
+    assert!(page.has_more, "6 rows with limit=2 must set has_more");
+    let cursor1 = page
+        .next_cursor
+        .clone()
+        .expect("has_more must return next_cursor");
+    assert_eq!(page.records[0].ts, ts(50), "DESC first row must be ts50");
+    assert_eq!(page.records[1].ts, ts(40), "DESC second row must be ts40");
 
-    // 解码 cursor1 续拉第 2 页 (ts30, ts20)。
+    // Decode cursor1 to continue with page 2 (ts30, ts20).
     let (cts, cid) = decode_cursor(&cursor1);
     page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
@@ -214,12 +221,12 @@ fn cursor_pagination_walks_all_pages() {
         limit: 2,
         ..Default::default()
     });
-    assert_eq!(page.records.len(), 2, "第 2 页须 2 行");
-    assert!(page.has_more, "仍有 2 行未拉, 须 has_more");
+    assert_eq!(page.records.len(), 2, "page 2 must hold 2 rows");
+    assert!(page.has_more, "2 rows remain unpulled, must set has_more");
     assert_eq!(page.records[0].ts, ts(30));
     assert_eq!(page.records[1].ts, ts(20));
 
-    // 第 3 页 (ts10, ts0) → has_more=false。
+    // Page 3 (ts10, ts0) -> has_more=false.
     let cursor2 = page.next_cursor.clone().unwrap();
     let (cts2, cid2) = decode_cursor(&cursor2);
     page = store.list_filtered_page(&AuditListFilter {
@@ -229,9 +236,12 @@ fn cursor_pagination_walks_all_pages() {
         limit: 2,
         ..Default::default()
     });
-    assert_eq!(page.records.len(), 2, "第 3 页须 2 行");
-    assert!(!page.has_more, "末页须 has_more=false");
-    assert!(page.next_cursor.is_none(), "末页须无 next_cursor");
+    assert_eq!(page.records.len(), 2, "page 3 must hold 2 rows");
+    assert!(!page.has_more, "last page must have has_more=false");
+    assert!(
+        page.next_cursor.is_none(),
+        "last page must have no next_cursor"
+    );
     assert_eq!(page.records[0].ts, ts(10));
     assert_eq!(page.records[1].ts, ts(0));
 
@@ -246,9 +256,9 @@ fn combined_filters_since_level_event_type() {
     seed(&store);
 
     // since=ts15 + event_type=evaluate + level_min=l3:
-    // 全 6 行 → since 排除 ts0/10 (ts<15) → [ts20,30,40,50]
-    // → event_type=evaluate 排除 ts20(confirm) → [ts30,40,50]
-    // → level_min=l3 排除 ts40(L2) → [ts30(L4), ts50(L3)] = 2 行。
+    // all 6 rows -> since excludes ts0/10 (ts<15) -> [ts20,30,40,50]
+    // -> event_type=evaluate excludes ts20(confirm) -> [ts30,40,50]
+    // -> level_min=l3 excludes ts40(L2) -> [ts30(L4), ts50(L3)] = 2 rows.
     let page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         since: Some(&rfc(ts(15))),
@@ -260,11 +270,11 @@ fn combined_filters_since_level_event_type() {
     assert_eq!(
         page.records.len(),
         2,
-        "组合过滤 (since+event_type+level_min) 须 2 行 (ts30+ts50), got {}",
+        "combined filters (since+event_type+level_min) must keep 2 rows (ts30+ts50), got {}",
         page.records.len()
     );
-    assert_eq!(page.records[0].ts, ts(50), "DESC 首 ts50");
-    assert_eq!(page.records[1].ts, ts(30), "DESC 次 ts30");
+    assert_eq!(page.records[0].ts, ts(50), "DESC first is ts50");
+    assert_eq!(page.records[1].ts, ts(30), "DESC second is ts30");
 
     std::fs::remove_file(&db).ok();
 }
@@ -276,7 +286,7 @@ fn empty_filter_returns_all_desc() {
     let store = AuditStore::open(&db).unwrap();
     seed(&store);
 
-    // 无过滤 (仅 tenant + 大 limit) → 全 6 行 DESC。
+    // No filter (tenant + large limit only) -> all 6 rows DESC.
     let page = store.list_filtered_page(&AuditListFilter {
         tenant_id: Some("t1"),
         limit: 100,
@@ -285,19 +295,22 @@ fn empty_filter_returns_all_desc() {
     assert_eq!(
         page.records.len(),
         6,
-        "无过滤须全 6 行, got {}",
+        "no filter must return all 6 rows, got {}",
         page.records.len()
     );
     assert!(!page.has_more);
-    // DESC 序: ts50..ts0。
+    // DESC order: ts50..ts0.
     for i in 0..5 {
-        assert!(page.records[i].ts > page.records[i + 1].ts, "须严格 DESC");
+        assert!(
+            page.records[i].ts > page.records[i + 1].ts,
+            "must be strictly DESC"
+        );
     }
 
     std::fs::remove_file(&db).ok();
 }
 
-// cursor 编码 "ts\x1faudit_id" → 解双键。
+// Cursor is encoded "ts\x1faudit_id" -> decode both keys.
 fn decode_cursor(c: &str) -> (String, String) {
     let mut parts = c.splitn(2, '\x1f');
     let ts = parts.next().unwrap_or("").to_string();

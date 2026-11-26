@@ -1,11 +1,14 @@
-// Stage 3 语义分析 (PRD §7.4 R5) — tree-sitter 多 grammar 代码内容扫描
+// Stage 3 semantic analysis (PRD §7.4 R5) — tree-sitter multi-grammar code content scanning
 //
-// 仅在 feature = "semantic" 启用 (MVP 默认关, PRD §7.4 "需时再引且锁版本")。
-// 命令类鉴权已由 Stage 2 shell-words 覆盖; 本阶段扫代码内容 (非命令), 检危险调用:
+// Enabled only when feature = "semantic" (off by default in MVP, PRD §7.4
+// "adopt when needed with locked versions").
+// Command-style authorization is already covered by Stage 2 shell-words; this
+// stage scans code content (not commands) for dangerous calls:
 //   Python: os.system / subprocess.* / eval / exec / __import__ / pickle.loads
-//   JS/TS:  eval / Function / child_process / fetch 外泄
+//   JS/TS:  eval / Function / child_process / fetch exfiltration
 //   Rust:   Command::new / std::process::Command / unsafe / fs::remove_dir_all
-// 版本锁与 fusion-executor workspace 一致 (tree-sitter 0.25, grammars 0.23), 防 grammar 漂移。
+// Versions locked to match the fusion-executor workspace (tree-sitter 0.25,
+// grammars 0.23) to prevent grammar drift.
 
 #![cfg(feature = "semantic")]
 
@@ -14,15 +17,19 @@ use tree_sitter::{Node, Parser};
 
 use crate::tokenizer::TokenHit;
 
-// ── 危险调用表 (per-language) ─────────────────────────────────────────
-// 函数名前缀匹配 (语义扫描按调用表达式 callee 名命中)
+// ── Danger call tables (per-language) ────────────────────────────────
+// Matched by function name (semantic scan hits by call-expression callee name).
 //
-// A9 SSOT: 这些表是语义阶段的唯一真相源。原 semantic_default_rules() 产出 6 条
-// stage=Semantic GuardRule 注入规则集 (持久 SQLite), 但 evaluate 跳过非 Regex stage,
-// 从不编译从不匹配 —— 死代码。两真相源解耦: admin 删 "semantic:py:os.system" 规则期望
-// 禁用 os.system 检测, 实际语义扫描仍经 PY_DANGER_L4 命中, 违 Checkpoint 2 SSOT。
-// 修 (b): 删 semantic_default_rules, 本表为语义执行权威, 非 admin 可变 (文档化)。
-// 调用方经 guard.rule.list 仅见 Regex 规则, 语义检测能力固定。
+// A9 SSOT: these tables are the single source of truth for the semantic stage.
+// The former semantic_default_rules() emitted 6 stage=Semantic GuardRules into
+// the ruleset (persisted to SQLite), but evaluate skips non-Regex stages and
+// never compiled or matched them — dead code. Two decoupled sources of truth:
+// an admin deleting the "semantic:py:os.system" rule expects to disable
+// os.system detection, yet the semantic scan still hits via PY_DANGER_L4,
+// violating the Checkpoint 2 SSOT.
+// Fix (b): removed semantic_default_rules; these tables are the semantic-stage
+// enforcement authority and are not admin-mutable (documented).
+// Callers only see Regex rules via guard.rule.list; semantic detection is fixed.
 
 const PY_DANGER_L4: &[&str] = &[
     "os.system",
@@ -88,34 +95,50 @@ impl SemanticHit {
     }
 }
 
-// ── 入口: 多 grammar 尝试 ────────────────────────────────────────────
-// C4: 不因 has_error 短路清零真实命中 (tree-sitter 错误恢复解析器, 危险节点仍在树中)。
-// C5 引入跨语言裸命中风险 (eval/exec/compile 在 Python+JS 都触发): `const x=eval('1')`
-// 在 Python grammar 下也命中 eval, 但 Python grammar 报错 (const 非法)。
-// 决策: 优先采信"无解析错误"的 grammar 命中 (源语言确证); 若全 grammar 都有错, 才采信首个
-// 非空命中 (C4 — 有错仍有真实危险调用如 os.system("rm -rf /") 中注入语法错)。
-// 全部零命中 + 全部报错 → 追加 L2 parse-error (不静默 clean); 否则 clean。
+// ── Entry: multi-grammar attempt ─────────────────────────────────────
+// C4: never zero out real hits because of has_error (tree-sitter is an
+// error-recovering parser; dangerous nodes remain in the tree).
+// C5 introduced a cross-language bare-hit risk (eval/exec/compile fire in both
+// Python and JS): `const x=eval('1')` also hits eval under the Python grammar,
+// but the Python grammar reports an error (const is invalid).
+// Decision: prefer hits from the grammar with no parse errors (source language
+// confirmed); only if every grammar errors, fall back to the first non-empty
+// hit set (C4 — an errored source can still contain a real dangerous call, e.g.
+// a syntax error injected into os.system("rm -rf /")).
+// All-zero hits + all errors -> append an L2 parse-error hit (never a silent
+// clean); otherwise clean.
 
-// P2-1 (audit §P2-1): 语义扫描输入上限 + 语言启发式门控, 防 tree-sitter 多 grammar 大输入突破 SLA。
+// P2-1 (audit §P2-1): semantic scan input cap + language heuristic gating, to
+// stop tree-sitter multi-grammar parsing of large inputs from blowing the SLA.
 //
-// 问题: 原实现无脑全试 4 grammar (Python/JS/TS/Rust)。clean Python 源经 3 个非原生 grammar
-// 错误恢复解析 (tree-sitter 错恢复超线性), 256KB → 27s, 远超 2s SLA (PRD R1)。
+// Problem: the original implementation blindly tried all 4 grammars
+// (Python/JS/TS/Rust). Clean Python source went through 3 non-native grammars
+// with error-recovery parsing (superlinear in tree-sitter), so 256KB took 27s —
+// far beyond the 2s SLA (PRD R1).
 //
-// 两道防线:
-//   (1) 输入硬上限 SEMANTIC_INPUT_CAP —— 超出 fail-open 降级 (regex/tokenizer 仍扫), L2 提示审计可见。
-//   (2) 语言启发式 guess_grammars —— 按首行/关键字猜源语言, 只试候选 grammar (通常 1 个),
-//       省 3/4 解析。clean 源最坏 1× 解析。无启发命中 → fallback 全 4 (由 cap 卡界, 罕见)。
+// Two lines of defense:
+//   (1) Hard input cap SEMANTIC_INPUT_CAP — exceeding it degrades fail-open
+//       (regex/tokenizer still scan); an L2 hint keeps it audit-visible.
+//   (2) Language heuristic guess_grammars — guesses the source language from
+//       leading lines/keywords and only tries candidate grammars (usually 1),
+//       saving 3/4 of the parsing. Clean source parses at worst 1x. No
+//       heuristic hit -> fall back to all 4 (bounded by the cap, rare).
 //
-// 保 C4 (有错源仍检真实危险调用) + C5 (跨语言裸命中, 如 JS const+eval 不误作 Python): 候选按
-// 确证优先 —— 无错 grammar 命中 > 无错零命中 > err+非空命中兜底 > 全错 L2 parse-error。
+// Preserves C4 (errored sources still get real dangerous calls detected) and
+// C5 (cross-language bare hits, e.g. JS const+eval not mistaken for Python):
+// candidates are confirmation-ordered — no-error grammar hits > no-error zero
+// hits > err + non-empty hits fallback > all-error L2 parse-error.
 pub const SEMANTIC_INPUT_CAP: usize = 256 * 1024;
 
-// P2-1: 语言启发式 —— 扫首 ~2KB + 整体特征关键字, 返回候选 grammar 顺序 (高确证在前)。
-// 关键字取各语言强特征 (互斥度高的语法关键字), 避 JS grammar 贪婪吃 Rust 源 (const/let 共用)。
+// P2-1: language heuristic — scans the first ~2KB plus whole-content keyword
+// features, returning candidate grammars ordered (highest confidence first).
+// Keywords are strong per-language features (highly mutually exclusive syntax
+// keywords), avoiding the JS grammar greedily consuming Rust source (const/let
+// are shared).
 fn guess_grammars(content: &str) -> Vec<&'static str> {
     let head: String = content.chars().take(2048).collect();
     let full = content;
-    // Rust 强特征: use/fn/pub fn/let mut/impl/struct/unsafe/mod/extern/-> 类型签名。
+    // Strong Rust features: use/fn/pub fn/let mut/impl/struct/unsafe/mod/extern/-> type signatures.
     let rust = head.contains("fn ")
         || head.contains("::")
         || head.contains("let mut")
@@ -123,14 +146,14 @@ fn guess_grammars(content: &str) -> Vec<&'static str> {
         || head.contains("impl ")
         || head.contains("extern ")
         || (head.contains("use ") && head.contains("::"));
-    // Python 强特征: def /import/from/elif/None/True/False/lambda/dunder。
+    // Strong Python features: def /import/from/elif/None/True/False/lambda/dunder.
     let python = head.contains("\ndef ")
         || head.starts_with("def ")
         || head.contains("import ")
         || head.contains("elif ")
         || head.contains("lambda ")
         || full.contains("__name__");
-    // JS/TS 特征: require(/console./const .*=require/=>/function( (TS 加 : 类型)。
+    // JS/TS features: require(/console./const .*=require/=>/function( (TS adds : types).
     let jsts = head.contains("require(")
         || head.contains("console.")
         || head.contains("=>")
@@ -153,7 +176,7 @@ fn guess_grammars(content: &str) -> Vec<&'static str> {
         out.push("js");
     }
     if out.is_empty() {
-        // 无启发命中 → 全 4 (fallback, 由 SEMANTIC_INPUT_CAP 卡界, 模糊源兜底)。
+        // No heuristic hit -> all 4 (fallback, bounded by SEMANTIC_INPUT_CAP, for ambiguous sources).
         out.extend_from_slice(&["python", "js", "ts", "rust"]);
     }
     out
@@ -174,7 +197,8 @@ pub fn semantic_check(content: &str) -> Vec<SemanticHit> {
     if trimmed.is_empty() {
         return Vec::new();
     }
-    // P2-1 防线 1: 输入超上限 → 跳过 tree-sitter 解析, fail-open 降级 (regex/tokenizer 仍扫)。
+    // P2-1 defense 1: input over the cap -> skip tree-sitter parsing, degrade
+    // fail-open (regex/tokenizer still scan).
     if trimmed.len() > SEMANTIC_INPUT_CAP {
         tracing::warn!(
             input_bytes = trimmed.len(),
@@ -186,14 +210,15 @@ pub fn semantic_check(content: &str) -> Vec<SemanticHit> {
             callee: "<input-too-large>".into(),
             risk: RiskLevel::L2,
             reason: format!(
-                "语义扫描输入超上限 ({}>{}, 降级跳过, regex/tokenizer 仍扫)",
+                "semantic scan input exceeds cap ({}>{}, degraded and skipped, regex/tokenizer still scan)",
                 trimmed.len(),
                 SEMANTIC_INPUT_CAP
             ),
             stage: CheckStage::Semantic,
         }];
     }
-    // P2-1 防线 2: 语言启发式门控, 只试候选 grammar (通常 1 个), 省 3/4 解析。
+    // P2-1 defense 2: language heuristic gating, only tries candidate grammars
+    // (usually 1), saving 3/4 of the parsing.
     let langs = guess_grammars(trimmed);
     let mut err_hit: Option<Vec<SemanticHit>> = None;
     let mut any_clean_empty = false;
@@ -201,17 +226,20 @@ pub fn semantic_check(content: &str) -> Vec<SemanticHit> {
         let (hits, had_error) = scan_by_lang(lang, trimmed);
         if !had_error {
             if !hits.is_empty() {
-                // 无错 + 非空命中 = 源语言确证 + 真实危险 (C5 最高优先), 立即返。
+                // No error + non-empty hits = source language confirmed + real
+                // danger (C5, highest priority); return immediately.
                 return hits;
             }
-            // 无错 + 零命中: 正确语言且安全, 记为候选 (余下候选仍试, 查有无更优 clean+hits)。
+            // No error + zero hits: correct language and safe; keep as a
+            // candidate (remaining candidates still tried for a better clean+hits).
             any_clean_empty = true;
         } else if !hits.is_empty() && err_hit.is_none() {
-            // 有错 + 非空: C4 兜底 (有错源仍检真实危险调用如 os.system 注入)。
+            // Error + non-empty: C4 fallback (errored sources still get real
+            // dangerous calls detected, e.g. an injected os.system).
             err_hit = Some(hits);
         }
     }
-    // 优先级: clean_empty (正确语言零命中) > err_hit (C4 兜底) > all-error L2 parse-error。
+    // Priority: clean_empty (correct language, zero hits) > err_hit (C4 fallback) > all-error L2 parse-error.
     if any_clean_empty {
         return Vec::new();
     }
@@ -222,15 +250,17 @@ pub fn semantic_check(content: &str) -> Vec<SemanticHit> {
         language: "unknown",
         callee: "<parse-error>".into(),
         risk: RiskLevel::L2,
-        reason: "源含解析错误, 语义扫描可能不完整 (C4)".into(),
+        reason: "source contains parse errors, semantic scan may be incomplete (C4)".into(),
         stage: CheckStage::Semantic,
     }]
 }
 
 // ── Python ───────────────────────────────────────────────────────────
 
-// scan_* 返回 (危险命中, had_error)。had_error 仅作 grammar 回退决策, 不在此追加 L2。
-// L2 parse-error hit 由 semantic_check 统一在"全 grammar 零命中且全报错"时追加。
+// scan_* returns (dangerous hits, had_error). had_error only drives grammar
+// fallback decisions; no L2 is appended here.
+// The L2 parse-error hit is appended uniformly by semantic_check when all
+// grammars return zero hits and all errored.
 
 fn scan_python(code: &str) -> (Vec<SemanticHit>, bool) {
     let mut parser = Parser::new();
@@ -244,12 +274,16 @@ fn scan_python(code: &str) -> (Vec<SemanticHit>, bool) {
         Some(t) => t,
         None => return (Vec::new(), true),
     };
-    // C4: 不因 root has_error 短路。tree-sitter 是错误恢复解析器, 危险调用节点仍在树中
-    // 可遍历。注入一个语法错误不应让 os.system("rm -rf /") 整文件静默 clean。
+    // C4: do not short-circuit on root has_error. tree-sitter is an
+    // error-recovering parser; dangerous call nodes remain traversable in the
+    // tree. One injected syntax error must not silence
+    // os.system("rm -rf /") for the whole file as clean.
     let had_error = tree.root_node().has_error();
     let mut hits = Vec::new();
-    // C5: Python 专用遍历 —— 收集 import/别名绑定, 用别名解析 callee, 检危险 import +
-    // 动态调度 (getattr/__import__/globals/locals/vars)。非 Python 语言仍走通用 walk_calls。
+    // C5: Python-specific traversal — collect import/alias bindings, resolve
+    // callees through aliases, check dangerous imports + dynamic dispatch
+    // (getattr/__import__/globals/locals/vars). Non-Python languages still use
+    // the generic walk_calls.
     walk_python(code, tree.root_node(), &mut hits);
     (hits, had_error)
 }
@@ -268,7 +302,7 @@ fn scan_javascript(code: &str) -> (Vec<SemanticHit>, bool) {
         Some(t) => t,
         None => return (Vec::new(), true),
     };
-    // C4: 不因 root has_error 短路 (见 scan_python 注释)。
+    // C4: do not short-circuit on root has_error (see scan_python comment).
     let had_error = tree.root_node().has_error();
     let mut hits = Vec::new();
     walk_calls(
@@ -296,7 +330,7 @@ fn scan_typescript(code: &str) -> (Vec<SemanticHit>, bool) {
         Some(t) => t,
         None => return (Vec::new(), true),
     };
-    // C4: 不因 root has_error 短路 (见 scan_python 注释)。
+    // C4: do not short-circuit on root has_error (see scan_python comment).
     let had_error = tree.root_node().has_error();
     let mut hits = Vec::new();
     walk_calls(
@@ -324,7 +358,7 @@ fn scan_rust(code: &str) -> (Vec<SemanticHit>, bool) {
         Some(t) => t,
         None => return (Vec::new(), true),
     };
-    // C4: 不因 root has_error 短路 (见 scan_python 注释)。
+    // C4: do not short-circuit on root has_error (see scan_python comment).
     let had_error = tree.root_node().has_error();
     let mut hits = Vec::new();
     walk_calls(
@@ -338,14 +372,17 @@ fn scan_rust(code: &str) -> (Vec<SemanticHit>, bool) {
     (hits, had_error)
 }
 
-// ── C5: Python 专用遍历 (import/别名/动态调度) ──────────────────────────
-// 三类命中:
-//  1. 危险模块 import 本身 (os/subprocess/ctypes/pickle/marshal) → L3。无论后续是否调用,
-//     导入危险模块即标注 (可执行 RCE 前置)。
-//  2. from <危险模块> import Y → L3 (Y 多为 system/Popen/CDLL 等危险符号)。
-//  3. call_expression: 用别名绑定解析 callee (import os as o → o.system→os.system);
-//     动态调度 getattr/__import__/globals/locals/vars → L3 (无法证明安全)。
-// 别名绑定表: alias 名 → 真实模块路径 (如 "o"→"os", "s"→"os.system")。
+// ── C5: Python-specific traversal (imports/aliases/dynamic dispatch) ──
+// Three hit classes:
+//  1. Importing a dangerous module itself (os/subprocess/ctypes/pickle/marshal)
+//     -> L3. Regardless of whether it is later called, importing a dangerous
+//     module is flagged (an executable RCE prerequisite).
+//  2. from <dangerous module> import Y -> L3 (Y is usually a dangerous symbol
+//     like system/Popen/CDLL).
+//  3. call_expression: resolve callees via alias bindings (import os as o ->
+//     o.system -> os.system); dynamic dispatch getattr/__import__/globals/
+//     locals/vars -> L3 (cannot be proven safe).
+// Alias binding table: alias name -> real module path (e.g. "o"->"os", "s"->"os.system").
 const PY_DANGER_MODULES: &[&str] = &[
     "os",
     "subprocess",
@@ -379,7 +416,7 @@ fn walk_python_node(
 ) {
     let kind = node.kind();
 
-    // import 语句: import os / import os as o / import os.path as p
+    // import statement: import os / import os as o / import os.path as p
     if kind == "import_statement" {
         collect_import_statement(code, node, aliases, out);
     }
@@ -388,7 +425,8 @@ fn walk_python_node(
         collect_import_from(code, node, aliases, out);
     }
 
-    // call: 别名解析 + 动态调度检测。tree-sitter-python 调用节点 kind = "call" (非 call_expression)。
+    // call: alias resolution + dynamic dispatch detection. The
+    // tree-sitter-python call node kind is "call" (not call_expression).
     if kind == "call" || kind == "call_expression" {
         if let Some(callee_node) = node.child_by_field_name("function") {
             let callee = callee_node
@@ -413,23 +451,25 @@ fn walk_python_node(
     }
 }
 
-// import os → alias "os"→"os", 危险模块即 L3 hit。
-// import os as o → alias "o"→"os"。
-// import os.path → alias "os"→"os" (顶层模块)。import os.path as p → "p"→"os.path"。
+// import os -> alias "os"->"os"; a dangerous module is an immediate L3 hit.
+// import os as o -> alias "o"->"os".
+// import os.path -> alias "os"->"os" (top-level module). import os.path as p -> "p"->"os.path".
 fn collect_import_statement(
     code: &str,
     node: Node,
     aliases: &mut std::collections::HashMap<String, String>,
     out: &mut Vec<SemanticHit>,
 ) {
-    // tree-sitter-python: import_statement 下含 dotted_name + 可选 aliased_import。
-    // 简健做法: 取整段源文本, 解析 "import X[.Y][ as A]" 与逗号多目标。
+    // tree-sitter-python: import_statement contains dotted_name + optional
+    // aliased_import.
+    // Simple robust approach: take the whole source text segment and parse
+    // "import X[.Y][ as A]" with comma-separated targets.
     let text = node.utf8_text(code.as_bytes()).unwrap_or("");
     parse_import_text(text, aliases, out, false);
 }
 
-// from os import system → alias "system"→"os.system"; X 危险 → L3。
-// from os import system as s → "s"→"os.system"。
+// from os import system -> alias "system"->"os.system"; dangerous X -> L3.
+// from os import system as s -> "s"->"os.system".
 fn collect_import_from(
     code: &str,
     node: Node,
@@ -440,8 +480,9 @@ fn collect_import_from(
     parse_import_text(text, aliases, out, true);
 }
 
-// 文本级解析 import 语句 (tree-sitter field 跨 grammar 版本不稳, 文本解析更健)。
-// is_from=true → from X import Y[, Z] 形式。
+// Text-level parsing of import statements (tree-sitter fields are unstable
+// across grammar versions; text parsing is more robust).
+// is_from=true -> the from X import Y[, Z] form.
 fn parse_import_text(
     text: &str,
     aliases: &mut std::collections::HashMap<String, String>,
@@ -463,11 +504,11 @@ fn parse_import_text(
                 language: "python",
                 callee: format!("from {module} import"),
                 risk: RiskLevel::L3,
-                reason: format!("python 从危险模块 {} 导入 (C5)", module),
+                reason: format!("python import from dangerous module {} (C5)", module),
                 stage: CheckStage::Semantic,
             });
         }
-        // 每个 Y [as A] → alias
+        // Each Y [as A] -> alias
         for item in names.split(',') {
             let item = item.trim();
             let segs: Vec<&str> = item.split_whitespace().collect();
@@ -510,7 +551,7 @@ fn parse_import_text(
                     language: "python",
                     callee: format!("import {dotted}"),
                     risk: RiskLevel::L3,
-                    reason: format!("python 导入危险模块 {} (C5)", top),
+                    reason: format!("python imports dangerous module {} (C5)", top),
                     stage: CheckStage::Semantic,
                 });
             }
@@ -521,32 +562,35 @@ fn parse_import_text(
     }
 }
 
-// Python callee 分类: 先别名解析 (o.system → os.system), 再查危险表 + 动态调度。
+// Python callee classification: resolve aliases first (o.system -> os.system),
+// then check the danger tables + dynamic dispatch.
 fn classify_python(
     callee: &str,
     aliases: &std::collections::HashMap<String, String>,
     out: &mut Vec<SemanticHit>,
 ) {
-    // 动态调度: getattr/__import__/globals/locals/vars → L3 (无法证明安全)。
-    // 同时 eval/exec/compile 本就是 PY_DANGER_L3, 这里显式标 reason。
+    // Dynamic dispatch: getattr/__import__/globals/locals/vars -> L3 (cannot be
+    // proven safe). eval/exec/compile are already in PY_DANGER_L3; the reason
+    // is labeled explicitly here.
     if PY_DYNAMIC_DISPATCH.contains(&callee) {
         out.push(SemanticHit {
             language: "python",
             callee: callee.to_string(),
             risk: RiskLevel::L3,
-            reason: format!("python 动态调度/反射调用 (C5): {}", callee),
+            reason: format!("python dynamic dispatch/reflection call (C5): {}", callee),
             stage: CheckStage::Semantic,
         });
         return;
     }
-    // 别名解析: 取 callee 第一段 (点前) 查 alias, 重写为真实路径。
+    // Alias resolution: look up the callee's first segment (before the dot) in
+    // the alias table and rewrite to the real path.
     let resolved = resolve_alias(callee, aliases);
     if danger_match(&resolved, PY_DANGER_L4) {
         out.push(SemanticHit {
             language: "python",
             callee: resolved.clone(),
             risk: RiskLevel::L4,
-            reason: format!("python 危险调用 (L4, 别名解析): {}", resolved),
+            reason: format!("python dangerous call (L4, alias-resolved): {}", resolved),
             stage: CheckStage::Semantic,
         });
         return;
@@ -556,14 +600,15 @@ fn classify_python(
             language: "python",
             callee: resolved.clone(),
             risk: RiskLevel::L3,
-            reason: format!("python 危险调用 (L3, 别名解析): {}", resolved),
+            reason: format!("python dangerous call (L3, alias-resolved): {}", resolved),
             stage: CheckStage::Semantic,
         });
     }
 }
 
-// callee "o.system" → alias "o"→"os" → "os.system"。
-// alias 表存顶层模块名, callee 第一段查表替换。
+// callee "o.system" -> alias "o"->"os" -> "os.system".
+// The alias table stores top-level module names; the callee's first segment is
+// looked up and replaced.
 fn resolve_alias(callee: &str, aliases: &std::collections::HashMap<String, String>) -> String {
     let first = callee.split('.').next().unwrap_or(callee);
     if let Some(real) = aliases.get(first) {
@@ -580,9 +625,10 @@ fn danger_match(callee: &str, table: &[&str]) -> bool {
     table.contains(&callee)
 }
 
-// ── 通用调用表达式遍历 ────────────────────────────────────────────────
-// tree-sitter 各 grammar 的 call node kind: call_expression (py/js/ts),
-// rust 的 call_expression (method/call). callee 文本取调用目标源码片段。
+// ── Generic call-expression traversal ────────────────────────────────
+// Call node kinds across tree-sitter grammars: call_expression (py/js/ts),
+// rust call_expression (method/call). The callee text is the source snippet of
+// the call target.
 fn walk_calls(
     code: &str,
     node: Node,
@@ -608,7 +654,7 @@ fn recurse_walk(
         let kind = node.kind();
         if kind == "call_expression" || kind == "call" {
             if let Some(callee_node) = node.child_by_field_name("function").or_else(|| {
-                // rust grammar 无 function field, 取首非标点子节点
+                // rust grammar has no function field; take the first non-punctuation child
                 node.named_child(0)
             }) {
                 let callee = callee_node
@@ -640,14 +686,15 @@ fn classify(
     danger_l4: &[&str],
     danger_l3: &[&str],
 ) -> Option<SemanticHit> {
-    // C5: 删 ends_with(":{d}") 死逻辑 — 匹配 foo:os.system 这类非法 Python 属性,
-    // 永不命中真实代码, 仅增噪音。改为精确全等。
+    // C5: removed the ends_with(":{d}") dead logic — it matched invalid Python
+    // attributes like foo:os.system, never hit real code, and only added noise.
+    // Replaced with exact equality.
     if danger_l4.contains(&callee) {
         return Some(SemanticHit {
             language: lang,
             callee: callee.to_string(),
             risk: RiskLevel::L4,
-            reason: format!("{} 危险调用 (L4): {}", lang, callee),
+            reason: format!("{} dangerous call (L4): {}", lang, callee),
             stage: CheckStage::Semantic,
         });
     }
@@ -656,7 +703,7 @@ fn classify(
             language: lang,
             callee: callee.to_string(),
             risk: RiskLevel::L3,
-            reason: format!("{} 危险调用 (L3): {}", lang, callee),
+            reason: format!("{} dangerous call (L3): {}", lang, callee),
             stage: CheckStage::Semantic,
         });
     }

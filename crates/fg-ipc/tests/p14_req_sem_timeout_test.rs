@@ -1,15 +1,21 @@
-// P1-4 (audit §2.3): permit 等待与 handler 超时分离。
-// 旧码 req_sem.acquire_owned().await 嵌在 2s handler timeout future 内 → permit 排队
-// 偷占业务预算。修复: permit 单独 500ms 等待 (PERMIT_TIMEOUT_MS), 拿不到 → -32002 即拒;
-// 拿到后 2s (REQ_TIMEOUT_SECS) 全程给 handler。
+// P1-4 (audit §2.3): permit waiting is separated from the handler timeout.
+// The old code nested req_sem.acquire_owned().await inside the 2s handler timeout
+// future, so permit queueing stole from the business budget. Fix: the permit gets
+// its own 500ms wait (PERMIT_TIMEOUT_MS); failing to obtain one -> immediate
+// rejection with -32002; once obtained, the full 2s (REQ_TIMEOUT_SECS) goes to the
+// handler.
 //
-// 确定性策略 (test-helpers): new_with_req_permits(1) 建单槽服务端, 预取并持有那 1 个 permit,
-// 后续请求必然走 permit 等待 → 500ms 超时 → -32002。无需真实慢 handler, 无时序竞态。
+// Deterministic strategy (test-helpers): new_with_req_permits(1) builds a
+// single-slot server; the test pre-acquires and holds that 1 permit, so the next
+// request necessarily goes through permit waiting -> 500ms timeout -> -32002.
+// No real slow handler needed, no timing races.
 //
-// 验证两点:
-//   1) permit 等满 → -32002 (非 -32010 timeout, 非 2s 等满)。
-//   2) 拒绝快速返回 (< 2s handler 预算, 实测 < 1s), 证 permit 超时独立短于 handler。
-// 隔离 env: 独立 SOCK + DATA_DIR + TOKEN_KEY。需 test-helpers feature。
+// Verifies two things:
+//   1) permit exhausted -> -32002 (not -32010 timeout, not waiting the full 2s).
+//   2) The rejection returns fast (< 2s handler budget, measured < 1s), proving
+//      the permit timeout is independently shorter than the handler's.
+// Isolated env: dedicated SOCK + DATA_DIR + TOKEN_KEY. Requires the test-helpers
+// feature.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -45,13 +51,14 @@ fn ensure_env() -> (PathBuf, PathBuf) {
     (db, sock)
 }
 
-// 单槽服务端: 预取并持有唯一 permit → 下一个请求走 permit 等待 → 500ms 超时 → -32002。
+// Single-slot server: pre-acquire and hold the sole permit -> the next request
+// goes through permit waiting -> 500ms timeout -> -32002.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn permit_wait_timeout_returns_rate_limit_fast() {
     let (db, sock) = ensure_env();
     let store = Arc::new(AuditStore::open(&db).unwrap());
     let engine = fg_audit_engine::AuditEngine::new(store.clone()).unwrap();
-    // 单槽: 只 1 个 req permit。
+    // Single slot: only 1 req permit.
     let server = IpcServer::new_with_req_permits(engine, store, 1);
     let sem = server.req_sem_handle();
     let serve_sock = sock.clone();
@@ -62,7 +69,7 @@ async fn permit_wait_timeout_returns_rate_limit_fast() {
         }
     });
 
-    // 等套接字出现。
+    // Wait for the socket to appear.
     for _ in 0..100 {
         if sock.exists() {
             break;
@@ -75,9 +82,10 @@ async fn permit_wait_timeout_returns_rate_limit_fast() {
         sock.display()
     );
 
-    // 预取并持有唯一 permit → 服务端 req_sem 空, 任何请求走 permit 等待。
+    // Pre-acquire and hold the sole permit -> the server's req_sem is empty, any
+    // request goes through permit waiting.
     let held = sem.acquire_owned().await.expect("acquire sole permit");
-    // 给 accept 循环一点时间就绪。
+    // Give the accept loop a moment to become ready.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut stream = UnixStream::connect(&sock).unwrap();
@@ -87,27 +95,33 @@ async fn permit_wait_timeout_returns_rate_limit_fast() {
     stream.write_all(req).unwrap();
     stream.flush().unwrap();
 
-    // 计时: permit 等待应 ~500ms 超时拒, 远 < 2s handler 预算。
+    // Timing: the permit wait should time out and reject at ~500ms, far below the
+    // 2s handler budget.
     let start = Instant::now();
     let mut buf = [0u8; 256];
     let n = stream.read(&mut buf).unwrap_or(0);
     let elapsed = start.elapsed();
 
-    assert!(n > 0, "P1-4: permit 满须收到拒绝帧 (非静默卡死), got n={n}");
+    assert!(
+        n > 0,
+        "P1-4: an exhausted permit must yield a rejection frame (no silent freeze), got n={n}"
+    );
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
         resp.contains(r#""code":-32002"#),
-        "P1-4: permit 超时须返 -32002 (rate limit), 非 -32010 handler timeout, got: {resp}"
+        "P1-4: permit timeout must return -32002 (rate limit), not -32010 handler timeout, got: {resp}"
     );
     assert!(
         resp.contains("rate limited"),
-        "P1-4: 拒绝帧须含 rate limited 消息, got: {resp}"
+        "P1-4: the rejection frame must contain a rate limited message, got: {resp}"
     );
-    // 关键: 拒绝须在 handler 2s 预算之前返回 (permit 超时 500ms, 含网络抖动留余量 < 1.5s)。
-    // 旧码会把 permit 等待算进 2s, 这里若 ≥ 2s 说明分离失效。
+    // Key: the rejection must return before the handler's 2s budget (permit timeout
+    // is 500ms; with network jitter allowance keep it under 1.5s).
+    // The old code counted the permit wait inside the 2s; being >= 2s here means
+    // the separation failed.
     assert!(
         elapsed < Duration::from_secs(2),
-        "P1-4: permit 超时拒绝须快于 2s handler 预算 (分离生效), 实测 {:?}",
+        "P1-4: the permit-timeout rejection must be faster than the 2s handler budget (separation in effect), measured {:?}",
         elapsed
     );
 
@@ -117,7 +131,8 @@ async fn permit_wait_timeout_returns_rate_limit_fast() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// 对照: 释放 permit 后同一 ping 须正常返 pong (证 -32002 是 permit 满专属, 非误拒全部)。
+// Control: after the permit is released, the same ping must return pong normally
+// (proves -32002 is specific to an exhausted permit, not a blanket rejection).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn permit_available_serves_normally() {
     let (db, sock) = ensure_env();
@@ -139,7 +154,7 @@ async fn permit_available_serves_normally() {
     }
     assert!(sock.exists());
 
-    // 不预取 permit → 服务端两槽空闲 → ping 正常服务。
+    // No permit pre-acquired -> both server slots idle -> ping is served normally.
     let mut stream = UnixStream::connect(&sock).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"guard.ping\",\"params\":{}}\n";
@@ -148,15 +163,15 @@ async fn permit_available_serves_normally() {
 
     let mut buf = [0u8; 512];
     let n = stream.read(&mut buf).unwrap_or(0);
-    assert!(n > 0, "ping 须有响应");
+    assert!(n > 0, "ping must receive a response");
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
         resp.contains("pong"),
-        "permit 空闲时 ping 须正常返 pong (非误拒), got: {resp}"
+        "with a free permit, ping must return pong normally (no spurious rejection), got: {resp}"
     );
     assert!(
         !resp.contains(r#""code":-32002"#),
-        "permit 空闲时不应返 rate limit, got: {resp}"
+        "with a free permit, no rate limit should be returned, got: {resp}"
     );
 
     drop(stream);

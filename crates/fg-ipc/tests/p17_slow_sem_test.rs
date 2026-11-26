@@ -1,15 +1,24 @@
-// P1-7 (audit §P1-7): 慢任务独立限流 (slow_sem), 防大表 verify/联邦网络调用占满 blocking 池饿死拦截。
+// P1-7 (audit §P1-7): independent rate limiting for slow tasks (slow_sem), so
+// large-table verify / federated network calls cannot fill the blocking pool and
+// starve the interception path.
 //
-// 慢方法 (guard.audit.verify / guard.cluster.*) 2s 超时无法取消正在执行的 spawn_blocking 阻塞任务,
-// 慢请求可占满 blocking 线程池 (max_blocking_threads=64) → 饿死拦截路径 (guard.evaluate)。
-// 修复: 慢方法额外取 slow_sem permit (独立 500ms 超时, ≤ fast req_sem 槽数), 持到任务真完成,
-// 硬限并发慢任务数, 保 fast req_sem 槽给拦截。
+// For slow methods (guard.audit.verify / guard.cluster.*) the 2s timeout cannot
+// cancel an in-flight spawn_blocking task, so slow requests can fill the blocking
+// thread pool (max_blocking_threads=64) -> starve the interception path
+// (guard.evaluate). Fix: slow methods additionally acquire a slow_sem permit
+// (independent 500ms timeout, <= fast req_sem slot count), held until the task
+// truly completes, hard-limiting concurrent slow tasks and preserving fast
+// req_sem slots for interception.
 //
-// 验证三点 (确定性, 无需真实慢任务):
-//   1) slow_sem 满 → 慢方法 (guard.audit.verify) 返 -32002 (rate limit), 非 -32010 timeout。
-//   2) 慢方法拒绝快于 2s handler 预算 (slow permit 超时 500ms 独立)。
-//   3) 快方法 (guard.ping) 不受 slow_sem 影响 —— slow_sem 满时 ping 仍正常返 pong (两限流独立)。
-// 隔离 env: 独立 SOCK + DATA_DIR + TOKEN_KEY。需 test-helpers feature。
+// Verifies three points (deterministic, no real slow tasks needed):
+//   1) slow_sem full -> slow method (guard.audit.verify) returns -32002 (rate
+//      limit), not -32010 timeout.
+//   2) The slow-method rejection is faster than the 2s handler budget (slow
+//      permit timeout of 500ms is independent).
+//   3) Fast methods (guard.ping) are unaffected by slow_sem — with slow_sem full,
+//      ping still returns pong normally (the two limiters are independent).
+// Isolated env: dedicated SOCK + DATA_DIR + TOKEN_KEY. Requires the test-helpers
+// feature.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -45,14 +54,16 @@ fn ensure_env() -> (PathBuf, PathBuf) {
     (db, sock)
 }
 
-// 单 slow 槽服务端: 预取并持有唯一 slow permit → 下一个慢方法走 slow_sem 等待 → 500ms 超时 → -32002。
-// req_sem 保持默认 16 (空), 确保只 slow 路径受限, 不与 fast req_sem 竞争混淆。
+// Single slow-slot server: pre-acquire and hold the sole slow permit -> the next
+// slow method goes through slow_sem waiting -> 500ms timeout -> -32002.
+// req_sem keeps its default 16 (empty), ensuring only the slow path is limited and
+// avoiding confusion with fast req_sem contention.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_sem_full_rejects_slow_method_fast() {
     let (db, sock) = ensure_env();
     let store = Arc::new(AuditStore::open(&db).unwrap());
     let engine = fg_audit_engine::AuditEngine::new(store.clone()).unwrap();
-    // 单 slow 槽; req_sem 默认 16 (空, 不受限)。
+    // Single slow slot; req_sem default 16 (empty, not limited).
     let server = IpcServer::new_with_slow_permits(engine, store, 1);
     let slow_sem = server.slow_sem_handle();
     let serve_sock = sock.clone();
@@ -75,7 +86,8 @@ async fn slow_sem_full_rejects_slow_method_fast() {
         sock.display()
     );
 
-    // 预取并持有唯一 slow permit → 服务端 slow_sem 空, 慢方法走 slow_sem 等待。
+    // Pre-acquire and hold the sole slow permit -> the server's slow_sem is empty,
+    // slow methods go through slow_sem waiting.
     let held = slow_sem
         .acquire_owned()
         .await
@@ -85,7 +97,8 @@ async fn slow_sem_full_rejects_slow_method_fast() {
     let mut stream = UnixStream::connect(&sock).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
-    // guard.audit.verify 是慢方法 (is_slow=true) → 先取 slow_sem → 满等待 500ms → -32002。
+    // guard.audit.verify is a slow method (is_slow=true) -> acquires slow_sem
+    // first -> full, waits 500ms -> -32002.
     let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"guard.audit.verify\",\"params\":{}}\n";
     stream.write_all(req).unwrap();
     stream.flush().unwrap();
@@ -97,17 +110,18 @@ async fn slow_sem_full_rejects_slow_method_fast() {
 
     assert!(
         n > 0,
-        "P1-7: slow_sem 满须收到拒绝帧 (非静默卡死), got n={n}"
+        "P1-7: a full slow_sem must yield a rejection frame (no silent freeze), got n={n}"
     );
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
         resp.contains(r#""code":-32002"#),
-        "P1-7: slow permit 超时须返 -32002 (rate limit), 非 -32010 timeout, got: {resp}"
+        "P1-7: slow permit timeout must return -32002 (rate limit), not -32010 timeout, got: {resp}"
     );
-    // 慢方法拒绝须快于 2s handler 预算 (slow permit 超时 500ms 独立, 留余量 < 1.5s)。
+    // The slow-method rejection must be faster than the 2s handler budget (slow
+    // permit timeout of 500ms is independent; keep margin under 1.5s).
     assert!(
         elapsed < Duration::from_secs(2),
-        "P1-7: slow permit 超时拒绝须快于 2s handler 预算 (独立生效), 实测 {:?}",
+        "P1-7: the slow permit timeout rejection must be faster than the 2s handler budget (independent), measured {:?}",
         elapsed
     );
 
@@ -120,8 +134,10 @@ async fn slow_sem_full_rejects_slow_method_fast() {
     }
 }
 
-// 对照: slow_sem 满 时快方法 (guard.ping) 不受影响, 仍正常返 pong。
-// 证两限流独立 —— slow_sem 只约束慢方法, fast req_sem 空则快方法正常服务。
+// Control: with slow_sem full, fast methods (guard.ping) are unaffected and still
+// return pong normally.
+// Proves the two limiters are independent — slow_sem only constrains slow methods;
+// with fast req_sem empty, fast methods are served normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_sem_full_does_not_block_fast_method() {
     let (db, sock) = ensure_env();
@@ -145,7 +161,8 @@ async fn slow_sem_full_does_not_block_fast_method() {
     }
     assert!(sock.exists());
 
-    // 预取并持有唯一 slow permit → slow_sem 满。但 ping 是快方法 (is_slow=false), 走 req_sem (空)。
+    // Pre-acquire and hold the sole slow permit -> slow_sem full. But ping is a
+    // fast method (is_slow=false), going through req_sem (empty).
     let _held = slow_sem
         .acquire_owned()
         .await
@@ -160,15 +177,15 @@ async fn slow_sem_full_does_not_block_fast_method() {
 
     let mut buf = [0u8; 512];
     let n = stream.read(&mut buf).unwrap_or(0);
-    assert!(n > 0, "P1-7: ping 须有响应");
+    assert!(n > 0, "P1-7: ping must receive a response");
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
         resp.contains("pong"),
-        "P1-7: slow_sem 满时快方法 ping 须正常返 pong (两限流独立), got: {resp}"
+        "P1-7: with slow_sem full, the fast method ping must still return pong normally (independent limiters), got: {resp}"
     );
     assert!(
         !resp.contains(r#""code":-32002"#),
-        "P1-7: 快方法不应受 slow_sem 满影响返 rate limit, got: {resp}"
+        "P1-7: fast methods must not be rate limited by a full slow_sem, got: {resp}"
     );
 
     drop(stream);
@@ -179,8 +196,10 @@ async fn slow_sem_full_does_not_block_fast_method() {
     }
 }
 
-// 对照: slow_sem 空时慢方法正常服务 (释放 permit 后 verify 返 result, 非 -32002)。
-// 证 -32002 是 slow_sem 满专属, 非误拒所有慢方法。
+// Control: with slow_sem empty, slow methods are served normally (after the permit
+// is released, verify returns a result, not -32002).
+// Proves -32002 is specific to a full slow_sem, not a blanket rejection of slow
+// methods.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_sem_available_serves_slow_method() {
     let (db, sock) = ensure_env();
@@ -203,7 +222,8 @@ async fn slow_sem_available_serves_slow_method() {
     }
     assert!(sock.exists());
 
-    // 不预取 slow permit → slow_sem 空 → 慢方法 verify 正常服务 (空库 verify 快返)。
+    // No slow permit pre-acquired -> slow_sem empty -> the slow method verify is
+    // served normally (verify on an empty store returns quickly).
     let mut stream = UnixStream::connect(&sock).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"guard.audit.verify\",\"params\":{}}\n";
@@ -212,15 +232,15 @@ async fn slow_sem_available_serves_slow_method() {
 
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).unwrap_or(0);
-    assert!(n > 0, "P1-7: verify 须有响应");
+    assert!(n > 0, "P1-7: verify must receive a response");
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(
         resp.contains("\"result\"") || resp.contains("tampered"),
-        "P1-7: slow_sem 空时 verify 须正常返 result (含 tampered 字段), 非 rate limit, got: {resp}"
+        "P1-7: with slow_sem empty, verify must return a normal result (including the tampered field), not a rate limit, got: {resp}"
     );
     assert!(
         !resp.contains(r#""code":-32002"#),
-        "P1-7: slow_sem 空时 verify 不应返 rate limit, got: {resp}"
+        "P1-7: with slow_sem empty, verify must not be rate limited, got: {resp}"
     );
 
     drop(stream);

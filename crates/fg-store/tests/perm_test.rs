@@ -1,5 +1,5 @@
-// C21 (P0-G9): DB 文件/目录权限硬化测试
-// 验证 AuditStore::open 后 guard.db 0o600 + 父目录 0o700 (不依赖 umask)。
+// C21 (P0-G9): DB file/directory permission hardening tests
+// Verify that after AuditStore::open, guard.db is 0o600 and the parent directory 0o700 (umask-independent).
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -34,11 +34,11 @@ fn db_and_dir_hardened_after_open() {
     let db = temp_db();
     let parent = db.parent().unwrap().to_path_buf();
     let _store = AuditStore::open(&db).unwrap();
-    // 触发一次写以创建 -wal/-shm (WAL 按需)。
+    // Trigger one write so -wal/-shm get created (WAL is created on demand).
     let store = AuditStore::open(&db).unwrap();
     drop(store);
 
-    // C21: DB 0o600, 目录 0o700。
+    // C21: DB 0o600, directory 0o700.
     assert_eq!(
         mode(&db),
         0o600,
@@ -50,7 +50,7 @@ fn db_and_dir_hardened_after_open() {
         "guard dir must be 0o700 after open (C21 hardening, not umask 0755)"
     );
 
-    // -wal/-shm 若存在亦须 0o600。
+    // -wal/-shm must also be 0o600 if present.
     let wal = {
         let mut s = db.as_os_str().to_os_string();
         s.push("-wal");
@@ -68,7 +68,7 @@ fn db_and_dir_hardened_after_open() {
         assert_eq!(mode(&shm), 0o600, "-shm must be 0o600 (C21)");
     }
 
-    // P1-7: 物理分库后 token.db / action.db sibling 亦须 0o600 (C21 三库均硬化)。
+    // P1-7: after the physical DB split, the token.db / action.db siblings must also be 0o600 (C21 hardening on all three DBs).
     let token_db = db.with_file_name("token.db");
     let action_db = db.with_file_name("action.db");
     assert_eq!(

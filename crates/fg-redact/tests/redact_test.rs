@@ -1,6 +1,6 @@
 use fg_redact::Redactor;
 
-// M4: Redactor::new() 返 Result, 测试用 expect (静态模式编译应永不失败)。
+// M4: Redactor::new() returns Result; tests use expect (static pattern compilation should never fail).
 fn make() -> Redactor {
     Redactor::new().expect("redactor regex compile (static patterns)")
 }
@@ -18,10 +18,11 @@ fn reversible_returns_tokens() {
     let r = make();
     let (out, matches) = r.redact_reversible("password=hunter2pass");
     assert_eq!(matches.len(), 1);
-    // C19: 仅脱敏值, 保留可见标签前缀 (DLP 惯例: 字段名可见, 机密脱敏)。
+    // C19: only the value is redacted, the visible label prefix is retained (DLP convention:
+    // field name visible, secret redacted).
     assert!(out.starts_with("password=[REDACTED:password#tok_"));
     assert!(!out.contains("hunter2pass"), "value must be redacted");
-    // 存原始值 (仅值, 非全匹配) 供 reveal 还原。
+    // Stores the original value (value only, not the full match) for reveal restoration.
     assert_eq!(matches[0].original, "hunter2pass");
 }
 
@@ -38,8 +39,9 @@ fn reversible_multiple_fields() {
 #[test]
 fn extract_placeholders_round_trips() {
     let r = make();
-    // issue #13: 用合法 GB 身份证 (110101199003077651, 校验位 '1') —— id_number 带校验 validator 后,
-    // 不合法 id (如 ...77654) 被拒不脱敏, 须用合法 id 验证占位符往返。
+    // issue #13: use a valid GB ID (110101199003077651, check char '1') — after id_number gained
+    // its checksum validator, invalid ids (e.g. ...77654) are rejected and not redacted, so the
+    // placeholder round trip must be verified with a valid id.
     let input = "id 110101199003077651 here";
     let (redacted, matches) = r.redact_reversible(input);
     let placeholders = r.extract_placeholders(&redacted);
@@ -62,67 +64,83 @@ fn has_sensitive_detects() {
     assert!(!r.has_sensitive("plain text"));
 }
 
-// L6 span 追踪: id_number 不腐蚀先前占位符。原顺序 replace_all 让 id_number 在
-// tok_<32hex> (含 17 位数字子串) 上二次匹配 → 破占位符 → extract_placeholders 找不到 →
-// reveal 撞 H6 → 可逆降级不可逆。span 追踪在原内容单趟收集拒重叠, 占位符永不写回原内容。
+// L6 span tracking: id_number must not corrupt earlier placeholders. The original sequential
+// replace_all let id_number match again on tok_<32hex> (containing 17-digit substrings) →
+// corrupted the placeholder → extract_placeholders found nothing → reveal hit H6 → reversible
+// degraded to irreversible. Span tracking collects on the original content in one pass with
+// overlap rejection; placeholders are never written back into the original content.
 #[test]
 fn l6_id_number_does_not_corrupt_placeholder() {
     let r = make();
-    // sk- 值尾随 18 位合法身份证 (110101199003077651, issue #13 改合法 GB) —— api_key 命中全值,
-    // id_number 勿二次吞尾 (span 重叠跳过)。
+    // The sk- value trails an 18-digit valid ID (110101199003077651, valid GB per issue #13) —
+    // api_key takes the full value; id_number must not swallow the tail a second time (span
+    // overlap skipped).
     let input = "api key sk-abcdefghijklmnopqrstuvwx110101199003077651";
     let (redacted, matches) = r.redact_reversible(input);
     let placeholders = r.extract_placeholders(&redacted);
     assert_eq!(
         placeholders.len(),
         matches.len(),
-        "占位符数须 == matches 数 (无腐蚀); redacted={redacted}"
+        "placeholder count must == matches count (no corruption); redacted={redacted}"
     );
     assert!(
         !redacted.contains("110101199003077651"),
-        "id 值须脱敏非裸留"
+        "id value must be redacted, not left bare"
     );
 }
 
-// L6 span 追踪: 重叠命中首模式优先, 次模式跳过 (id_number 落在 password 值内不二次吞)。
+// L6 span tracking: on overlap the first pattern wins and the later one is skipped (id_number
+// landing inside a password value does not swallow it a second time).
 #[test]
 fn l6_overlap_first_pattern_wins() {
     let r = make();
-    // password 值含 18 位合法身份证 (110101199003077651) —— password 命中值 (含数字),
-    // id_number span 重叠 → 跳过。
+    // The password value contains an 18-digit valid ID (110101199003077651) — password takes the
+    // value (digits included); id_number's span overlaps → skipped.
     let input = "password=secret110101199003077651";
     let (redacted, matches) = r.redact_reversible(input);
     let placeholders = r.extract_placeholders(&redacted);
-    assert_eq!(placeholders.len(), matches.len(), "重叠勿双脱敏");
+    assert_eq!(
+        placeholders.len(),
+        matches.len(),
+        "overlap must not double-redact"
+    );
     assert_eq!(
         matches.len(),
         1,
-        "password 值整体一个占位符, id_number 勿分裂"
+        "password value is one placeholder as a whole; id_number must not split it"
     );
     assert!(redacted.starts_with("password=[REDACTED:password#tok_"));
 }
 
-// P0-8 (audit §2.7): CJK 内容触发 last4 字节切片 panic。中文密码 (3字节/字) 的 len()
-// 是字节数, s[n-4..] 切到字符中间 → slice panic。审计复现: 5 个中文字符 (15 字节),
-// last4 切 s[11..], 11 不是 char boundary (落在 '试' 内) → panic。修复按字符边界取末4字。
+// P0-8 (audit §2.7): CJK content triggered the last4 byte-slice panic. For a Chinese password
+// (3 bytes/char) len() is the byte count, so s[n-4..] cut into the middle of a char → slice
+// panic. Audit repro: 5 Chinese chars (15 bytes); last4 cut s[11..], and 11 is not a char
+// boundary (it lands inside a char) → panic. Fix: take the last 4 chars on char boundaries.
+// NOTE: the Chinese fixture is intentionally kept — this is product-data test coverage for CJK
+// input; an ASCII fixture would pass even with the old byte-slicing code.
 #[test]
 fn p0_8_cjk_last4_no_panic() {
     let r = make();
-    // 纯中文密码 (5 字符 = 15 字节): n=15, 旧码切 s[11..] → 11 落在字符内 panic。
+    // Pure Chinese password (5 chars = 15 bytes): n=15, old code cut s[11..] → 11 lands inside a
+    // char → panic.
+    // i18n: user-facing — CJK product-data fixture, load-bearing for the char-boundary test
     let out = r.redact_irreversible("password: 密码测试值");
     assert!(
         out.contains("[REDACTED:password#"),
         "CJK password must redact, not panic: {out}"
     );
+    // i18n: user-facing — fixture assertion
     assert!(!out.contains("密码测试值"), "value must be redacted");
-    // 末4字符 = "码测试值" (按字符, 非字节), 含占位符即可验证未 panic。
+    // The last 4 chars are the last 4 CHARS of the CJK fixture (by char, not byte); asserting the
+    // suffixed placeholder verifies no panic.
     assert!(
+        // i18n: user-facing — fixture assertion
         out.ends_with("码测试值]"),
         "last4 must be last 4 CHARS not bytes: {out}"
     );
 }
 
-// P0-8: emoji (4字节/字) 同理。原字节切片在 emoji 上 panic。
+// P0-8: emoji (4 bytes/char) behaves the same. The original byte slicing panicked on emoji.
 #[test]
 fn p0_8_emoji_last4_no_panic() {
     let r = make();
@@ -133,7 +151,7 @@ fn p0_8_emoji_last4_no_panic() {
     );
 }
 
-// P1-1 (audit §1.10): DLP 脱敏盲区扩展 —— 9 类新凭据覆盖。
+// P1-1 (audit §1.10): DLP redaction blind-spot expansion — 9 new credential classes covered.
 
 #[test]
 fn p1_1_jwt_redacted() {
@@ -158,7 +176,7 @@ fn p1_1_oauth_bearer_redacted() {
 #[test]
 fn p1_1_aws_secret_redacted() {
     let r = make();
-    // 标准 AWS Secret Access Key 示例 (40 字符, 多样性)。
+    // Standard AWS Secret Access Key example (40 chars, diverse).
     let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     let (out, matches) = r.redact_reversible(secret);
     assert_eq!(matches.len(), 1, "AWS secret one token: {out}");
@@ -169,7 +187,8 @@ fn p1_1_aws_secret_redacted() {
 #[test]
 fn p1_1_aws_secret_rejects_homogeneous() {
     let r = make();
-    // 40 全同字符 → 字符多样性 < 6 → validator 拒, 不脱敏 (假阳性防御)。
+    // 40 identical chars → char diversity < 6 → validator rejects, no redaction (false-positive
+    // defense).
     let (out, matches) = r.redact_reversible("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     assert!(
         matches.is_empty(),
@@ -181,7 +200,7 @@ fn p1_1_aws_secret_rejects_homogeneous() {
 #[test]
 fn p1_1_credit_card_luhn_redacted() {
     let r = make();
-    // 通过 Luhn 的测试卡号 (Visa 4242…)。
+    // Test card number that passes Luhn (Visa 4242…).
     let (out, matches) = r.redact_reversible("card 4242424242424242 here");
     assert_eq!(matches.len(), 1, "Luhn-valid card one token: {out}");
     assert!(out.contains("[REDACTED:credit_card#tok_"));
@@ -191,7 +210,7 @@ fn p1_1_credit_card_luhn_redacted() {
 #[test]
 fn p1_1_credit_card_rejects_non_luhn() {
     let r = make();
-    // 16 位但不过 Luhn → validator 拒。
+    // 16 digits but fails Luhn → validator rejects.
     let (out, matches) = r.redact_reversible("ref 1234567890123456 end");
     assert!(matches.is_empty(), "non-Luhn 16-digit not a card: {out}");
     assert!(!out.contains("REDACTED"));
@@ -200,14 +219,16 @@ fn p1_1_credit_card_rejects_non_luhn() {
 #[test]
 fn p1_1_credit_card_boundary_not_substring_of_id() {
     let r = make();
-    // issue #13: 18 位合法身份证 (110101199003077651) —— id_number (GB 校验通过, 且排 credit_card
-    // 之前) 先吃, credit_card span 重叠被跳 (不再吞 17 位前导数字剩悬空 X, 缺陷 1 修复)。
+    // issue #13: 18-digit valid ID (110101199003077651) — id_number (GB check passes, and it is
+    // ordered before credit_card) consumes it first; credit_card's span overlaps and is skipped
+    // (no longer eats the 17-digit leading part leaving a dangling X; defect 1 fixed).
     let (out, matches) = r.redact_reversible("id 110101199003077651 end");
     let kinds: Vec<&str> = matches
         .iter()
         .map(|m| m.placeholder.split('#').next().unwrap())
         .collect();
-    // id_number 命中 (合法 GB, 先于 credit_card); credit_card 须被重叠拒 (id_number 已吃)。
+    // id_number hit (valid GB, before credit_card); credit_card must be rejected by overlap
+    // (id_number already consumed it).
     assert!(
         kinds.iter().any(|k| k.starts_with("[REDACTED:id_number")),
         "id_number (valid GB) must redact: {out}"
@@ -253,7 +274,7 @@ fn p1_1_stripe_key_redacted() {
 fn p1_1_secret_kv_redacted() {
     let r = make();
     let (out, matches) = r.redact_reversible(r#"{"token": "ghp_abcdefABCDEF1234567890abcdef"}"#);
-    // token= 键值命中; 也可能 ghp_ 前缀 api_key 命中 (重叠, 先到先拒)。
+    // token= key-value hit; the ghp_ prefixed api_key may also hit (overlap, first accepted wins).
     assert!(
         !matches.is_empty(),
         "secret_kv or api_key must match: {out}"
@@ -270,7 +291,7 @@ fn p1_1_env_kv_redacted() {
     assert!(out.contains("REDACTED"));
 }
 
-// issue #2: PII 模式类 (phone 已有, 补 email/ipv4/bankcard 覆盖验证)。
+// issue #2: PII pattern classes (phone already existed; adds email/ipv4/bankcard coverage).
 
 #[test]
 fn issue2_email_redacted() {
@@ -305,7 +326,7 @@ fn issue2_ipv4_redacted() {
 #[test]
 fn issue2_ipv4_rejects_invalid_octet() {
     let r = make();
-    // 256 超出 u8 → validator 拒, 不脱敏 (非真实 ipv4)。
+    // 256 exceeds u8 → validator rejects, no redaction (not a real ipv4).
     let (out, matches) = r.redact_reversible("version 256.1.1.1 bad");
     assert!(
         matches.is_empty(),
@@ -317,7 +338,7 @@ fn issue2_ipv4_rejects_invalid_octet() {
 #[test]
 fn issue2_bankcard_via_credit_card_redacted() {
     let r = make();
-    // 16 位 Luhn 有效卡号 (issue #2 bankcard 13-19 位) → credit_card 脱敏。
+    // 16-digit Luhn-valid card (issue #2 bankcard 13-19 digits) → redacted by credit_card.
     let (out, matches) = r.redact_reversible("bankcard 4111111111111111 paid");
     assert_eq!(matches.len(), 1, "bankcard one token: {out}");
     assert!(out.contains("[REDACTED:credit_card#tok_"));
@@ -332,8 +353,9 @@ fn issue2_phone_present() {
     assert!(out.contains("[REDACTED:phone#tok_"));
 }
 
-// issue #10: redact_credentials() 仅脱凭据子集, 跳过 PII。
-// 消费方 (fusion-memory) 自带更准 PII 逻辑, 只需 fg-redact 补凭据覆盖。
+// issue #10: redact_credentials() redacts only the credential subset, skipping PII.
+// Consumers (fusion-memory) bring their own more accurate PII logic; they only need fg-redact for
+// credential coverage.
 
 #[test]
 fn issue10_credentials_redacts_jwt_and_password() {
@@ -357,13 +379,14 @@ fn issue10_credentials_redacts_jwt_and_password() {
 
 #[test]
 fn issue10_credentials_skips_idcard() {
-    // issue #13: 合法 GB 身份证 (11010119900307889X, 校验位 X) —— redact_credentials() 跳 PII
-    // → 原样保留 (消费方按需选类)。issue #13 修复后 full redact() 会脱敏为 id_number, 本测验证
-    // credentials-only 子集正确跳过 PII (与 full redact 分歧)。
+    // issue #13: valid GB ID (11010119900307889X, check char X) — redact_credentials() skips PII
+    // → left as-is (consumers pick classes as needed). After the issue #13 fixes, full redact()
+    // would redact it as id_number; this test verifies the credentials-only subset correctly
+    // skips PII (diverging from full redact).
     let r = make();
-    let out = r.redact_credentials("身份证 11010119900307889X 复印件");
+    let out = r.redact_credentials("id card 11010119900307889X copy");
     assert_eq!(
-        out, "身份证 11010119900307889X 复印件",
+        out, "id card 11010119900307889X copy",
         "id-card untouched by credentials-only: {out}"
     );
     assert!(!out.contains("REDACTED"), "no PII redaction: {out}");
@@ -371,8 +394,9 @@ fn issue10_credentials_skips_idcard() {
 
 #[test]
 fn issue10_credentials_skips_long_non_luhn_digits() {
-    // issue #13: 18 位非 PII 数字串 (订单号 999999999999999999) —— GB 校验不通过 → full redact()
-    // 也不脱敏 (缺陷 2 修复), credentials-only 同样跳过 → 原样保留。
+    // issue #13: 18-digit non-PII digit string (order number 999999999999999999) — fails the GB
+    // check → full redact() does not redact it either (defect 2 fix); credentials-only skips it
+    // the same way → left as-is.
     let r = make();
     let out = r.redact_credentials("order 999999999999999999 timestamp");
     assert_eq!(
@@ -395,7 +419,7 @@ fn issue10_credentials_skips_phone_email_ipv4() {
 
 #[test]
 fn issue10_redact_with_patterns_subset() {
-    // 通用原语: 仅跑 private_key + jwt, 跳过其余 (含 password)。
+    // Generic primitive: runs only private_key + jwt, skipping the rest (password included).
     let r = make();
     let input = "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c and password=hunter2pass";
     let out = r.redact_with_patterns(input, &["private_key", "jwt"]);
@@ -403,7 +427,7 @@ fn issue10_redact_with_patterns_subset() {
         out.contains("[REDACTED:jwt]"),
         "jwt in subset redacted: {out}"
     );
-    // password 不在传入子集 → 不脱 (值裸留)。
+    // password is not in the given subset → not redacted (value left bare).
     assert!(
         out.contains("password=hunter2pass"),
         "password outside subset untouched: {out}"
@@ -423,7 +447,8 @@ fn issue10_redact_with_patterns_unknown_name_ignored() {
 
 #[test]
 fn issue10_credentials_full_set_matches_redact_on_credential_only_input() {
-    // 纯凭据输入: redact_credentials() 与 redact() 产出一致 (无 PII 可分歧)。
+    // Credential-only input: redact_credentials() and redact() produce identical output (no PII
+    // to diverge on).
     let r = make();
     let input = "key sk-abcdefghijklmnopqrstuvwx and password=secret123";
     assert_eq!(
@@ -433,15 +458,18 @@ fn issue10_credentials_full_set_matches_redact_on_credential_only_input() {
     );
 }
 
-// issue #13: PII 3 缺陷修复 —— idcard 被 credit_card 错吞 / id_number 误吞长数字 / +86 phone 被拒。
+// issue #13: 3 PII defect fixes — idcard wrongly swallowed by credit_card / id_number swallowing
+// long digit strings / +86 phone rejected.
 
-// 缺陷 1: 合法 GB 身份证 (尾 X) 须脱敏为 id_number, 非 credit_card, 无悬空 X。
+// Defect 1: a valid GB ID (trailing X) must be redacted as id_number, not credit_card, with no
+// dangling X.
 #[test]
 fn issue13_idcard_not_eaten_by_credit_card() {
     let r = make();
-    // 11010119900307889X = 合法 GB (校验位 X)。原: credit_card 吃 17 位前导数字 → "...credit_card]X"
-    // (悬空 X)。修复: id_number (GB 校验, 排 credit_card 之前) 先吃全 18 字符 → id_number 标签, 无悬空。
-    let out = r.redact("身份证 11010119900307889X 复印件");
+    // 11010119900307889X = valid GB (check char X). Before: credit_card ate the 17-digit leading
+    // part → "...credit_card]X" (dangling X). Fix: id_number (GB check, ordered before
+    // credit_card) consumes the full 18 chars first → id_number tag, no dangling tail.
+    let out = r.redact("id card 11010119900307889X copy");
     assert!(
         out.contains("[REDACTED:id_number]"),
         "valid id-card must tag id_number not credit_card: {out}"
@@ -456,11 +484,11 @@ fn issue13_idcard_not_eaten_by_credit_card() {
     );
 }
 
-// 缺陷 1 附加: 合法身份证 (尾数字) 同样正确, id_number 排序吃前。
+// Defect 1 addendum: a valid ID (digit tail) is handled correctly too; id_number's ordering wins.
 #[test]
 fn issue13_idcard_digit_tail_correct() {
     let r = make();
-    // 110101199003077651 = 合法 GB (校验位 '1')。
+    // 110101199003077651 = valid GB (check char '1').
     let out = r.redact("id 110101199003077651 end");
     assert!(
         out.contains("[REDACTED:id_number]"),
@@ -469,11 +497,12 @@ fn issue13_idcard_digit_tail_correct() {
     assert!(!out.contains("credit_card"), "not credit_card: {out}");
 }
 
-// 缺陷 2: 非 PII 长 18 位数字串 (订单号) 须被 GB 校验拒, 不脱敏。
+// Defect 2: a non-PII 18-digit string (order number) must be rejected by the GB check, not
+// redacted.
 #[test]
 fn issue13_id_number_rejects_non_pii_long_digits() {
     let r = make();
-    // 999999999999999999 = 订单号样, GB 校验不通过 (sum=900, rem=9, 期望 '3' ≠ '9')。
+    // 999999999999999999 = order-number-like, fails the GB check (sum=900, rem=9, expected '3' ≠ '9').
     let out = r.redact("order 999999999999999999 timestamp");
     assert_eq!(
         out, "order 999999999999999999 timestamp",
@@ -485,7 +514,7 @@ fn issue13_id_number_rejects_non_pii_long_digits() {
     );
 }
 
-// 缺陷 3: +86 国际前缀手机号须被 phone 脱敏。
+// Defect 3: a +86 international-prefixed phone number must be redacted by phone.
 #[test]
 fn issue13_phone_accepts_plus86_prefix() {
     let r = make();
@@ -497,7 +526,7 @@ fn issue13_phone_accepts_plus86_prefix() {
     assert!(!out.contains("13912345678"), "phone value stripped: {out}");
 }
 
-// 缺陷 3 附加: 0086 前缀同样接受。
+// Defect 3 addendum: the 0086 prefix is accepted the same way.
 #[test]
 fn issue13_phone_accepts_0086_prefix() {
     let r = make();
@@ -508,18 +537,21 @@ fn issue13_phone_accepts_0086_prefix() {
     );
 }
 
-// 缺陷 3 边界: 裸号 (无前缀) 仍正确; 更长数字子段前的 +86 不误吞。
+// Defect 3 boundary: a bare number (no prefix) still works; a +86 preceded by a longer digit
+// segment is not falsely swallowed.
 #[test]
 fn issue13_phone_bare_and_boundary() {
     let r = make();
-    // 裸号仍脱敏。
+    // Bare number still redacted.
     assert!(
         r.redact("call 13800138000 now")
             .contains("[REDACTED:phone]"),
         "bare phone still redacted"
     );
-    // 2008613912345678 (前缀 '2') → span 从 idx1 起的 "0086...", start-1='2' 数字 → 边界拒, 不误吞。
-    // 此串无合法 phone (20086… 非 1[3-9] 开头裸号), 整体不脱敏。
+    // 2008613912345678 (prefix '2') → span would start at idx1 with "0086...", start-1='2' is a
+    // digit → boundary rejects, no false swallow.
+    // This string contains no valid phone (20086… is not a bare 1[3-9] number), so nothing is
+    // redacted.
     let out = r.redact("x 2008613912345678 y");
     assert!(
         !out.contains("[REDACTED:phone]"),
@@ -527,7 +559,7 @@ fn issue13_phone_bare_and_boundary() {
     );
 }
 
-// has_sensitive 对合法身份证须检出 (id_number 带 validator 后不被静默漏判)。
+// has_sensitive must detect a valid ID (not silently missed after id_number gained its validator).
 #[test]
 fn issue13_has_sensitive_detects_valid_id() {
     let r = make();

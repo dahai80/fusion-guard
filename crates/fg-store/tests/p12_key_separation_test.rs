@@ -1,10 +1,12 @@
-// P1-2 (audit §1.6): HKDF 域分离 + 版本化轮换。
-// 三测: (1) 域分离 — 同 master 派生 chain-HMAC key != token-AES-GCM key;
-//       (2) 轮换 — 旧审计行用旧 version 派生 key 验链, 新行用新 version, verify_chain 透过;
-//       (3) token 轮换后旧 token 解密 — put @v1, rotate→v2, get_tenant 仍解 v1 token (用 v1 派生 key)。
+// P1-2 (audit §1.6): HKDF domain separation + versioned rotation.
+// Three tests: (1) domain separation — same master derives chain-HMAC key != token-AES-GCM key;
+//       (2) rotation — old audit rows verify with a key derived from the old version, new rows use the new
+//       version, verify_chain passes;
+//       (3) old token decrypts after rotation — put @v1, rotate -> v2, get_tenant still decrypts the v1 token
+//       (using the v1-derived key).
 //
-// 需要 FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore 加载密钥)。
-// test-helpers feature: derive_chain_key / derive_token_key 暴露供断言域分离。
+// Requires FUSION_GUARD_TOKEN_KEY (AuditStore::open -> TokenStore loads the key).
+// test-helpers feature: derive_chain_key / derive_token_key exposed so domain separation can be asserted.
 
 use std::path::PathBuf;
 
@@ -37,8 +39,8 @@ fn cleanup(dir: &std::path::Path) {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// 域分离: 同 master, 同 version, chain key != token key (不同 info label → HKDF 独立输出)。
-// 防单点泄露双失守: chain key 泄 → 不可解 token; token key 泄 → 不可伪造审计链。
+// Domain separation: same master, same version, chain key != token key (different info labels -> independent HKDF output).
+// Prevents a single leak from failing both: chain key leak -> tokens stay undecryptable; token key leak -> audit chain stays unforgeable.
 #[test]
 fn key_separation_chain_ne_token() {
     ensure_env_key();
@@ -50,7 +52,7 @@ fn key_separation_chain_ne_token() {
         token.as_slice(),
         "chain-HMAC key must differ from token-AES-GCM key (HKDF domain separation, P1-2 §1.6)"
     );
-    // 确定性: 同 master + 同 version 重算一致 (跨重启验旧链/解旧 token 可重算)。
+    // Deterministic: same master + same version recomputes identically (old chain/token verifiable across restart).
     let chain2 = derive_chain_key(&master, 1);
     assert_eq!(
         chain.as_slice(),
@@ -59,7 +61,7 @@ fn key_separation_chain_ne_token() {
     );
 }
 
-// 版本化: 不同 version 派生不同 key (轮换语义 — bump version 即换 key)。
+// Versioned: different versions derive different keys (rotation semantics — bumping the version swaps the key).
 #[test]
 fn key_version_derives_distinct() {
     ensure_env_key();
@@ -72,8 +74,8 @@ fn key_version_derives_distinct() {
     assert_ne!(t1.as_slice(), t2.as_slice(), "v1 token key != v2 token key");
 }
 
-// 轮换 + 旧行验链: 写 v1 行 → rotate v2 → 写 v2 行 → verify_chain 透过
-// (旧行用 v1 派生 chain key 验, 新行用 v2; 每行存 key_version, verify 按行版本派生)。
+// Rotation + old-row chain verification: write v1 rows -> rotate to v2 -> write v2 rows -> verify_chain passes
+// (old rows verify with the v1-derived chain key, new rows with v2; each row stores key_version, verify derives per row).
 #[tokio::test]
 async fn rotation_old_audit_rows_verify_with_old_key() {
     let (db, dir) = temp_env();
@@ -94,7 +96,7 @@ async fn rotation_old_audit_rows_verify_with_old_key() {
     assert_eq!(v_before.total_rows, 2, "2 v1 rows pre-rotation");
 
     let new_v = store.rotate_key().unwrap();
-    assert_eq!(new_v, 2, "rotate → v2");
+    assert_eq!(new_v, 2, "rotate -> v2");
     assert_eq!(store.current_key_version(), 2, "live version now 2");
 
     store
@@ -118,8 +120,8 @@ async fn rotation_old_audit_rows_verify_with_old_key() {
     cleanup(&dir);
 }
 
-// token 轮换后旧 token 解密: put @v1 → rotate v2 → get_tenant 仍解出 v1 token 原文。
-// get_tenant 读行的 key_version, 用 v1 派生 token key 解 (旧 token 不随轮换失效)。
+// Old token decrypts after token-key rotation: put @v1 -> rotate to v2 -> get_tenant still reveals the v1 plaintext.
+// get_tenant reads the row's key_version and decrypts with the v1-derived token key (old tokens do not break on rotation).
 #[tokio::test]
 async fn token_reveals_after_rotation() {
     let (db, dir) = temp_env();
@@ -135,18 +137,18 @@ async fn token_reveals_after_rotation() {
     let new_v = store.rotate_key().unwrap();
     assert_eq!(new_v, 2);
 
-    // v2 写新 token。
+    // Write a new token under v2.
     tokens
         .put_tenant("tok-v2", "sk-new-xyz", "default")
         .unwrap();
 
-    // v1 旧 token 仍可解 (用 v1 派生 key, 行存 key_version=1)。
+    // The old v1 token still decrypts (v1-derived key; row stores key_version=1).
     let got_old = tokens.get_tenant("tok-v1", "default").unwrap();
     assert_eq!(
         got_old, secret,
         "v1 token decrypts after rotation (per-row key_version, P1-2)"
     );
-    // v2 新 token 也可解 (用 v2 派生 key)。
+    // The new v2 token also decrypts (v2-derived key).
     let got_new = tokens.get_tenant("tok-v2", "default").unwrap();
     assert_eq!(got_new, "sk-new-xyz", "v2 token decrypts with v2 key");
 

@@ -1,11 +1,15 @@
-// P1-5 (audit §P1-5): epoch 编排层事务化 —— 并发 add_rule 不丢 epoch bump。
+// P1-5 (audit §P1-5): epoch orchestration-layer transactionalization — concurrent add_rule never loses an epoch bump.
 //
-// add_rule 三步 (落盘 rule → 内存 add → 落盘 epoch) 非原子。无编排互斥锁时, 两线程并发:
-//   T1 读 epoch=N, T2 读 epoch=N → 各自 bump N+1 写盘 → 丢一次 bump, epoch 单调但与规则数不一致。
-// 修复: AuditEngine 持 rule_orch_lock (Mutex), add/update/remove 全程持锁序列化三步编排。
+// add_rule's three steps (persist rule → in-memory add → persist epoch) are not atomic. Without the orchestration
+// mutex, two concurrent threads:
+//   T1 reads epoch=N, T2 reads epoch=N → each bumps to N+1 and writes → one bump is lost; the epoch stays monotonic
+// but diverges from the rule count.
+// Fix: AuditEngine holds rule_orch_lock (Mutex); add/update/remove hold it throughout, serializing the three-step
+// orchestration.
 //
-// 验收: N 线程并发 add_rule → 最终 epoch == 起始+N (无丢 bump), 且 N 条规则全落盘 (无丢规则)。
-// 隔离 env: 独立 DATA_DIR + TOKEN_KEY。
+// Acceptance: N threads add_rule concurrently → final epoch == start+N (no lost bumps) and all N rules persisted
+// (none lost).
+// Isolated env: dedicated DATA_DIR + TOKEN_KEY.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,7 +57,7 @@ fn make_rule(idx: usize) -> GuardRule {
     }
 }
 
-// P1-5 核心: 16 线程并发 add_rule → epoch 严格增 16 (无丢 bump), 16 规则全落盘。
+// P1-5 core: 16 threads add_rule concurrently → epoch strictly increases by 16 (no lost bumps), all 16 rules persisted.
 #[test]
 fn concurrent_add_rule_no_lost_epoch_bump() {
     let (db, dir) = temp_env();
@@ -61,9 +65,9 @@ fn concurrent_add_rule_no_lost_epoch_bump() {
     let engine = Arc::new(AuditEngine::new(store.clone()).unwrap());
 
     let start_epoch = engine.epoch();
-    tracing::info!(start_epoch, "P1-5: 并发 add_rule 起点 epoch");
+    tracing::info!(start_epoch, "P1-5: concurrent add_rule starting epoch");
 
-    // 16 线程并发 add_rule, 各加 1 条唯一规则。
+    // 16 threads add_rule concurrently, each adding one unique rule.
     let mut handles = Vec::with_capacity(CONCURRENT_ADDS);
     for i in 0..CONCURRENT_ADDS {
         let eng = Arc::clone(&engine);
@@ -79,28 +83,29 @@ fn concurrent_add_rule_no_lost_epoch_bump() {
 
     let final_epoch = engine.epoch();
 
-    // 验收 1: epoch 严格增 CONCURRENT_ADDS (无丢 bump)。无锁时并发会丢 bump → final < start+N。
+    // Acceptance 1: epoch strictly increases by CONCURRENT_ADDS (no lost bumps). Without the lock, concurrent adds
+    // lose bumps → final < start+N.
     assert_eq!(
         final_epoch,
         start_epoch + CONCURRENT_ADDS as u64,
-        "P1-5: 并发 add_rule 后 epoch 须严格增 {} (无丢 bump), start={} final={}",
+        "P1-5: epoch must strictly increase by {} after concurrent add_rule (no lost bumps), start={} final={}",
         CONCURRENT_ADDS,
         start_epoch,
         final_epoch
     );
 
-    // 验收 2: 各线程返回的 epoch 单调且唯一 (每个 bump 序列化, 不重复)。
+    // Acceptance 2: epochs returned by the threads are monotonic and unique (each bump serialized, no duplicates).
     let mut sorted = epochs.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(
         sorted.len(),
         CONCURRENT_ADDS,
-        "P1-5: 各 add_rule 返回的 epoch 须唯一 (无两线程同 bump), got epochs={:?}",
+        "P1-5: epochs returned by add_rule must be unique (no two threads bump the same value), got epochs={:?}",
         epochs
     );
 
-    // 验收 3: 16 条规则全落盘 (重新 load 规则集, 数量含 16 新增)。
+    // Acceptance 3: all 16 rules persisted (reload the ruleset, count includes the 16 new rules).
     let reloaded = store
         .load_rules()
         .expect("load_rules query")
@@ -110,7 +115,7 @@ fn concurrent_add_rule_no_lost_epoch_bump() {
         let found = reloaded.rules.iter().any(|r| r.name == name);
         assert!(
             found,
-            "P1-5: 并发 add_rule 后规则 {} 须落盘 (无丢规则)",
+            "P1-5: rule {} must be persisted after concurrent add_rule (no lost rules)",
             name
         );
     }
@@ -118,7 +123,8 @@ fn concurrent_add_rule_no_lost_epoch_bump() {
     cleanup(&dir);
 }
 
-// P1-5 对照: 单线程连续 add_rule → epoch 严格增 N (基线, 证并发测试非偶然通过)。
+// P1-5 control: sequential single-thread add_rule → epoch strictly increases by N (baseline, proving the concurrent
+// test does not pass by accident).
 #[test]
 fn sequential_add_rule_epoch_strictly_increases() {
     let (db, dir) = temp_env();
@@ -131,13 +137,13 @@ fn sequential_add_rule_epoch_strictly_increases() {
         assert_eq!(
             ep,
             start_epoch + 1 + i as u64,
-            "P1-5: 连续 add_rule epoch 须严格 +1 每次"
+            "P1-5: sequential add_rule epoch must strictly +1 each time"
         );
     }
     assert_eq!(
         engine.epoch(),
         start_epoch + CONCURRENT_ADDS as u64,
-        "P1-5: 连续 add_rule 终态 epoch"
+        "P1-5: sequential add_rule final epoch"
     );
 
     cleanup(&dir);

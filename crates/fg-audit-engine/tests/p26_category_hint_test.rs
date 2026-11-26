@@ -1,9 +1,11 @@
-// P2-6 (audit §3.2/F6, PRD §6.3 H9): category_hint 边界传递 + 风险地板。
-// 旧 IPC 不收 category_hint, 调用方 hint 在边界丢弃 → H9 半实现 (caller 无法传 hint)。
-// 修: IPC 收 category_hint? 传入 AuditEngine::evaluate; hint 仅作风险地板 (max(推断,命中,hint))
-// 抬等级永不压低, L3/L4 由真实规则命中驱动 (非 caller 声明), hint 地板封顶 L2。
-// 需 FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore 加载密钥)。
-// test-helpers feature 透传。
+// P2-6 (audit §3.2/F6, PRD §6.3 H9): category_hint boundary passthrough + risk floor.
+// The old IPC did not accept category_hint; the caller's hint was dropped at the boundary → H9 half-implemented
+// (callers could not pass hints).
+// Fix: IPC accepts category_hint? and passes it to AuditEngine::evaluate; the hint acts only as a risk floor
+// (max(inferred, hit, hint)) — it can raise the level, never lower it; L3/L4 are driven by real rule hits (not
+// caller claims); the hint floor caps at L2.
+// Requires FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore loads the key).
+// test-helpers feature forwarded.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +39,7 @@ fn cleanup(dir: &std::path::Path) {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// hint_risk_floor 纯决策 (规则 5): 已知高风险 category → L2 地板; read/clean/未知 → None。
+// hint_risk_floor pure decision (Rule 5): known high-risk categories → L2 floor; read/clean/unknown → None.
 #[test]
 fn hint_risk_floor_known_categories() {
     assert_eq!(hint_risk_floor("shell_exec"), Some(RiskLevel::L2));
@@ -47,56 +49,64 @@ fn hint_risk_floor_known_categories() {
 
 #[test]
 fn hint_risk_floor_low_or_unknown_is_none() {
-    // read/clean: 调用方主张低风险不抬地板 (反方向不取信)。
+    // read/clean: a low-risk caller claim does not raise the floor (the reverse direction is not trusted).
     assert_eq!(hint_risk_floor("read"), None);
     assert_eq!(hint_risk_floor("clean"), None);
-    // 未知 category: 不臆造风险 (caller 不能用未知名抬地板)。
+    // unknown category: do not invent risk (a caller cannot raise the floor with an unknown name).
     assert_eq!(hint_risk_floor("bogus_category"), None);
     assert_eq!(hint_risk_floor(""), None);
 }
 
-// H9 核心: hint 抬等级不压低。benign content (ls) 无 hit → L1 Allow;
-// 传 category_hint="network" → 地板 L2 > L1 → risk 升 L2, action Allow→Redact。
+// H9 core: the hint raises the level, never lowers it. Benign content (ls) has no hit → L1 Allow;
+// passing category_hint="network" → floor L2 > L1 → risk rises to L2, action Allow→Redact.
 #[tokio::test]
 async fn hint_raises_floor_from_l1_to_l2() {
     let (db, dir) = temp_env();
     let store = Arc::new(AuditStore::open(&db).unwrap());
     let engine = AuditEngine::new(store.clone()).unwrap();
 
-    // ls /tmp: 无规则命中, infer_category → "read" (L1 Allow)。
+    // ls /tmp: no rule hits, infer_category → "read" (L1 Allow).
     let no_hint = engine
         .evaluate("ls /tmp", 0, "default", ContentType::Shell, None)
         .unwrap();
-    assert_eq!(no_hint.risk_level, RiskLevel::L1, "无 hint 基线须 L1");
-    assert_eq!(no_hint.action, SafetyAction::Allow, "无 hit 须 Allow");
-    assert!(no_hint.category_hint.is_none(), "无 hint 须 None");
+    assert_eq!(
+        no_hint.risk_level,
+        RiskLevel::L1,
+        "no-hint baseline must be L1"
+    );
+    assert_eq!(no_hint.action, SafetyAction::Allow, "no hit must be Allow");
+    assert!(no_hint.category_hint.is_none(), "no hint must be None");
 
-    // 同 content + hint "network": 地板 L2 > L1 → 抬 L2, action Redact。
+    // Same content + hint "network": floor L2 > L1 → raised to L2, action Redact.
     let with_hint = engine
         .evaluate("ls /tmp", 0, "default", ContentType::Shell, Some("network"))
         .unwrap();
     assert_eq!(
         with_hint.risk_level,
         RiskLevel::L2,
-        "hint network 须抬 L2 地板"
+        "hint network must raise the L2 floor"
     );
-    assert_eq!(with_hint.action, SafetyAction::Redact, "Allow 须升 Redact");
+    assert_eq!(
+        with_hint.action,
+        SafetyAction::Redact,
+        "Allow must be raised to Redact"
+    );
     assert_eq!(
         with_hint.category_hint.as_deref(),
         Some("network"),
-        "hint 须落 verdict"
+        "hint must land on the verdict"
     );
-    // guard 推断的 inferred_category 仍是 read (content 权威), hint 不覆盖推断。
+    // The guard-inferred inferred_category stays "read" (content is authoritative); the hint does not override inference.
     assert_eq!(
         with_hint.inferred_category, "read",
-        "hint 不覆盖 content 推断"
+        "hint does not override content inference"
     );
 
     cleanup(&dir);
 }
 
-// H9 反向: hint 永不压低。rm -rf 命中 L4 Block; 传 hint "read" (低风险) → 仍 L4 Block。
-// 防 v0.1 自证降级绕过 (调用方报 read 让 rm -rf 降 L1)。
+// H9 reverse: the hint never lowers. rm -rf hits L4 Block; passing hint "read" (low risk) → still L4 Block.
+// Prevents the v0.1 self-attested downgrade bypass (a caller reporting "read" to downgrade rm -rf to L1).
 #[tokio::test]
 async fn hint_never_lowers_l4_block() {
     let (db, dir) = temp_env();
@@ -112,25 +122,38 @@ async fn hint_never_lowers_l4_block() {
             Some("read"),
         )
         .unwrap();
-    assert_eq!(v.risk_level, RiskLevel::L4, "规则命中 L4 不被 hint 压低");
-    assert_eq!(v.action, SafetyAction::Block, "Block 不被 hint 降级");
+    assert_eq!(
+        v.risk_level,
+        RiskLevel::L4,
+        "rule-hit L4 is not lowered by the hint"
+    );
+    assert_eq!(
+        v.action,
+        SafetyAction::Block,
+        "Block is not downgraded by the hint"
+    );
     assert_eq!(
         v.category_hint.as_deref(),
         Some("read"),
-        "hint 仍落 verdict (审计可见调用方主张)"
+        "hint still lands on the verdict (audit-visible caller claim)"
     );
-    // content 推断权威: inferred_category 非空且未被 hint "read" 覆盖 (hint 不改推断, 只抬地板)。
-    assert!(!v.inferred_category.is_empty(), "content 推断须非空");
+    // Content inference is authoritative: inferred_category is non-empty and not overridden by the hint "read"
+    // (the hint does not change inference, only raises the floor).
+    assert!(
+        !v.inferred_category.is_empty(),
+        "content inference must be non-empty"
+    );
     assert_ne!(
         v.inferred_category, "read",
-        "hint 不覆盖 content 推断 (H9 权威在 content)"
+        "hint does not override content inference (H9 authority is content)"
     );
 
     cleanup(&dir);
 }
 
-// hint 地板低于当前判定 → 无副作用 (地板只抬不压)。rm -rf 命中 L4 Block;
-// 传 hint "shell_exec" (L2 地板) → 地板 L2 < 当前 L4 → 不改 risk/action (地板只在低于当前时抬)。
+// Hint floor below the current verdict → no side effects (the floor only raises, never lowers). rm -rf hits
+// L4 Block; passing hint "shell_exec" (L2 floor) → floor L2 < current L4 → risk/action unchanged (the floor
+// only raises when below the current level).
 #[tokio::test]
 async fn hint_floor_below_current_no_change() {
     let (db, dir) = temp_env();
@@ -140,7 +163,7 @@ async fn hint_floor_below_current_no_change() {
     let no_hint = engine
         .evaluate("rm -rf /tmp/y", 0, "default", ContentType::Shell, None)
         .unwrap();
-    assert_eq!(no_hint.risk_level, RiskLevel::L4, "基线 L4");
+    assert_eq!(no_hint.risk_level, RiskLevel::L4, "baseline L4");
     assert_eq!(no_hint.action, SafetyAction::Block);
 
     let with_hint = engine
@@ -152,17 +175,21 @@ async fn hint_floor_below_current_no_change() {
             Some("shell_exec"),
         )
         .unwrap();
-    // shell_exec 地板 L2 < 当前 L4 → 不改 (地板只抬, 低于当前无副作用)。
-    assert_eq!(with_hint.risk_level, RiskLevel::L4, "地板<当前 不改 risk");
+    // shell_exec floor L2 < current L4 → unchanged (the floor only raises; below current it has no effect).
+    assert_eq!(
+        with_hint.risk_level,
+        RiskLevel::L4,
+        "floor<current does not change risk"
+    );
     assert_eq!(
         with_hint.action,
         SafetyAction::Block,
-        "地板<当前 不改 action"
+        "floor<current does not change action"
     );
     assert_eq!(
         with_hint.category_hint.as_deref(),
         Some("shell_exec"),
-        "hint 仍落 verdict"
+        "hint still lands on the verdict"
     );
 
     cleanup(&dir);

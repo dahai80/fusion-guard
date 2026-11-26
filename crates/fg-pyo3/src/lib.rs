@@ -1,9 +1,9 @@
-// fg-pyo3 — PyO3 绑定, maturin 目标 crate
+// fg-pyo3 — PyO3 binding, maturin target crate
 //
-// 产出 fusion_guard._native 扩展, 纯 Python guard_client.py 包装 (上游 fusion-core issue #17)。
-// PyGuardClient 包装同步 UDS JSON-RPC 客户端 (连运行中的 guard 守护进程, FUSION_GUARD_SOCK),
-// 非 in-process engine — 保留规则 SSOT (每 Python 进程独立 engine 会分叉 epoch, 违 Checkpoint 2 契约)。
-// 对齐 fusion-executor/crates/fe-pyo3 绑定机制 (maturin/#[pyclass]), 非 in-process 嵌入。
+// Produces the fusion_guard._native extension, wrapped by pure-Python guard_client.py (upstream fusion-core issue #17).
+// PyGuardClient wraps a synchronous UDS JSON-RPC client (talks to the running guard daemon, FUSION_GUARD_SOCK),
+// not an in-process engine — preserves rule SSOT (a per-Python-process engine would fork epochs, violating the Checkpoint 2 contract).
+// Mirrors the fusion-executor/crates/fe-pyo3 binding mechanism (maturin/#[pyclass]), not in-process embedding.
 
 use std::io::{BufRead, Read};
 use std::os::unix::net::UnixStream;
@@ -19,16 +19,16 @@ use fg_core::GuardVerdict;
 
 const DEFAULT_SOCK: &str = "/tmp/fusion-guard.sock";
 const ENV_SOCK: &str = "FUSION_GUARD_SOCK";
-// Issue #36: shared secret env 回退 (与 start.sh/daemon 侧同名变量)。
+// Issue #36: shared secret env fallback (same variable name as the start.sh/daemon side).
 const ENV_SHARED_SECRET: &str = "FUSION_GUARD_SHARED_SECRET";
 const FRAMING_BYTE: u8 = 0x0A;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const REQ_TIMEOUT_SECS: u64 = 2;
 static REQ_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-// ── Python 可见类型 (镜像 Rust 类型) ──────────────────────────────────
+// ── Python-visible types (mirroring the Rust types) ──────────────────────────────────
 
-/// Python 可见 verdict — 镜像 Rust GuardVerdict
+/// Python-visible verdict — mirrors Rust GuardVerdict
 #[pyclass(name = "NativeGuardVerdict", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGuardVerdict {
@@ -54,7 +54,7 @@ struct PyGuardVerdict {
     verdict_ttl_secs: u32,
     #[pyo3(get)]
     inferred_category: String,
-    // P2-6 (H9): 调用方传入的 category_hint (None=未传)。审计可见调用方主张。
+    // P2-6 (H9): caller-supplied category_hint (None = not provided). Caller claim is visible to the audit.
     #[pyo3(get)]
     category_hint: Option<String>,
 }
@@ -62,8 +62,8 @@ struct PyGuardVerdict {
 impl From<GuardVerdict> for PyGuardVerdict {
     fn from(v: GuardVerdict) -> Self {
         Self {
-            // C11/P0-G7: 用 serde 网络序列化 (lowercase, 契约对齐) 而非 Debug 表示。
-            // 服务端 to_value 现序列化 "block"/"l4", 客户端须同源取值, 不再反向依赖 Debug。
+            // C11/P0-G7: use serde wire serialization (lowercase, contract-aligned) instead of the Debug representation.
+            // Server to_value now serializes "block"/"l4"; the client must take values from the same source, no longer reverse-depending on Debug.
             action: serde_str(&v.action),
             risk_level: serde_str(&v.risk_level),
             reason: v.reason,
@@ -80,8 +80,8 @@ impl From<GuardVerdict> for PyGuardVerdict {
     }
 }
 
-// C11: 取枚举的 serde JSON 字符串 (rename_all=lowercase → "block"/"l4"/"ast" 等),
-// 去引号, 失败回退 "unknown"。与服务端 to_value 同源, 斩 Debug 依赖。
+// C11: take the enum's serde JSON string (rename_all=lowercase → "block"/"l4"/"ast" etc.),
+// strip quotes, fall back to "unknown" on failure. Same source as server to_value, cutting the Debug dependency.
 fn serde_str<T: serde::Serialize>(v: &T) -> String {
     match serde_json::to_value(v) {
         Ok(Value::String(s)) => s,
@@ -116,7 +116,7 @@ impl PyGuardVerdict {
     }
 }
 
-/// Python 可见 rule — 镜像 Rust GuardRule
+/// Python-visible rule — mirrors Rust GuardRule
 #[pyclass(name = "NativeGuardRule", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGuardRule {
@@ -146,7 +146,7 @@ impl PyGuardRule {
     }
 }
 
-/// Python 可见脱敏结果 — 镜像 Rust RedactResult
+/// Python-visible redact result — mirrors Rust RedactResult
 #[pyclass(name = "NativeRedactResult", skip_from_py_object)]
 #[derive(Clone)]
 struct PyRedactResult {
@@ -166,7 +166,7 @@ impl PyRedactResult {
     }
 }
 
-/// Python 可见链式 hash 校验结果 — 镜像 Rust ChainVerification / SubChainVerification
+/// Python-visible chain hash verification result — mirrors Rust ChainVerification / SubChainVerification
 #[pyclass(name = "NativeChainVerification", skip_from_py_object)]
 #[derive(Clone)]
 struct PyChainVerification {
@@ -194,7 +194,7 @@ impl PyChainVerification {
     }
 }
 
-// P0-5: 全链聚合校验结果 (audit + tcc + rules + dead_letter)。
+// P0-5: all-chains aggregated verification result (audit + tcc + rules + dead_letter).
 #[pyclass(name = "NativeAllChainsVerification", skip_from_py_object)]
 #[derive(Clone)]
 struct PyAllChainsVerification {
@@ -224,22 +224,22 @@ impl PyAllChainsVerification {
     }
 }
 
-// ── UDS JSON-RPC 客户端 (同步, 带连接复用) ───────────────────────────
+// ── UDS JSON-RPC client (synchronous, with connection reuse) ───────────────────────────
 
-// P2-4 (audit §3.6): 旧 `UdsClient::call` 每次 connect+write+read+drop —— 每次调用付
-// UDS connect 握手开销 (socket 创建+bind+connect+accept 内核态往返), 高频 L1 evaluate
-// P99 被握手主导, 9 端并发下 P99<1ms 不可达。服务端 conn_loop 已循环处理单连接多请求
-// (read→dispatch→write 循环, EOF 才断, CONN_DEADLINE_SECS=30s 兜底) —— 无需改服务端。
-// 仅客户端复用: UdsClient 持 Mutex<Option<UnixStream>> 持久连接, call 取出复用, IO 错
-// (服务端 30s deadline 断 / 对端重启 / 偶发) → drop 旧流重连一次重试 (透明自愈), 不暴露给调用方。
-// Python 单线程阻塞模型, 一次一请求在途, 无需多路复用 —— 单连接复用即消除握手开销。
-/// 内部同步 UDS 客户端 — 持久连接复用 (P2-4)
-/// pub(crate) 暴露供集成测试验证 wire contract (无 Python 环境)
+// P2-4 (audit §3.6): the old `UdsClient::call` did connect+write+read+drop every time — every call paid
+// the UDS connect handshake cost (socket create+bind+connect+accept kernel round trip); for high-frequency L1 evaluate
+// P99 was dominated by the handshake, making P99<1ms unreachable with 9 concurrent callers. The server conn_loop already loops over multiple requests per connection
+// (read→dispatch→write loop, disconnects only on EOF, CONN_DEADLINE_SECS=30s backstop) — no server change needed.
+// Client-side reuse only: UdsClient holds a persistent Mutex<Option<UnixStream>> connection; call takes it out for reuse, and on IO error
+// (server 30s deadline disconnect / peer restart / sporadic) → drop the old stream, reconnect, and retry once (transparent self-healing), never surfaced to the caller.
+// Python is a single-threaded blocking model with one request in flight at a time; no multiplexing needed — a single reused connection eliminates the handshake overhead.
+/// Internal synchronous UDS client — persistent connection reuse (P2-4)
+/// Exposed as pub(crate) so integration tests can verify the wire contract (no Python environment)
 pub struct UdsClient {
     sock: PathBuf,
     conn: std::sync::Mutex<Option<UnixStream>>,
-    // Issue #36: §12.1 shared secret —— Some 时注入每个非 ping 请求 params["secret"]
-    // (服务端 PeerAuthorizer 非 ping 强校验, ping 对任意对端开放)。
+    // Issue #36: §12.1 shared secret — when Some, inject params["secret"] into every non-ping request
+    // (server PeerAuthorizer enforces it strictly on non-ping; ping is open to any peer).
     shared_secret: Option<String>,
 }
 
@@ -258,7 +258,7 @@ impl UdsClient {
         }
     }
 
-    // Issue #36: 显式携带 shared secret (None = 不注入, dev daemon 无 secret 时行为不变)。
+    // Issue #36: explicitly carry the shared secret (None = do not inject; behavior unchanged when the dev daemon has no secret).
     pub fn new_with_secret(sock: PathBuf, shared_secret: Option<String>) -> Self {
         Self {
             sock,
@@ -268,8 +268,8 @@ impl UdsClient {
     }
 
     pub fn call(&self, method: &str, mut params: Value) -> std::result::Result<Value, RpcError> {
-        // Issue #36: 非 ping 请求注入 params["secret"] (§12.1 第二因子)。
-        // ping 服务端对任意对端开放, 不注入 (与 server 语义对齐)。
+        // Issue #36: inject params["secret"] into non-ping requests (§12.1 second factor).
+        // ping is open to any peer server-side; do not inject (aligned with server semantics).
         if method != "guard.ping" {
             if let Some(secret) = &self.shared_secret {
                 if let Some(obj) = params.as_object_mut() {
@@ -296,8 +296,8 @@ impl UdsClient {
             });
         }
 
-        // P2-4: 首次用持久流; IO 错 (服务端 deadline 断/重启) → drop 旧流重连一次重试。
-        // 重试仅一次 (避免循环重连放大故障), 第二次错即报出。
+        // P2-4: use the persistent stream first; on IO error (server deadline disconnect/restart) → drop the old stream, reconnect, retry once.
+        // Retry only once (avoid reconnect loops amplifying the fault); surface the second error.
         match self.call_once(&req_bytes) {
             Ok(v) => Ok(v),
             Err(first) => {
@@ -307,11 +307,11 @@ impl UdsClient {
         }
     }
 
-    // P2-4: 单次 call —— 取持久流 (无则 connect 新建), 写请求读响应, IO 错 → 清流 (下次重连)。
-    // 成功保留流供复用。流按借用读写 (BufReader<&UnixStream>), 不消耗/clone, 同 fd 跨调用复用。
+    // P2-4: single call — take the persistent stream (connect a new one if absent), write the request and read the response; on IO error → clear the stream (reconnect next time).
+    // On success the stream is kept for reuse. The stream is read/written by borrow (BufReader<&UnixStream>), never consumed/cloned; the same fd is reused across calls.
     fn call_once(&self, req_bytes: &[u8]) -> std::result::Result<Value, RpcError> {
         let mut guard = self.conn.lock().expect("conn mutex poisoned");
-        // 无持久流或上次 IO 错清空 → connect 新建 (lazy, 首次 call 才建)。
+        // No persistent stream, or it was cleared after a previous IO error → connect a new one (lazy, created on first call).
         if guard.is_none() {
             let stream = UnixStream::connect(&self.sock).map_err(|e| RpcError {
                 code: -32010,
@@ -322,9 +322,9 @@ impl UdsClient {
             *guard = Some(stream);
         }
         let stream = guard.as_mut().expect("conn just ensured Some");
-        // 借用读写: 不消耗 stream, 持久 fd 保留供下次 call 复用。
+        // Read/write by borrow: do not consume the stream; the persistent fd is kept for reuse by the next call.
         if let Err(e) = std::io::Write::write_all(stream, req_bytes) {
-            // 写错 = 流已坏 (对端断/EPIPE), 清空促下次重连。
+            // Write error = the stream is broken (peer disconnect/EPIPE); clear it to force a reconnect next time.
             tracing::debug!(error = %e, "write failed — clearing persistent conn (P2-4)");
             *guard = None;
             return Err(RpcError {
@@ -333,14 +333,14 @@ impl UdsClient {
             });
         }
         let mut buf = Vec::new();
-        // C17: 响应读取限流 (MAX_LINE_BYTES+1), take 截断后查超限。
-        // 恶意/失控服务端返回巨响应不再无界缓冲到 Python 进程 OOM。
+        // C17: response read cap (MAX_LINE_BYTES+1); truncate with take, then check for overrun.
+        // A malicious/runaway server returning a huge response no longer buffers unboundedly and OOMs the Python process.
         let reader = std::io::BufReader::new(stream);
         if let Err(e) = reader
             .take((MAX_LINE_BYTES + 1) as u64)
             .read_until(FRAMING_BYTE, &mut buf)
         {
-            // 读错 = 流已坏 (服务端 deadline 断/EOF/超时), 清空促重连。
+            // Read error = the stream is broken (server deadline disconnect/EOF/timeout); clear it to force a reconnect.
             tracing::debug!(error = %e, "read failed — clearing persistent conn (P2-4)");
             *guard = None;
             return Err(RpcError {
@@ -359,7 +359,7 @@ impl UdsClient {
             buf.pop();
         }
         if buf.is_empty() {
-            // 服务端正常关闭 (EOF) = 流生命周期尽, 清空促下次重连。
+            // Server closed normally (EOF) = the stream lifecycle ended; clear it to force a reconnect next time.
             *guard = None;
             return Err(RpcError {
                 code: -32010,
@@ -371,8 +371,8 @@ impl UdsClient {
             message: format!("parse resp: {e}"),
         })?;
 
-        // 成功响应带 "error": null (Option<RpcError> serialize None → null),
-        // 须排除 null — 仅 error 为非 null 对象才算错误
+        // Success responses carry "error": null (Option<RpcError> serializes None → null),
+        // so null must be excluded — only a non-null error object counts as an error
         if let Some(Value::Object(err)) = resp.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(-32603) as i32;
             let message = err
@@ -398,10 +398,10 @@ fn map_rpc_err(e: RpcError) -> PyErr {
     }
 }
 
-// ── 主入口: PyGuardClient ─────────────────────────────────────────────
+// ── Main entry: PyGuardClient ─────────────────────────────────────────────
 
-/// Python 可见 guard 客户端 — UDS JSON-RPC 调运行中守护进程
-/// P2-4: 持持久 UdsClient (内含 Mutex<Option<UnixStream>> 连接复用), 非 sock 每次新建。
+/// Python-visible guard client — UDS JSON-RPC calls into the running daemon
+/// P2-4: holds a persistent UdsClient (with Mutex<Option<UnixStream>> connection reuse inside), not a new socket per call.
 #[pyclass(name = "NativeGuardClient", skip_from_py_object)]
 struct PyGuardClient {
     client: UdsClient,
@@ -466,9 +466,9 @@ impl PyGuardClient {
             .map(PathBuf::from)
             .or_else(|| std::env::var(ENV_SOCK).ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCK));
-        // Issue #36: 显式参数 > FUSION_GUARD_SHARED_SECRET env > None。
-        // daemon 开 secret (Keychain 或 --insecure-secret-env) 时非 ping 调用须携带,
-        // 否则 -32001 unauthorized: secret denied (GuardSafetyBackend 全降级 fail-closed)。
+        // Issue #36: explicit argument > FUSION_GUARD_SHARED_SECRET env > None.
+        // When the daemon enforces the secret (Keychain or --insecure-secret-env), non-ping calls must carry it,
+        // otherwise -32001 unauthorized: secret denied (GuardSafetyBackend fully degrades fail-closed).
         let secret = shared_secret
             .or_else(|| std::env::var(ENV_SHARED_SECRET).ok())
             .filter(|s| !s.is_empty());
@@ -497,8 +497,8 @@ impl PyGuardClient {
     /// evaluate(content, caller_epoch=0, tenant_id=None, requester=None, content_type="shell", category_hint=None) -> NativeGuardVerdict
     /// content_type: "shell" (default, run tokenizer) | "code" (run tree-sitter semantic)
     ///               | "json"/"yaml"/"text" (regex only, skip tokenizer+semantic)
-    /// category_hint: 调用方 category hint (H9, PRD §6.3) —— guard 从 content 推断权威,
-    ///                hint 仅作风险地板抬等级不压低。None=不传 (向后兼容)。
+    /// category_hint: caller category hint (H9, PRD §6.3) — guard infers authoritatively from content;
+    ///                the hint only acts as a risk floor, raising the level but never lowering it. None = not passed (backward compatible).
     #[pyo3(signature = (content, caller_epoch=0, tenant_id=None, requester=None, content_type="shell", category_hint=None))]
     fn evaluate(
         &self,
@@ -537,12 +537,12 @@ impl PyGuardClient {
             .client()
             .call("guard.rule.list", Value::Object(Default::default()))
             .map_err(map_rpc_err)?;
-        // L9: epoch 缺失报错 (回退 0 会让 caller 永持陈旧 epoch, 后续 evaluate 永判 stale)。
+        // L9: error when epoch is missing (falling back to 0 would leave the caller holding a stale epoch forever, making every later evaluate stale).
         let epoch = res
             .get("epoch")
             .and_then(Value::as_u64)
             .ok_or_else(|| PyValueError::new_err("rule.list response missing 'epoch'"))?;
-        // rules 缺失当空 (合法: 无规则), 但类型错即报错。
+        // Missing rules is treated as empty (legal: no rules), but a wrong type is an error.
         let arr = match res.get("rules").cloned() {
             Some(Value::Array(a)) => a,
             Some(_) => return Err(PyValueError::new_err("rule.list 'rules' not array")),
@@ -562,7 +562,7 @@ impl PyGuardClient {
             .client()
             .call("guard.redact", params)
             .map_err(map_rpc_err)?;
-        // L9: redacted_content 缺失即报错 (勿静默空串伪装成功脱敏)。
+        // L9: error when redacted_content is missing (never silently pass an empty string off as a successful redaction).
         let redacted_content = res
             .get("redacted_content")
             .and_then(Value::as_str)
@@ -584,7 +584,7 @@ impl PyGuardClient {
             .client()
             .call("guard.reveal", params)
             .map_err(map_rpc_err)?;
-        // L9: 勿 unwrap_or("") 掩盖服务端缺失 — 显式报错 (空串会被 caller 当成功 reveal)。
+        // L9: never mask a missing server field with unwrap_or("") — error explicitly (an empty string would read as a successful reveal).
         res.get("content")
             .and_then(Value::as_str)
             .map(String::from)
@@ -614,7 +614,7 @@ impl PyGuardClient {
             .client()
             .call("guard.confirm", params)
             .map_err(map_rpc_err)?;
-        // L9: 勿 unwrap_or(res) 回退 — 服务端缺 "verdict" 字段即报错, 不拿裸响应当 verdict 解析。
+        // L9: never fall back to unwrap_or(res) — error when the server omits the "verdict" field; do not parse the raw response as a verdict.
         let verdict_val = res
             .get("verdict")
             .cloned()
@@ -657,8 +657,8 @@ impl PyGuardClient {
     }
 
     /// audit_verify() -> NativeAllChainsVerification
-    /// P0-5: 全链聚合 (audit + tcc + rules + dead_letter)。每条子链解析为 PyChainVerification,
-    /// 顶层 tampered = 任一子链坏。L9: 关键字段缺失 → PyValueError (勿静默回退 false)。
+    /// P0-5: all-chain aggregation (audit + tcc + rules + dead_letter). Each subchain parses into a PyChainVerification;
+    /// top-level tampered = any subchain broken. L9: missing key fields → PyValueError (never silently fall back to false).
     fn audit_verify(&self) -> PyResult<PyAllChainsVerification> {
         let res = self
             .client()
@@ -701,16 +701,16 @@ impl PyGuardClient {
 }
 
 impl PyGuardClient {
-    // P2-4: 返回持久 UdsClient 引用 (内含连接池), 不每次新建 —— 复用 UDS 连接。
+    // P2-4: return a reference to the persistent UdsClient (with connection pooling inside); never create a new one per call — reuse the UDS connection.
     fn client(&self) -> &UdsClient {
         &self.client
     }
 }
 
-// M9: Value → Python 直转 (非 to_string + json.loads 往返)。
-// 原实现 serde_json::to_string 再 Python json.loads —— f64 经 JSON 十进制串可能丢精度
-// (如 0.1+0.2 二进制 f64 序列化为短十进制再解析回略偏值), 且每次调 import json + parse 开销。
-// 直转递归构造 Python 对象, f64 走 PyO3 原生 f64 注入, 精度保真, 零 import。
+// M9: convert Value directly to Python (not a to_string + json.loads round trip).
+// The old implementation used serde_json::to_string then Python json.loads — f64 through a JSON decimal string can lose precision
+// (e.g. 0.1+0.2 as binary f64 serializes to a short decimal and parses back slightly off), plus the per-call cost of import json + parse.
+// Direct conversion recursively builds the Python objects; f64 goes through PyO3's native f64 injection — exact precision, zero imports.
 fn json_to_py(py: Python, val: Value) -> PyResult<Py<PyAny>> {
     value_to_obj(py, &val)
 }

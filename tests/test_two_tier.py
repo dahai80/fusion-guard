@@ -3,14 +3,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from fusion_guard.laya_guard import LayaGuardClient
 from fusion_guard.two_tier import (
+    DEFAULT_MIN_CONFIDENCE,
+    LAYA_MAX_PROMPT_CHARS,
     TwoTierGuard,
     TwoTierResult,
-    LAYA_MAX_PROMPT_CHARS,
-    DEFAULT_MIN_CONFIDENCE,
     _load_min_confidence,
 )
-from fusion_guard.laya_guard import LayaGuardClient, GuardResult, DimensionScore
 
 
 def _guard_answer(jailbreak=0.0, injection=0.0, sensitive=0.0, harm=0.0, topic="other", confidence=0.9):
@@ -171,7 +171,7 @@ def test_prompt_truncated_to_laya_max(mock_post):
     full = _fake_full()
     tt = _two_tier(full)
     long_prompt = "x" * (LAYA_MAX_PROMPT_CHARS + 500)
-    r = tt.evaluate(long_prompt)
+    tt.evaluate(long_prompt)
     sent = mock_post.call_args.kwargs["json"]["prompt"]
     assert len(sent) == LAYA_MAX_PROMPT_CHARS
     assert tt.stats["truncated_prompts"] == 1
@@ -259,6 +259,7 @@ def _check_laya():
         return _LAYA_AVAILABLE
     try:
         import httpx
+
         key = os.environ.get("FUSION_CLIENT_KEY") or os.environ.get("FUSION_MLX_API_KEY", "fg-admin-key")
         base = os.environ.get("FUSION_GUARD_LAYA_BASE", "http://127.0.0.1:11434")
         resp = httpx.get(base + "/v1/laya/status", headers={"Authorization": "Bearer " + key}, timeout=3)
@@ -304,8 +305,8 @@ class TestTwoTierIntegration:
         if warm.precheck.fallback:
             pytest.skip("laya endpoint unavailable")
         r = tt.evaluate("hello world")
-        assert r.precheck.latency_ms < 200.0, (
-            "pre-check latency {}ms pathological; see fusion-mlx#1646".format(r.precheck.latency_ms)
+        assert r.precheck.latency_ms < 200.0, "pre-check latency {}ms pathological; see fusion-mlx#1646".format(
+            r.precheck.latency_ms
         )
 
     def test_real_agreement_sample(self):

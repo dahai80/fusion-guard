@@ -1,21 +1,21 @@
-// fg-es — Endpoint Security 高危系统事件监控 (PRD Phase 7, Q#3)
+// fg-es — Endpoint Security high-risk system event monitor (PRD Phase 7, Q#3)
 //
-// macOS Endpoint Security framework 监控高危系统事件 (exec/file-write/rename/unlink/socket)。
-// **资质约束**: ES client 需 `com.apple.developer.endpoint-security.client` entitlement
-// (Apple 开发者协议签署 + provisioning)。无 entitlement:
-//   - 真实 ES C FFI 无法运行 (ESNewClient 返回缺权限错误)
-//   - 降级路径 (PRD Q#3): 退回 TCC runtime prompt (Phase 5 已覆盖 TCC)
+// macOS Endpoint Security framework monitors high-risk system events (exec/file-write/rename/unlink/socket).
+// **Entitlement constraint**: the ES client needs the `com.apple.developer.endpoint-security.client` entitlement
+// (Apple developer agreement signing + provisioning). Without the entitlement:
+//   - the real ES C FFI cannot run (ESNewClient returns a permission error)
+//   - degrade path (PRD Q#3): fall back to the TCC runtime prompt (Phase 5 already covers TCC)
 //
-// 本 crate 为安全类型层 (unsafe_code=deny), FFI 逻辑在 fg-es-bridge (唯一 allow crate)。
-// build.rs 检测 entitlement/编译环境 → 无则发 cfg(es_bridge_stub) + C stub fallback
-// (返回 degraded=true, 无事件), 镜像 fg-tcc-bridge stub 范式。
+// This crate is the safe types layer (unsafe_code=deny); FFI logic lives in fg-es-bridge (the sole allow crate).
+// build.rs detects the entitlement/compile environment → if absent emits cfg(es_bridge_stub) + a C stub fallback
+// (degraded=true, no events), mirroring the fg-tcc-bridge stub pattern.
 //
-// 当前落地 (无 entitlement 开发环境): stub 模式 — 提供类型 + degraded 状态 + 空事件流,
-// 真实 ES 绑定待 entitlement 就位后接入 (ESNewClient/ESSubscribe/ESNewClientResult)。
+// Currently landed (dev environment without entitlement): stub mode — types + degraded status + empty event stream;
+// the real ES binding lands once the entitlement is in place (ESNewClient/ESSubscribe/ESNewClientResult).
 
 use serde::{Deserialize, Serialize};
 
-// ── 监控事件种类 (PRD: 高危系统事件) ──────────────────────────────────
+// ── Monitored event kinds (PRD: high-risk system events) ──────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EsEventKind {
@@ -49,7 +49,7 @@ impl EsEventKind {
     }
 }
 
-// ── ES 事件记录 (监控捕获后落审计) ────────────────────────────────────
+// ── ES event record (captured by the monitor, then audited) ────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EsEvent {
@@ -60,16 +60,16 @@ pub struct EsEvent {
     pub ts: i64,
 }
 
-// ── ES 监控器状态 ─────────────────────────────────────────────────────
+// ── ES monitor state ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EsMonitorState {
-    // 真实 ES client 运行中 (有 entitlement, 订阅生效)
+    // Real ES client running (entitlement present, subscription effective)
     Active,
-    // 无 entitlement → 降级, 退回 TCC (PRD Q#3)
+    // No entitlement → degraded, fall back to TCC (PRD Q#3)
     Degraded,
-    // 监控未启动
+    // Monitor not started
     Inactive,
 }
 
@@ -92,9 +92,9 @@ impl EsStatus {
     }
 }
 
-// ── 监控器 (配置 + 启动 + 取事件) ─────────────────────────────────────
-// 当前 stub 模式: monitor_events 返回空 (degraded), 启动即记录降级
-// 真实模式 (entitlement 就位): fg-es-bridge ESNewClient + ESSubscribe → 事件流
+// ── Monitor (config + start + fetch events) ─────────────────────────────────────
+// Current stub mode: monitor_events returns empty (degraded); start records the degraded state
+// Real mode (entitlement in place): fg-es-bridge ESNewClient + ESSubscribe → event stream
 
 pub struct EsMonitor {
     kinds: Vec<EsEventKind>,
@@ -116,8 +116,8 @@ impl EsMonitor {
             );
             return EsStatus::degraded();
         }
-        // 真实 ES 路径 (entitlement 就位后): 调 fg_es_bridge::new_client + subscribe
-        // 当前 unreachable — build.rs 无 entitlement 即发 stub cfg
+        // Real ES path (once the entitlement is in place): call fg_es_bridge::new_client + subscribe
+        // Currently unreachable — build.rs emits the stub cfg when no entitlement exists
         self.active = true;
         EsStatus {
             state: EsMonitorState::Active,
@@ -153,7 +153,7 @@ impl EsMonitor {
         }
     }
 
-    // stub 模式恒空 (degraded, 无事件); 真实模式从 bridge 拉事件
+    // Stub mode is always empty (degraded, no events); real mode pulls events from the bridge
     pub fn monitor_events(&self) -> Vec<EsEvent> {
         if fg_es_bridge::is_stub() {
             return Vec::new();
@@ -162,7 +162,7 @@ impl EsMonitor {
     }
 }
 
-// ── 默认订阅高危事件集 ────────────────────────────────────────────────
+// ── Default set of high-risk subscribed events ────────────────────────────────────────────────
 
 pub fn default_kinds() -> Vec<EsEventKind> {
     vec![

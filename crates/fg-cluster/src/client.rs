@@ -1,15 +1,15 @@
-// client.rs — multi-node HTTP 客户端 (issue #52 跨节点 TRANSPORT 消费方)。
+// client.rs — multi-node HTTP client (issue #52 cross-node TRANSPORT consumer).
 //
-// 连 fusion-multi-node master HTTP API (本地/LAN, 无云):
-//   GET  /api/v1/audit/chain?since_seq=N     — 拉审计链段
-//   GET  /api/v1/rules/epoch                 — 查集群规则纪元
-//   POST /api/v1/rules/epoch/advance         — 推进纪元 (leader-only, ADMIN)
-//   POST /api/confirm                         — confirm 中继 (MAC 鉴集群成员)
-//   GET  /api/v1/confirms?epoch=N            — 查 confirm 聚合
-// 鉴权: Bearer cluster_token (集群令牌, env 注入)。5s 超时。
+// Connects to the fusion-multi-node master HTTP API (local/LAN, no cloud):
+//   GET  /api/v1/audit/chain?since_seq=N     — fetch audit chain segment
+//   GET  /api/v1/rules/epoch                 — query cluster rule epoch
+//   POST /api/v1/rules/epoch/advance         — advance epoch (leader-only, ADMIN)
+//   POST /api/confirm                        — confirm relay (MAC authenticates cluster membership)
+//   GET  /api/v1/confirms?epoch=N            — query confirm aggregation
+// Auth: Bearer cluster_token (cluster token, env injected). 5s timeout.
 //
-// 阻塞客户端 (reqwest::blocking) — fg-ipc handle_method 跑在 spawn_blocking 独立线程,
-// 非 tokio worker, 故阻塞 IO 安全 (不会卡异步运行时)。失败 fail-closed: 网络错/非 2xx → Err。
+// Blocking client (reqwest::blocking) — fg-ipc handle_method runs on a dedicated spawn_blocking thread,
+// not a tokio worker, so blocking IO is safe (does not stall the async runtime). Fail-closed on failure: network error/non-2xx → Err.
 
 use crate::key::{canonical_json, derive_confirm_relay_key, mac_payload};
 use crate::{
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 const TIMEOUT_SECS: u64 = 5;
 
-// 集群消费方配置 — master 地址 + cluster_token (env FUSION_GUARD_CLUSTER_TOKEN 或注入)。
+// Cluster consumer config — master address + cluster_token (env FUSION_GUARD_CLUSTER_TOKEN or injected).
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub master_host: String,
@@ -30,8 +30,8 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    // 从 env 构造 (FUSION_GUARD_CLUSTER_TOKEN + FUSION_GUARD_CLUSTER_MASTER_HOST/PORT)。
-    // token 缺失 → None (单节点模式, 不消费跨节点原语)。
+    // Build from env (FUSION_GUARD_CLUSTER_TOKEN + FUSION_GUARD_CLUSTER_MASTER_HOST/PORT).
+    // Missing token → None (single-node mode, no cross-node primitive consumption).
     pub fn from_env() -> Option<Self> {
         let token = std::env::var("FUSION_GUARD_CLUSTER_TOKEN").ok()?;
         if token.is_empty() {
@@ -51,7 +51,7 @@ impl ClusterConfig {
     }
 }
 
-// multi-node HTTP 客户端 — 持久 reqwest::blocking::Client (连接池复用)。
+// multi-node HTTP client — persistent reqwest::blocking::Client (connection pool reuse).
 #[derive(Debug, Clone)]
 pub struct ClusterClient {
     cfg: ClusterConfig,
@@ -77,7 +77,7 @@ impl ClusterClient {
         Ok(Self { cfg, http })
     }
 
-    // 借配置 (IPC 需读 cluster_token 派生 audit-chain 密钥做本地链验证)。
+    // Borrow the config (IPC needs cluster_token to derive the audit-chain key for local chain verification).
     pub fn cfg_ref(&self) -> &ClusterConfig {
         &self.cfg
     }
@@ -106,7 +106,7 @@ impl ClusterClient {
         serde_json::from_str(&body).map_err(|e| ClusterError::Decode(format!("decode: {e}")))
     }
 
-    // 原语 1 — 拉审计链段 (since_seq 过滤, seq>=N 或无 seq 基线记录)。
+    // Primitive 1 — fetch audit chain segment (since_seq filter, seq>=N or baseline records without seq).
     pub fn fetch_audit_chain(&self, since_seq: u64) -> Result<AuditChainResponse, ClusterError> {
         let url = format!(
             "{}?since_seq={}",
@@ -124,7 +124,7 @@ impl ClusterClient {
         Ok(result)
     }
 
-    // 原语 2 — 查集群规则纪元 (master 内存态, 重启归零)。
+    // Primitive 2 — query cluster rule epoch (master in-memory state, resets on restart).
     pub fn get_rule_epoch(&self) -> Result<RuleEpochResponse, ClusterError> {
         let resp = self
             .http
@@ -135,7 +135,7 @@ impl ClusterClient {
         Self::decode_resp(resp)
     }
 
-    // 原语 2 — 推进集群规则纪元 (leader-only, 非 leader 返 409)。
+    // Primitive 2 — advance cluster rule epoch (leader-only, non-leader returns 409).
     pub fn advance_rule_epoch(&self, reason: &str) -> Result<RuleEpochResponse, ClusterError> {
         let req = RuleEpochAdvanceRequest {
             reason: reason.to_string(),
@@ -150,7 +150,7 @@ impl ClusterClient {
         Self::decode_resp(resp)
     }
 
-    // 原语 3 — confirm 中继到 master 聚合 (构 MAC, 鉴集群成员身份)。
+    // Primitive 3 — relay confirm to master aggregation (builds MAC, authenticates cluster membership).
     pub fn relay_confirm(
         &self,
         confirm_id: &str,
@@ -160,7 +160,7 @@ impl ClusterClient {
         ts: &str,
     ) -> Result<ConfirmRelayResponse, ClusterError> {
         let key = derive_confirm_relay_key(&self.cfg.cluster_token);
-        // MAC 签名输入 = ConfirmPayload 减 mac (canonical)。
+        // MAC signing input = ConfirmPayload minus mac (canonical).
         let payload = ConfirmPayload {
             confirm_id: confirm_id.to_string(),
             node_id: node_id.to_string(),
@@ -191,7 +191,7 @@ impl ClusterClient {
         Ok(result)
     }
 
-    // 原语 3 — 查 confirm 聚合 (可按 epoch 过滤)。
+    // Primitive 3 — query confirm aggregation (optionally filtered by epoch).
     pub fn list_confirms(&self, epoch: Option<u64>) -> Result<ConfirmListResponse, ClusterError> {
         let url = match epoch {
             Some(e) => format!("{}?epoch={}", self.url("/api/v1/confirms"), e),

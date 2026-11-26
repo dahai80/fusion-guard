@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
-
 from fusion_core.config import client_key
 
 logger = logging.getLogger("fusion_guard.laya_guard")
@@ -185,12 +184,16 @@ class LayaGuardClient:
         if blocked:
             logger.warning(
                 "laya-guard BLOCKED prompt | reasons=%s | topic=%s | latency=%.2fms",
-                reasons, topic, latency,
+                reasons,
+                topic,
+                latency,
             )
         elif flagged:
             logger.info(
                 "laya-guard flagged (below threshold, non-zero) | %s | topic=%s | latency=%.2fms",
-                flagged, topic, latency,
+                flagged,
+                topic,
+                latency,
             )
         else:
             logger.debug("laya-guard allowed | topic=%s | latency=%.2fms", topic, latency)

@@ -45,8 +45,10 @@ fn query_status_returns_six_services() {
 fn query_status_source_tagged() {
     let statuses = query_status();
     for s in &statuses {
-        // P1-6: AppleEvents live 路径标 "apple-events:unknown" (非 live, 桥恒返 0 非真实查询)。
-        // 三态合法: swift-bridge:live (5 服务真实查) / tccutil:stub (全桥 stub) / apple-events:unknown。
+        // P1-6: the AppleEvents live path tags "apple-events:unknown" (not live; the bridge always
+        // returns 0, not a real query).
+        // Three legal states: swift-bridge:live (5 services truly queried) / tccutil:stub (whole
+        // bridge stubbed) / apple-events:unknown.
         assert!(
             s.source == "swift-bridge:live"
                 || s.source == "tccutil:stub"
@@ -57,10 +59,13 @@ fn query_status_source_tagged() {
     }
 }
 
-// P1-6 (audit §P1-6): AppleEvents 真实查询回归。
-// Swift bridge 恒返 0 (guard 非 AE 自动化发起方, 无目标 app, 无法给单一布尔值)。
-// live 路径 (非 stub) 须标 source "apple-events:unknown" (非 live), 不误报为确定 false。
-// authorized=false 因桥返 0; source 区分 "未查" vs "查了且未授权"。
+// P1-6 (audit §P1-6): AppleEvents honest query regression.
+// The Swift bridge always returns 0 (guard is not the AE automation initiator, has no target app,
+// and cannot yield a single boolean).
+// The live path (non-stub) must tag source "apple-events:unknown" (not live), never misreporting
+// a definite false.
+// authorized=false because the bridge returns 0; source distinguishes "not queried" from
+// "queried and not authorized".
 #[test]
 fn query_status_apple_events_marked_unknown_live() {
     let statuses = query_status();
@@ -68,21 +73,21 @@ fn query_status_apple_events_marked_unknown_live() {
         .iter()
         .find(|s| s.service == TccService::AppleEvents)
         .expect("AppleEvents service present");
-    // live 路径 (cfg!(tcc_bridge_stub)==false) 须标 unknown, 非 live。
+    // Live path (cfg!(tcc_bridge_stub)==false) must be tagged unknown, not live.
     if !cfg!(tcc_bridge_stub) {
         assert_eq!(
             ae.source, "apple-events:unknown",
-            "P1-6: live 路径 AppleEvents 须标 apple-events:unknown (桥恒返 0 非真实查询), 非 swift-bridge:live"
+            "P1-6: live-path AppleEvents must be tagged apple-events:unknown (bridge always returns 0, not a real query), not swift-bridge:live"
         );
         assert!(
             !ae.authorized,
-            "P1-6: AppleEvents 桥恒返 0 → authorized=false"
+            "P1-6: AppleEvents bridge always returns 0 → authorized=false"
         );
     } else {
-        // stub 路径全桥为 stub, source=tccutil:stub (P1-6 不改变 stub 行为)。
+        // Stub path: whole bridge stubbed, source=tccutil:stub (P1-6 does not change stub behavior).
         assert_eq!(
             ae.source, "tccutil:stub",
-            "P1-6: stub 路径 AppleEvents 仍 tccutil:stub"
+            "P1-6: stub-path AppleEvents stays tccutil:stub"
         );
     }
 }

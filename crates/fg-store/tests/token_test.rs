@@ -41,9 +41,10 @@ fn missing_token_errors() {
     assert!(matches!(err, fg_store::TokenError::NotFound(_)));
 }
 
-// 仅扫本测试自建子目录, 不遍历整个系统 temp_dir —— 后者在本机被其他进程污染 (FIFO/大目录)
-// 致 std::fs::read 在某 entry 上 open 阻塞 (sample 证: 卡在 open syscall), 测试挂死。
-// 断言意图不变: 自建 db 目录下不得出现明文 "supersecret"。
+// Scan only the subdirectory this test created, not the whole system temp_dir — the latter is polluted by other
+// processes on this machine (FIFOs/large dirs), which made std::fs::read block on open for some entry
+// (sample evidence: stuck in the open syscall), hanging the test.
+// Assertion intent unchanged: no plaintext "supersecret" may appear in the self-created db directory.
 fn open_conn_in_dir() -> (Connection, std::path::PathBuf) {
     ensure_env_key();
     let dir = std::env::temp_dir().join(format!(

@@ -1,18 +1,18 @@
-// cluster_integration.rs — issue #4 / multi-nodes#52 跨节点 3 原语集成测试。
+// cluster_integration.rs — issue #4 / multi-nodes#52 cross-node 3-primitive integration tests.
 //
-// 不连真实 fusion-multi-node (非本地), 用极简 std HTTP mock (后台 std::thread + TcpListener)
-// 模拟 master API。核验 guard 消费方与 multi-node 契约 wire 形态 + 双向 MAC 互操作。
+// Does not connect to a real fusion-multi-node (not local); uses a minimal std HTTP mock (background std::thread + TcpListener)
+// to simulate the master API. Verifies the guard consumer's wire contract with multi-node + bidirectional MAC interoperability.
 //
-// 为何不用 wiremock: reqwest::blocking 内部建 tokio runtime, 与 #[tokio::test] async 上下文
-// 同进程 drop 会 panic ("Cannot drop a runtime where blocking is not allowed")。
-// std-only mock 无 tokio, 阻塞客户端在普通 #[test] 调用, runtime drop 安全。
+// Why not wiremock: reqwest::blocking builds a tokio runtime internally, dropping it in the same process as a #[tokio::test] async
+// context panics ("Cannot drop a runtime where blocking is not allowed").
+// The std-only mock has no tokio; the blocking client is called from a plain #[test], so runtime drop is safe.
 //
-// 测试设 FUSION_GUARD_TOKEN_KEY (全局规约)。
+// Tests set FUSION_GUARD_TOKEN_KEY (global convention).
 //
-// 3 原语:
-//   1. audit chain fetch + federated verify (clean / tamper 检出)
-//   2. epoch get / advance (wire 形态)
-//   3. confirm relay — 双向 MAC (客户端签名 + 独立复算验签, 证互操作)
+// 3 primitives:
+//   1. audit chain fetch + federated verify (clean / tamper detection)
+//   2. epoch get / advance (wire shape)
+//   3. confirm relay — bidirectional MAC (client signs + independent recomputation verifies, proving interoperability)
 
 #![allow(clippy::needless_borrows_for_generic_args)]
 
@@ -29,15 +29,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-// workspace 并发跑时 fg-cluster 与其他 crate 测试竞争 CPU, 多个 mock server 并行 accept
-// + 2ms 轮询 → 偶发 path 解析空 → 500 flake (primitive2_epoch_advance / primitive3_confirm_list_by_epoch)。
-// 序列化锁: 全测试文件串行 (每测独占 mock), 消并发竞争。单个 crate 测试本就快 (<0.1s), 串行无感。
+// When the workspace runs concurrently, fg-cluster and other crate tests compete for CPU; multiple mock servers accept in parallel
+// + 2ms polling → occasional empty path parse → 500 flake (primitive2_epoch_advance / primitive3_confirm_list_by_epoch).
+// Serialization lock: the whole test file runs serially (each test exclusively owns its mock), removing concurrency races. A single crate's tests are fast anyway (<0.1s), serializing is imperceptible.
 fn serial_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-// 测试用宏: 取序列化锁 (Drop 自动释), 保 mock server 单测独占。
+// Test macro: take the serialization lock (Drop auto-releases), keeps the mock server exclusive per test.
 macro_rules! serial {
     () => {
         let _guard = serial_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -46,7 +46,7 @@ macro_rules! serial {
 
 const TOKEN: &str = "cluster-test-token-12345";
 
-// 极简 std HTTP mock server — 收一请求, 按 path 分派返固定 body, 然后继续 (keep 生命周期)。
+// Minimal std HTTP mock server — receives one request, dispatches a fixed body by path, then continues (keeps lifetime).
 struct MockMaster {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -54,7 +54,7 @@ struct MockMaster {
 }
 
 impl MockMaster {
-    // 启 mock: 每个 handler 决定该 path 返 (status, body)。body 须已序列化好。
+    // Start mock: the handler decides what each path returns (status, body). Body must already be serialized.
     fn start<F>(handler: F) -> Self
     where
         F: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
@@ -64,13 +64,13 @@ impl MockMaster {
         let port = listener.local_addr().expect("addr").port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_cloned = stop.clone();
-        // 阻塞 accept + 短超时轮询 stop 标志 (原 nonblocking + 2ms sleep 在 workspace 并发编译
-        // CPU 竞争下 accept 延迟, reqwest 已连+发, mock 轮询晚 accept 读半截 → path 空 → 500 flaky)。
-        // 阻塞 accept 让 mock 在连接到达时即时处理, stop 检测靠 accept 超时返回 WouldBlock。
+        // Blocking accept + short-timeout polling of the stop flag (the original nonblocking + 2ms sleep suffered accept latency under
+        // workspace concurrent-compile CPU contention; reqwest had connected+sent, the mock accepted late and read a partial request → empty path → 500 flaky).
+        // Blocking accept lets the mock handle connections immediately on arrival; stop detection relies on accept timing out with WouldBlock.
         listener.set_nonblocking(true).expect("nonblocking");
         let handler = Arc::new(handler);
         let handle = thread::spawn(move || {
-            // 用 50ms 短超时唤醒查 stop, 非 2ms 空 sleep (CPU 竞争下 2ms 频轮询反拖慢)。
+            // Use a 50ms short timeout to wake and check stop, not a 2ms busy sleep (under CPU contention 2ms frequent polling slows things down).
             let dur = std::time::Duration::from_millis(50);
             while !stop_cloned.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -109,13 +109,13 @@ impl Drop for MockMaster {
     }
 }
 
-// 解析请求行 + 头, 调 handler 取响应, 写回。不解析 body (本测试请求 body 不需 mock 验)。
+// Parse request line + headers, call handler for the response, write back. Does not parse body (the mock need not verify request bodies in these tests).
 fn handle_conn<F>(mut stream: TcpStream, handler: &Arc<F>)
 where
     F: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
 {
-    // 循环读到 headers 结束 (\r\n\r\n)。GET 无 body, headers 终止即整请求。
-    // 原 single-read 在并发负载下可能读半截 → path 解析空 → 500 flaky。
+    // Loop reading until headers end (\r\n\r\n). GET has no body; headers termination is the whole request.
+    // The original single-read could read a partial request under concurrent load → empty path parse → 500 flaky.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 1024];
@@ -142,7 +142,7 @@ where
     let path = parts.next().unwrap_or("");
     let mut auth = String::new();
     for line in lines {
-        // 只小写 header 名比对, 保留值原样 (Bearer 大写)。
+        // Compare header names case-insensitively, keep the value as-is (Bearer capitalized).
         let (name, rest) = line.split_once(':').unwrap_or(("", ""));
         if name.trim().eq_ignore_ascii_case("authorization") {
             auth = rest.trim().to_string();
@@ -290,13 +290,13 @@ fn primitive2_epoch_advance() {
 #[test]
 fn primitive3_confirm_relay_mac_interop_bidirectional() {
     serial!();
-    // 双向 MAC 互操作: 客户端签 MAC, mock 端独立验签 (同 key scheme) — 证 wire 上 MAC 正确。
+    // Bidirectional MAC interop: client signs the MAC, mock side independently verifies (same key scheme) — proves the MAC is correct on the wire.
     let confirm_key = derive_confirm_relay_key(TOKEN);
     let ok_body = json!({
         "status": "relayed", "confirm_id": "c1", "node_id": "n1", "reason": "ok", "epoch": 5
     })
     .to_string();
-    // mock 端验签: 读请求 body, 取 mac 字段, 用同方案复算比对。
+    // Mock-side verification: read request body, extract mac field, recompute with the same scheme and compare.
     let expected_auth = format!("Bearer {TOKEN}");
     let verify_key = confirm_key;
     let server = MockMaster::start(move |path, method, auth| {
@@ -305,8 +305,8 @@ fn primitive3_confirm_relay_mac_interop_bidirectional() {
         } else {
             (500, "{}".into())
         }
-        // 注: std mock 不读 body (handle_conn 未解析), 故 mock 端验签改在客户端侧独立复算 (见下)。
-        // 真实 multi-node 会验签; 这里证客户端签名输入可被同方案独立复现 = 互操作成立。
+        // Note: the std mock does not read the body (handle_conn does not parse it), so mock-side verification is replaced by independent recomputation on the client side (see below).
+        // A real multi-node verifies the signature; here we prove the client's signing input can be independently reproduced with the same scheme = interoperability holds.
     });
     let client = ClusterClient::new(server.cfg()).unwrap();
     let resp = client
@@ -316,7 +316,7 @@ fn primitive3_confirm_relay_mac_interop_bidirectional() {
     assert_eq!(resp.confirm_id, "c1");
     assert_eq!(resp.epoch, 5);
 
-    // 独立复算 MAC, 证客户端签名输入正确 (multi-node 端同算法验)。
+    // Independently recompute the MAC, proving the client's signing input is correct (multi-node verifies with the same algorithm).
     let payload = json!({
         "confirm_id": "c1", "node_id": "n1", "action": "approve", "epoch": 5, "ts": "2026-08-28T12:00:00Z"
     });

@@ -60,9 +60,9 @@ fn confirm(
         .confirm_atomic(id, approved, by, tenant, &writer, &key, kv)
 }
 
-// C9 篡改 helper: 另开独立连接改 verdict_json 中 risk_level 字段 (列不动)。
-// C11 后 risk_level 序列化 lowercase ("l4"/"l3"), 故替换小写串。
-// P1-7: pending_actions 在 action.db (sibling of audit.db path)。篡改须开 action.db 非 audit.db。
+// C9 tamper helper: open a separate connection and rewrite the risk_level field inside verdict_json (column untouched).
+// After C11 risk_level serializes lowercase ("l4"/"l3"), so we replace the lowercase strings.
+// P1-7: pending_actions lives in action.db (sibling of the audit.db path). Tampering must open action.db, not audit.db.
 fn tamper_verdict_json(path: &std::path::Path, action_id: &str, new_risk_json: &str) {
     let action_db = path.with_file_name("action.db");
     let conn = Connection::open(&action_db).unwrap();
@@ -157,9 +157,9 @@ fn evict_expired_removes_old() {
     assert_eq!(n, 0, "fresh action not evicted");
 }
 
-// C9: H8 查 risk_level 列非 JSON blob。
-// (1) L4 put → 篡改 verdict_json risk_level 改 "L3", 列仍 L4 → H8 查列拦截 AbsoluteBlock。
-// (2) L3 put → 篡改 verdict_json risk_level 改 "L4", 列仍 L3 → 交叉校验 RiskTampered。
+// C9: H8 checks the risk_level column, not the JSON blob.
+// (1) L4 put -> tamper verdict_json risk_level to "L3", column stays L4 -> H8 column check blocks with AbsoluteBlock.
+// (2) L3 put -> tamper verdict_json risk_level to "L4", column stays L3 -> cross-check yields RiskTampered.
 #[test]
 fn c9_h8_checks_risk_column_not_json() {
     let (store, path) = open_store();
@@ -168,15 +168,15 @@ fn c9_h8_checks_risk_column_not_json() {
     v.requires_approval = false;
     store.actions().put(&v, "default").unwrap();
 
-    // 篡改 verdict_json: "l4" → "l3" (列 risk_level 不动 = L4)。C11 lowercase。
+    // Tamper verdict_json: "l4" -> "l3" (risk_level column untouched = L4). C11 lowercase.
     tamper_verdict_json(&path, &id.to_string(), "\"l3\"");
     let err = confirm(&store, &id.to_string(), true, "tester", "default").unwrap_err();
     assert!(
         matches!(err, ActionError::AbsoluteBlock(_)),
-        "H8 查 risk_level 列 (L4) 拦截, 不被篡改的 JSON l3 绕过 (C9)"
+        "H8 checks the risk_level column (L4) and blocks; tampered JSON l3 must not bypass it (C9)"
     );
 
-    // L3 put → 篡改 JSON 改 l4, 列仍 L3 → 交叉校验 RiskTampered。
+    // L3 put -> tamper JSON to l4, column stays L3 -> cross-check yields RiskTampered.
     let id2 = uuid::Uuid::new_v4();
     let v2 = verdict(id2, RiskLevel::L3, SafetyAction::Block);
     store.actions().put(&v2, "default").unwrap();
@@ -184,11 +184,11 @@ fn c9_h8_checks_risk_column_not_json() {
     let err = confirm(&store, &id2.to_string(), true, "tester", "default").unwrap_err();
     assert!(
         matches!(err, ActionError::RiskTampered { .. }),
-        "列 L3 与篡改 JSON L4 不一致 → RiskTampered 拒 (C9 交叉校验)"
+        "column L3 vs tampered JSON L4 mismatch must reject with RiskTampered (C9 cross-check)"
     );
 }
 
-// C20: 跨租户 confirm 拒绝。action_id 泄露给 tenant-B, B confirm → CrossTenant。
+// C20: cross-tenant confirm is denied. action_id leaks to tenant-B; B confirms -> CrossTenant.
 #[test]
 fn c20_cross_tenant_confirm_denied() {
     let (store, _p) = open_store();
@@ -211,11 +211,11 @@ fn c20_cross_tenant_confirm_denied() {
     let err = confirm(&store, &id2.to_string(), true, "b-user", "tenant-b").unwrap_err();
     assert!(
         matches!(err, ActionError::CrossTenant { .. }),
-        "跨租户 confirm 必须拒绝 (C20)"
+        "cross-tenant confirm must be denied (C20)"
     );
 }
 
-// L2+A8: confirm 审计与 consume 原子。confirm 成功后 audit_events 有 confirm 行。
+// L2+A8: confirm audit and consume are atomic. After a successful confirm, audit_events has a confirm row.
 #[test]
 fn l2_confirm_audit_atomic_persisted() {
     let (store, _p) = open_store();
@@ -231,5 +231,8 @@ fn l2_confirm_audit_atomic_persisted() {
     let has_confirm = events
         .iter()
         .any(|e| e.event_type == "confirm" && e.outcome == "approved");
-    assert!(has_confirm, "confirm 审计必须原子落库 (L2+A8)");
+    assert!(
+        has_confirm,
+        "confirm audit must be atomically persisted (L2+A8)"
+    );
 }

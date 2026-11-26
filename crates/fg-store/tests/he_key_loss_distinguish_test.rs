@@ -1,15 +1,16 @@
-// H-E (product-audit §5, item c+d): 密钥丢失 vs 真篡改区分 + 轮换全链可验。
+// H-E (product-audit §5, item c+d): distinguish key loss from real tampering + full-chain verifiability after rotation.
 //
-// 缺陷 (item d): master 丢失 → 全量审计链 HMAC 不匹配 → 旧逻辑一律 tampered=true,
-// 与真篡改不可区分。修复: per-version key_anchor。verify 不匹配行查锚点: 锚点与当前
-// master 重算不匹配 → key_version_unknown_rows++ (密钥丢失, 非篡改); 锚点匹配 → 真篡改;
-// 锚点缺失 (legacy NULL) → fail-closed 篡改。
+// Defect (item d): losing the master -> every audit-chain HMAC mismatches -> the old logic always reported
+// tampered=true, indistinguishable from real tampering. Fix: per-version key_anchor. On a mismatching row, verify
+// checks the anchor: anchor mismatches a recomputation from the current master -> key_version_unknown_rows++
+// (key loss, not tampering); anchor matches -> real tampering; anchor missing (legacy NULL) -> fail-closed tamper.
 //
-// (item c): 轮换 = bump version (master 不变)。旧行用旧 version 派生 key 验, verify 透过。
-// re-hash 审计链被拒 (会破坏防篡改); per-row key_version 已令旧行验旧 key, 故 "轮换后历史行
-// 可验" 本就成立。本测扩 p12 到全 4 链 (audit/tcc/rules/dead-letter) + token, 证实透过。
+// (item c): rotation = bump version (master unchanged). Old rows verify with a key derived from the old version;
+// verify passes. Re-hashing the audit chain is rejected (it would break tamper-evidence); per-row key_version
+// already makes old rows verify with the old key, so "historical rows verifiable after rotation" holds by design.
+// This test extends p12 to all 4 chains (audit/tcc/rules/dead-letter) + tokens and confirms it.
 //
-// 需 FUSION_GUARD_TOKEN_KEY + FUSION_GUARD_ALLOW_ENV_KEY (AuditStore::open 不触 Keychain 阻塞)。
+// Requires FUSION_GUARD_TOKEN_KEY + FUSION_GUARD_ALLOW_ENV_KEY (so AuditStore::open does not block on Keychain).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -18,13 +19,14 @@ use fg_core::{CheckStage, RiskLevel, SafetyAction};
 use fg_rules::GuardRule;
 use fg_store::AuditStore;
 
-// 本文件 4 测试均改进程级 env (FUSION_GUARD_TOKEN_KEY 在 KEY_A/KEY_B 间切, +
-// FUSION_GUARD_DATA_DIR 各自 temp 目录)。并行会令 AuditStore::open 读到别测试刚设的
-// master / 目录 → key_loss 测试误载错 key → flaky。静态 Mutex 序列化同文件所有测试。
+// All 4 tests in this file mutate process-level env (FUSION_GUARD_TOKEN_KEY toggles between KEY_A/KEY_B, plus
+// FUSION_GUARD_DATA_DIR pointing at each test's own temp dir). Running in parallel would make AuditStore::open
+// read a master/dir another test just set -> key_loss tests load the wrong key -> flaky. A static Mutex serializes
+// all tests in this file.
 static ENV_GUARD: Mutex<()> = Mutex::new(());
 
 const KEY_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-// 与 KEY_A 不同的 master (模拟密钥丢失后重生成/恢复错误的新密钥)。
+// A different master from KEY_A (simulates a wrongly regenerated/recovered new key after key loss).
 const KEY_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
 fn temp_env() -> PathBuf {
@@ -43,8 +45,8 @@ fn cleanup(dir: &std::path::Path) {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// (item c) 轮换后全 4 链 + token 可验: v1 写 → rotate v2 → v2 写 → verify_all_chains 透过。
-// 证明 "轮换后历史行可验" 成立, 无需 re-hash/re-encrypt (re-hash 破坏防篡改, 拒)。
+// (item c) After rotation, all 4 chains + tokens verify: write v1 -> rotate to v2 -> write v2 -> verify_all_chains passes.
+// Proves "historical rows verifiable after rotation" holds, with no re-hash/re-encrypt needed (re-hash breaks tamper-evidence, rejected).
 #[tokio::test]
 async fn rotation_all_chains_and_tokens_verify() {
     let _env_guard = ENV_GUARD.lock().unwrap();
@@ -54,7 +56,7 @@ async fn rotation_all_chains_and_tokens_verify() {
     let store = AuditStore::open(&db).unwrap();
     let now = chrono::Utc::now();
 
-    // v1: 审计行 + tcc 链 + 规则突变 + token。
+    // v1: audit row + tcc chain + rule mutation + token.
     store.insert_event_at_ts("rot", now, "rm -rf /v1").unwrap();
     store
         .report_tcc_event("Accessibility", "app-a", "granted", "user")
@@ -76,13 +78,13 @@ async fn rotation_all_chains_and_tokens_verify() {
 
     assert_eq!(store.current_key_version(), 1);
     let before = store.verify_all_chains(Some("rot")).unwrap();
-    assert!(!before.tampered, "v1 全链干净");
-    assert!(!before.key_loss, "v1 无密钥丢失");
+    assert!(!before.tampered, "v1 all chains clean");
+    assert!(!before.key_loss, "v1 no key loss");
 
     let new_v = store.rotate_key().unwrap();
     assert_eq!(new_v, 2);
 
-    // v2: 各链再写一行 (混合 v1+v2)。
+    // v2: write one more row on each chain (mixed v1+v2).
     store.insert_event_at_ts("rot", now, "rm -rf /v2").unwrap();
     store
         .report_tcc_event("Camera", "app-b", "denied", "tcc")
@@ -104,26 +106,38 @@ async fn rotation_all_chains_and_tokens_verify() {
     let after = store.verify_all_chains(Some("rot")).unwrap();
     assert!(
         !after.tampered,
-        "混合 v1+v2 全 4 链可验 (per-row version, P1-2 + H-E item c)"
+        "mixed v1+v2 all 4 chains verify (per-row version, P1-2 + H-E item c)"
     );
-    assert!(!after.key_loss, "同 master 轮换无密钥丢失");
-    assert_eq!(after.audit.broken_links, 0, "audit 链无断链");
-    assert_eq!(after.tcc.broken_links, 0, "tcc 链无断链");
-    assert_eq!(after.rules.broken_links, 0, "rules 链无断链");
-    assert_eq!(after.dead_letter.broken_links, 0, "dead_letter 链无断链");
+    assert!(
+        !after.key_loss,
+        "rotation with the same master has no key loss"
+    );
+    assert_eq!(
+        after.audit.broken_links, 0,
+        "audit chain has no broken links"
+    );
+    assert_eq!(after.tcc.broken_links, 0, "tcc chain has no broken links");
+    assert_eq!(
+        after.rules.broken_links, 0,
+        "rules chain has no broken links"
+    );
+    assert_eq!(
+        after.dead_letter.broken_links, 0,
+        "dead_letter chain has no broken links"
+    );
 
-    // token v1 旧 token 用 v1 派生 key 仍解 (旧 token 不随轮换失效)。
+    // The old v1 token still decrypts with the v1-derived key (old tokens do not break on rotation).
     let got_v1 = tokens.get_tenant("tok-v1", "default").unwrap();
-    assert_eq!(got_v1, "sk-v1-secret", "v1 token 轮换后可解");
+    assert_eq!(got_v1, "sk-v1-secret", "v1 token decrypts after rotation");
     let got_v2 = tokens.get_tenant("tok-v2", "default").unwrap();
-    assert_eq!(got_v2, "sk-v2-secret", "v2 token 可解");
+    assert_eq!(got_v2, "sk-v2-secret", "v2 token decrypts");
 
     let dir = db.parent().unwrap();
     cleanup(dir);
 }
 
-// (item d) 密钥丢失: 用 KEY_A 建库写行 → 换 KEY_B 重开 → verify_all_chains 报
-// key_version_unknown_rows > 0 + key_loss=true, 但 tampered=false (非真篡改)。
+// (item d) Key loss: build the DB and write rows with KEY_A -> reopen with KEY_B -> verify_all_chains reports
+// key_version_unknown_rows > 0 + key_loss=true, but tampered=false (not real tampering).
 #[tokio::test]
 async fn key_loss_reports_unknown_not_tampered() {
     let _env_guard = ENV_GUARD.lock().unwrap();
@@ -133,40 +147,49 @@ async fn key_loss_reports_unknown_not_tampered() {
     let store = AuditStore::open(&db).unwrap();
     let now = chrono::Utc::now();
 
-    // 写审计行 (落 key_version=1 + 锚点用 KEY_A 派生)。
+    // Write audit rows (land with key_version=1 + anchors derived from KEY_A).
     store.insert_event_at_ts("kt", now, "rm -rf /loss").unwrap();
     store
         .report_tcc_event("Accessibility", "app-x", "granted", "u")
         .unwrap();
     drop(store);
 
-    // 换 master B 重开 (模拟密钥丢失后误用新密钥, env 显式提供绕过 virgin 门)。
+    // Reopen with master B (simulates mistakenly using a new key after key loss; env explicitly provided bypasses the virgin gate).
     std::env::set_var("FUSION_GUARD_TOKEN_KEY", KEY_B);
     let store2 = AuditStore::open(&db).unwrap();
 
     let v = store2.verify_all_chains(Some("kt")).unwrap();
-    // 行 HMAC 用 KEY_A 派生, 现 master B 派生不匹配 → broken。但锚点 (KEY_A 派生)
-    // 与 master B 重算不匹配 → KeyLoss (非 Tamper)。
+    // Row HMACs were derived from KEY_A and mismatch master B's derivation -> broken. But the anchors (KEY_A-derived)
+    // also mismatch a recomputation from master B -> KeyLoss (not Tamper).
     assert!(
         v.audit.key_version_unknown_rows > 0,
-        "audit 行密钥丢失 → key_version_unknown_rows > 0 (H-E item d)"
+        "audit rows lost their key -> key_version_unknown_rows > 0 (H-E item d)"
     );
-    assert!(v.audit.broken_links > 0, "丢失行不可验 → broken_links > 0");
+    assert!(
+        v.audit.broken_links > 0,
+        "lost-key rows cannot verify -> broken_links > 0"
+    );
     assert!(
         !v.audit.tampered,
-        "密钥丢失非真篡改 → tampered=false (H-E item d 核心区分)"
+        "key loss is not real tampering -> tampered=false (H-E item d core distinction)"
     );
-    assert!(v.key_loss, "聚合 key_loss=true");
-    assert!(!v.tampered, "纯密钥丢失 (无真篡改) → 聚合 tampered=false");
-    // tcc 链同理丢失。
-    assert!(v.tcc.key_version_unknown_rows > 0, "tcc 链密钥丢失同样区分");
+    assert!(v.key_loss, "aggregated key_loss=true");
+    assert!(
+        !v.tampered,
+        "pure key loss (no real tampering) -> aggregated tampered=false"
+    );
+    // The tcc chain is lost the same way.
+    assert!(
+        v.tcc.key_version_unknown_rows > 0,
+        "tcc chain key loss is distinguished the same way"
+    );
 
     let dir = db.parent().unwrap();
     cleanup(dir);
 }
 
-// (item d) 真篡改: 同 master 下直接改一行的 event_hash → 锚点匹配 (master 能派生)
-// → tampered=true, key_version_unknown_rows=0。
+// (item d) Real tampering: directly modify a row's event_hash under the same master -> anchor matches (master can
+// derive it) -> tampered=true, key_version_unknown_rows=0.
 #[tokio::test]
 async fn real_tamper_reports_tampered_not_key_loss() {
     let _env_guard = ENV_GUARD.lock().unwrap();
@@ -181,7 +204,7 @@ async fn real_tamper_reports_tampered_not_key_loss() {
         .insert_event_at_ts("tp", now, "rm -rf /tamper")
         .unwrap();
 
-    // 用写连接直接篡改第 2 行的 event_hash (同 master, 锚点仍匹配)。
+    // Use the write connection to tamper with the 2nd row's event_hash directly (same master, anchor still matches).
     {
         let w = store.audit_writer_handle();
         let w = w.lock().unwrap();
@@ -196,20 +219,20 @@ async fn real_tamper_reports_tampered_not_key_loss() {
     let v = store.verify_all_chains(Some("tp")).unwrap();
     assert!(
         v.audit.tampered,
-        "同 master 改 event_hash = 真篡改 → tampered=true (H-E item d)"
+        "same-master event_hash modification = real tampering -> tampered=true (H-E item d)"
     );
     assert!(
         v.audit.key_version_unknown_rows == 0,
-        "真篡改非密钥丢失 → key_version_unknown_rows=0"
+        "real tampering is not key loss -> key_version_unknown_rows=0"
     );
-    assert!(v.tampered, "聚合 tampered=true");
-    assert!(!v.key_loss, "真篡改 → key_loss=false");
+    assert!(v.tampered, "aggregated tampered=true");
+    assert!(!v.key_loss, "real tampering -> key_loss=false");
 
     let dir = db.parent().unwrap();
     cleanup(dir);
 }
 
-// (item d) 锚点缺失 (legacy NULL) → fail-closed 篡改。攻击者清锚点无法伪装成密钥丢失。
+// (item d) Anchor missing (legacy NULL) -> fail-closed tamper. An attacker clearing anchors cannot disguise the act as key loss.
 #[tokio::test]
 async fn missing_anchor_fail_closed_as_tamper() {
     let _env_guard = ENV_GUARD.lock().unwrap();
@@ -223,7 +246,7 @@ async fn missing_anchor_fail_closed_as_tamper() {
         .insert_event_at_ts("ma", now, "rm -rf /anchor")
         .unwrap();
 
-    // 篡改审计行 event_hash (令 HMAC 不匹配) + 清 token.db 的 v1 锚点为 NULL。
+    // Tamper with an audit row's event_hash (forcing an HMAC mismatch) + clear the v1 anchor in token.db to NULL.
     {
         let w = store.audit_writer_handle();
         let w = w.lock().unwrap();
@@ -245,11 +268,11 @@ async fn missing_anchor_fail_closed_as_tamper() {
     let v = store.verify_all_chains(Some("ma")).unwrap();
     assert!(
         v.audit.tampered,
-        "锚点 NULL + HMAC 不匹配 → fail-closed tampered=true (H-E, 攻击者清锚点无藏身处)"
+        "anchor NULL + HMAC mismatch -> fail-closed tampered=true (H-E, attackers clearing anchors get no hiding place)"
     );
     assert!(
         v.audit.key_version_unknown_rows == 0,
-        "锚点缺失不当密钥丢失 → key_version_unknown_rows=0"
+        "missing anchor does not count as key loss -> key_version_unknown_rows=0"
     );
 
     let dir = db.parent().unwrap();

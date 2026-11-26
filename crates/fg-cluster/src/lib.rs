@@ -1,12 +1,12 @@
-// fg-cluster — fusion-guard 跨节点消费方 (issue #4 / multi-nodes#52 契约)。
+// fg-cluster — fusion-guard cross-node consumer (issue #4 / multi-nodes#52 contract).
 //
-// 多节点 (fusion-multi-node PR #54) 定义 TRANSPORT + IDENTITY + KEY SCHEME:
-//   - HKDF-SHA256 从 cluster_token 域分离派生 3 个 MAC 密钥 (audit-chain/rule-epoch/confirm-relay)
+// Multi-node (fusion-multi-node PR #54) defines TRANSPORT + IDENTITY + KEY SCHEME:
+//   - HKDF-SHA256 derives 3 domain-separated MAC keys from cluster_token (audit-chain/rule-epoch/confirm-relay)
 //   - HTTP API: GET /api/v1/audit/chain, GET/POST /api/v1/rules/epoch, POST /api/confirm, GET /api/v1/confirms
-// guard 实现消费方: federated 链验证 / RuleSet epoch reconcile / confirm 中继聚合。
+// guard implements the consumer side: federated chain verification / RuleSet epoch reconcile / confirm relay aggregation.
 //
-// 层边界: guard 仅消费, 不定义集群协议 (PRD §4.1/§8.2 per-host 设计, 多节点 brokering)。
-// 100% 本地/LAN, 无云。密钥不新增独立秘密 — cluster_token 已是集群根信源 (env 注入)。
+// Layer boundary: guard only consumes, does not define the cluster protocol (PRD §4.1/§8.2 per-host design, multi-node brokering).
+// 100% local/LAN, no cloud. No new independent secret — cluster_token is already the cluster root of trust (env injected).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +21,9 @@ pub use key::{
 };
 pub use verify::{verify_chain_segment, ChainVerifyResult};
 
-// issue #52 原语 1 — 审计链段记录 (multi-node audit_log.py 写出形, JSON 反序列化)。
-// 链字段: seq 单调 / prev_hash 链接含 mac 的完整前序记录 sha256 / mac = HMAC over (record 减 mac)。
-// 无链字段 (降级基线): seq/prev_hash/mac 缺失, guard 视为基线记录不参与链校验。
+// issue #52 primitive 1 — audit chain segment record (multi-node audit_log.py wire shape, JSON deserialization).
+// Chain fields: seq monotonic / prev_hash links sha256 of the full previous record including mac / mac = HMAC over (record minus mac).
+// No chain fields (degraded baseline): seq/prev_hash/mac missing, guard treats it as a baseline record excluded from chain verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditChainRecord {
     pub ts: String,
@@ -47,7 +47,7 @@ pub struct AuditChainRecord {
     pub mac: Option<String>,
 }
 
-// GET /api/v1/audit/chain?since_seq=N 响应 (V1AuditChainResponse)。
+// GET /api/v1/audit/chain?since_seq=N response (V1AuditChainResponse).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditChainResponse {
     pub node_id: String,
@@ -57,7 +57,7 @@ pub struct AuditChainResponse {
     pub truncated: bool,
 }
 
-// GET /api/v1/rules/epoch + POST /api/v1/rules/epoch/advance 响应 (V1RuleEpochResponse)。
+// GET /api/v1/rules/epoch + POST /api/v1/rules/epoch/advance response (V1RuleEpochResponse).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleEpochResponse {
     pub epoch: u64,
@@ -65,14 +65,14 @@ pub struct RuleEpochResponse {
     pub advanced_at: String,
 }
 
-// POST /api/v1/rules/epoch/advance 请求 (RuleEpochAdvanceRequest)。
+// POST /api/v1/rules/epoch/advance request (RuleEpochAdvanceRequest).
 #[derive(Debug, Clone, Serialize)]
 pub struct RuleEpochAdvanceRequest {
     #[serde(default)]
     pub reason: String,
 }
 
-// POST /api/confirm 请求 (ConfirmRelayRequest) — guard 构 MAC 后发。
+// POST /api/confirm request (ConfirmRelayRequest) — guard builds the MAC then sends.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfirmRelayRequest {
     pub confirm_id: String,
@@ -83,7 +83,7 @@ pub struct ConfirmRelayRequest {
     pub mac: String,
 }
 
-// confirm 中继请求载荷 (减 mac) — MAC 签名输入, 须确定性 (与 multi-node canonical_json 同算法)。
+// confirm relay request payload (minus mac) — MAC signing input, must be deterministic (same algorithm as multi-node canonical_json).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfirmPayload {
     pub confirm_id: String,
@@ -93,7 +93,7 @@ pub struct ConfirmPayload {
     pub ts: String,
 }
 
-// GET /api/v1/confirms?epoch=N 响应 (V1ConfirmListResponse)。
+// GET /api/v1/confirms?epoch=N response (V1ConfirmListResponse).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfirmListResponse {
     pub confirms: Vec<serde_json::Value>,
@@ -101,7 +101,7 @@ pub struct ConfirmListResponse {
     pub count: usize,
 }
 
-// POST /api/confirm 响应 (receive_confirm 返): {status, confirm_id, node_id} 或 {status:"rejected", reason}。
+// POST /api/confirm response (receive_confirm return): {status, confirm_id, node_id} or {status:"rejected", reason}.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfirmRelayResponse {
     pub status: String,

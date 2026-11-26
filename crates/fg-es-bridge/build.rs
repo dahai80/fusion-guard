@@ -1,17 +1,17 @@
-// fg-es-bridge build.rs — Endpoint Security FFI 编译策略
+// fg-es-bridge build.rs — Endpoint Security FFI compile strategy
 //
-// macOS ES framework (EndpointSecurity.framework) 真实链接需:
-//   1. framework 存在 (macOS 12+)
-//   2. com.apple.developer.endpoint-security.client entitlement (Apple 签约)
-// 开发环境无 entitlement → 链 ES framework 会运行时失败 (ESNewClient 拒绝)。
+// Really linking the macOS ES framework (EndpointSecurity.framework) requires:
+//   1. the framework present (macOS 12+)
+//   2. the com.apple.developer.endpoint-security.client entitlement (Apple developer agreement)
+// A dev environment without the entitlement → linking the ES framework fails at runtime (ESNewClient refuses).
 //
-// 策略 (镜像 fg-tcc-bridge stub 范式):
-//   - 默认 stub 模式: 编 C stub (符号全返回 0/空), 发 cfg(es_bridge_stub)
-//     fg-es 据此走 Degraded 路径 (退回 TCC, PRD Q#3)
-//   - entitlement 就位后: 设 FUSION_GUARD_ES_LIVE=1 环境变量
-//     build.rs 链 ES framework + 编真实 FFI (待 entitlement 落地)
+// Strategy (mirrors the fg-tcc-bridge stub pattern):
+//   - Default stub mode: compile a C stub (symbols all return 0/empty), emit cfg(es_bridge_stub);
+//     fg-es takes the Degraded path accordingly (fall back to TCC, PRD Q#3)
+//   - Once the entitlement is in place: set the FUSION_GUARD_ES_LIVE=1 env var
+//     and build.rs links the ES framework + compiles the real FFI (pending entitlement provisioning)
 //
-// 当前恒 stub (无 entitlement 开发环境) — 真实绑定待资质就位。
+// Currently always stub (dev environment without entitlement) — the real binding awaits provisioning.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,14 +21,14 @@ fn main() {
     let obj = out_dir.join("EsBridge.o");
     let lib = out_dir.join("libfgesbridge.a");
 
-    // 真实 ES 路径需显式 opt-in (entitlement 就位后): FUSION_GUARD_ES_LIVE=1
+    // The real ES path requires explicit opt-in (once the entitlement is in place): FUSION_GUARD_ES_LIVE=1
     let live = std::env::var("FUSION_GUARD_ES_LIVE")
         .map(|v| v == "1")
         .unwrap_or(false);
 
     if live {
-        // 真实 ES C 绑定 (需 entitlement + provisioning, 此处占位待接入)
-        // 当前不编真实 FFI — entitlement 未就位前留空, 防未授权链接 ES framework
+        // Real ES C binding (requires entitlement + provisioning; placeholder here pending integration)
+        // Currently no real FFI is compiled — left empty until the entitlement is provisioned, preventing unauthorized ES framework linking
         println!("cargo:warning=ES live mode requested but entitlement not provisioned; falling back to stub");
         compile_stub(&out_dir, &obj, &lib);
         println!("cargo:rustc-cfg=es_bridge_stub");
@@ -45,13 +45,13 @@ fn compile_stub(out_dir: &std::path::Path, obj: &std::path::Path, lib: &std::pat
     let stub = out_dir.join("es_stub.c");
     std::fs::write(
         &stub,
-        "// ES stub — 无 entitlement 降级, 全返回 0/空 (fg-es 走 Degraded)\n\
+        "// ES stub — degrade without entitlement; all symbols return 0/empty (fg-es takes the Degraded path)\n\
          int fg_es_new_client(void){return 0;}\n\
          int fg_es_event_count(void){return 0;}\n",
     )
     .expect("write es stub");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    // M7: 勿吞 cc 编译失败 (原 let _ = status())。stub .o 缺失 → ar 打包空 → 链接报错不清晰。
+    // M7: never swallow cc compile failures (originally let _ = status()). A missing stub .o → ar packs nothing → unclear link errors.
     let cc_status = Command::new(&cc)
         .args(["-c", "-o", obj.to_str().unwrap(), stub.to_str().unwrap()])
         .status()
@@ -60,7 +60,7 @@ fn compile_stub(out_dir: &std::path::Path, obj: &std::path::Path, lib: &std::pat
         panic!("cc es stub compile failed (exit {:?})", cc_status.code());
     }
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-    // M7: ar 打包失败显式 fail, 非静默吞。
+    // M7: fail explicitly on ar archive failure, never silently swallow it.
     let ar_status = Command::new(&ar)
         .args(["rcs", lib.to_str().unwrap(), obj.to_str().unwrap()])
         .status()
