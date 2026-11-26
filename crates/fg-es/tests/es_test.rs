@@ -1,5 +1,5 @@
-// fg-es 测试 — Endpoint Security 降级路径 (无 entitlement 开发环境, stub 模式)
-// 真实 ES 路径待 entitlement 就位 (PRD Q#3: 无 entitlement → 降级 TCC)
+// fg-es tests — Endpoint Security degrade path (dev environment without entitlement, stub mode)
+// The real ES path lands once the entitlement is in place (PRD Q#3: no entitlement → fall back to TCC)
 
 use fg_es::{default_kinds, EsEventKind, EsMonitor, EsMonitorState, EsStatus};
 
@@ -14,7 +14,7 @@ fn event_kind_roundtrip() {
 
 #[test]
 fn monitor_degraded_without_entitlement() {
-    // stub 模式 (无 entitlement): start 返回 Degraded, 非 Active
+    // Stub mode (no entitlement): start returns Degraded, not Active
     let mut mon = EsMonitor::new(default_kinds());
     let status = mon.start();
     assert_eq!(status.state, EsMonitorState::Degraded);
@@ -50,6 +50,6 @@ fn es_status_degraded_constructor() {
 fn stop_clears() {
     let mut mon = EsMonitor::new(default_kinds());
     mon.stop();
-    // stop 无 panic 即可 (stub 模式 state 由 cfg 决定, 非 active 字段)
+    // stop must simply not panic (in stub mode the state is decided by cfg, not the active field)
     let _ = mon.status();
 }

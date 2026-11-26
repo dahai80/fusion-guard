@@ -4,10 +4,11 @@ use std::cmp::Reverse;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
-// issue #10/#13: 凭据模式子集名 (非 PII)。消费方用 redact_credentials() 或 redact_with_patterns()
-// 配此常量, 避免硬编码名随 defs 演化漂移。PII 子集 = email/ipv4/credit_card/phone/id_number ——
-// issue #13 修复后 (id_number GB 校验/前序 + phone 接受 +86) PII 行为已正确, 消费方可路由 PII 经
-// fg-redact; redact_credentials() 仍保留供仅需凭据子集的场景。
+// issue #10/#13: credential pattern subset names (non-PII). Consumers configure this constant via
+// redact_credentials() or redact_with_patterns(), avoiding drift of hardcoded names as defs evolve.
+// PII subset = email/ipv4/credit_card/phone/id_number — after the issue #13 fixes (id_number GB
+// validation/priority + phone accepting +86), PII behavior is correct and consumers can route PII
+// through fg-redact; redact_credentials() remains for scenarios needing only the credential subset.
 pub const CREDENTIAL_PATTERNS: &[&str] = &[
     "private_key",
     "jwt",
@@ -21,11 +22,14 @@ pub const CREDENTIAL_PATTERNS: &[&str] = &[
     "aws_secret",
 ];
 
-// M4: 编译失败不再 panic (原 4× .unwrap()), 返 Result 由 AuditEngine::new 决策 (fail-closed)。
-// P2: redact_counted 单次遍历返 (String, hit_count) —— evaluate 跳独立 has_sensitive 二扫。
-// P1-1 (audit §1.10): DLP 脱敏盲区扩展 —— 新增 AWS Secret/JWT/OAuth bearer/信用卡 (Luhn)/
-// 手机号/GCP/Azure/Stripe key/连接串内嵌凭据/.env 风格泛化 KEY=value。模式带可选 validator
-// (规则 5: Luhn/字符集等确定性校验用代码非模型), validator 返 false 的候选 span 跳过。
+// M4: compile failure no longer panics (was 4x .unwrap()); returns Result so AuditEngine::new
+// decides (fail-closed).
+// P2: redact_counted returns (String, hit_count) in a single pass — evaluate skips the separate
+// has_sensitive second scan.
+// P1-1 (audit §1.10): DLP redaction blind-spot expansion — adds AWS Secret/JWT/OAuth bearer/credit
+// card (Luhn)/phone/GCP/Azure/Stripe key/credentials embedded in connection strings/.env-style
+// generic KEY=value. Patterns carry an optional validator (rule 5: deterministic checks like
+// Luhn/charset use code, not a model); candidate spans where the validator returns false are skipped.
 pub struct Redactor {
     patterns: Vec<PatternDef>,
 }
@@ -33,20 +37,22 @@ pub struct Redactor {
 struct PatternDef {
     name: &'static str,
     re: Regex,
-    // P1-1 (规则 5): validator 接收 (content, span起, span止) —— 正则无 lookaround (regex crate),
-    // 边界 (前后非同类字符) + Luhn + 字符多样性 用代码校验, 非模型非正则。
+    // P1-1 (rule 5): validator receives (content, span start, span end) — the regex crate has no
+    // lookaround, so boundaries (adjacent chars not of the same class) + Luhn + character
+    // diversity are checked in code, not via model or regex.
     validator: Option<ValidatorFn>,
-    // issue #7: validator 的可序列化标签 (规则 5 显式标注, 非 fn 指针映射)。IPC dump 暴露给
-    // 下游消费者 (fusion-gateway PII SSOT 订阅), 消费方按 tag 重实现 validator (算法小且文档化)。
+    // issue #7: serializable tag for the validator (explicitly labeled per rule 5, not a fn-pointer
+    // map). Exposed by the IPC dump to downstream consumers (fusion-gateway PII SSOT subscribers);
+    // consumers re-implement the validator from the tag (the algorithms are small and documented).
     validator_tag: ValidatorTag,
-    // issue #7: 原始 pattern 字符串 (re 是 Regex 不可序列化), dump 暴露原串。
+    // issue #7: original pattern string (re is a non-serializable Regex); the dump exposes the raw string.
     pattern_str: &'static str,
 }
 
 type ValidatorFn = fn(&str, usize, usize) -> bool;
 
-// issue #7: redaction pattern 定义的可序列化 dump (guard.redact.patterns.dump 返回)。
-// 消费方 (fusion-gateway) 拉取 + 缓存取代 vendoring, 消手动 lockstep 更新。
+// issue #7: serializable dump of redaction pattern definitions (returned by guard.redact.patterns.dump).
+// Consumers (fusion-gateway) fetch + cache it instead of vendoring, eliminating manual lockstep updates.
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternDefDump {
     pub name: &'static str,
@@ -54,8 +60,9 @@ pub struct PatternDefDump {
     pub validator: ValidatorTag,
 }
 
-// issue #7: validator 标签枚举 (serde snake_case = issue 契约 "none"|"ipv4"|"aws_secret"|"luhn"|"phone"|"id_card")。
-// 非 fn 指针 —— IPC payload 需可序列化, 消费方按 tag 重实现。issue #13 加 IdCard (GB 11643 身份证校验)。
+// issue #7: validator tag enum (serde snake_case = issue contract "none"|"ipv4"|"aws_secret"|"luhn"|"phone"|"id_card").
+// Not fn pointers — the IPC payload must be serializable; consumers re-implement from the tag.
+// issue #13 adds IdCard (GB 11643 ID-card checksum).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorTag {
@@ -87,19 +94,24 @@ struct AcceptedMatch {
 }
 
 impl Redactor {
-    // C19: 脱敏正则覆盖真实密钥编码, 非玩具输入。
-    // P1-1 (audit §1.10): 扩展 DLP 覆盖面 —— AWS Secret/JWT/OAuth bearer/信用卡 (Luhn)/
-    //   手机号/GCP/Azure/Stripe/连接串内嵌凭据/.env 泛化 KEY=value。
-    // 顺序关键: 长凭据 + 重叠数字模式必须先于 id_number (\d{17}[\dXx]) —— 否则 40 位 AWS Secret
-    //   或 13-19 位信用卡被 id_number 的 17 位数字子串吞。先到先拒重叠 (collect_spans 语义),
-    //   故越具体/越长的越靠前。
-    // 每个模式组 1 (若有) = 敏感值; 无组 1 (PEM 块/OpenSSH/JWT/bearer/credit card/phone) = 全匹配。
-    // 通用键值模式仅脱敏值, 保留字段名 (DLP 惯例: 标签可见, 机密脱敏)。
-    // M4: 返 Result, 编译失败可 fail-closed (非 process panic)。
-    // 规则 5: Luhn (信用卡) + base64 字符集多样性 (AWS Secret) 用代码 validator, 非正则非模型。
+    // C19: redaction regexes cover real key encodings, not toy inputs.
+    // P1-1 (audit §1.10): expand DLP coverage — AWS Secret/JWT/OAuth bearer/credit card (Luhn)/
+    //   phone/GCP/Azure/Stripe/credentials embedded in connection strings/.env generic KEY=value.
+    // Order is critical: long credentials + overlapping digit patterns must precede id_number
+    //   (\d{17}[\dXx]) — otherwise a 40-char AWS Secret or a 13-19 digit credit card gets swallowed
+    //   by a 17-digit substring of id_number. First accepted wins on overlap (collect_spans
+    //   semantics), so the more specific/longer a pattern is, the earlier it goes.
+    // Per pattern, group 1 (if present) = sensitive value; without group 1 (PEM blocks/OpenSSH/
+    //   JWT/bearer/credit card/phone) the full match is the value.
+    // Generic key-value patterns redact only the value, keeping the field name (DLP convention:
+    //   label stays visible, secret is redacted).
+    // M4: returns Result so compile failure can fail-closed (not a process panic).
+    // Rule 5: Luhn (credit card) + base64 charset diversity (AWS Secret) use code validators,
+    //   not regex and not a model.
     pub fn new() -> std::result::Result<Self, RedactError> {
         // (name, pattern, optional_validator, validator_tag, pattern_str)
-        // issue #7: 加 validator_tag + pattern_str —— dump 暴露可序列化定义, 不改 redaction 行为。
+        // issue #7: adds validator_tag + pattern_str — the dump exposes serializable definitions,
+        // with no change to redaction behavior.
         let defs: [(
             &'static str,
             &str,
@@ -107,7 +119,7 @@ impl Redactor {
             ValidatorTag,
             &'static str,
         ); 15] = [
-            // PEM 块 / OpenSSH / JWK —— 多行, 最高优先, 不与短模式重叠。
+            // PEM blocks / OpenSSH / JWK — multi-line, highest priority, no overlap with short patterns.
             (
                 "private_key",
                 r#"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----|ssh-(?:rsa|ed25519|ecdsa) [A-Za-z0-9+/=]+|"(?:d|p|q|k|n)":\s*"[^"]+""#,
@@ -115,7 +127,8 @@ impl Redactor {
                 ValidatorTag::None,
                 r#"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----|ssh-(?:rsa|ed25519|ecdsa) [A-Za-z0-9+/=]+|"(?:d|p|q|k|n)":\s*"[^"]+""#,
             ),
-            // JWT 三段式 (eyJ… . eyJ… . …) —— base64url, 全匹配。先于裸数字模式 (防 17+ 数字子串误吞)。
+            // JWT three-segment form (eyJ… . eyJ… . …) — base64url, full match. Precedes bare digit
+            // patterns (prevents accidental swallowing of 17+ digit substrings).
             (
                 "jwt",
                 r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
@@ -123,7 +136,8 @@ impl Redactor {
                 ValidatorTag::None,
                 r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
             ),
-            // OAuth bearer token (Authorization: Bearer …) —— 组 1 = token 值, 前缀 "Bearer " 保留可见。
+            // OAuth bearer token (Authorization: Bearer …) — group 1 = token value, the "Bearer "
+            // prefix stays visible.
             (
                 "oauth_bearer",
                 r"(?i)bearer\s+([A-Za-z0-9_\-\.=~:/+]+)",
@@ -131,7 +145,7 @@ impl Redactor {
                 ValidatorTag::None,
                 r"(?i)bearer\s+([A-Za-z0-9_\-\.=~:/+]+)",
             ),
-            // GCP ya29 / Azure AIza / Stripe sk_live/sk_test + 原 API key 变体。
+            // GCP ya29 / Azure AIza / Stripe sk_live/sk_test plus original API key variants.
             (
                 "api_key",
                 r"(?i)(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{24,}|sk_test_[A-Za-z0-9]{24,}|ya29\.[A-Za-z0-9_\-]{20,}|api[_-]?key\s*[:=]\s*(\S+))",
@@ -139,8 +153,9 @@ impl Redactor {
                 ValidatorTag::None,
                 r"(?i)(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{24,}|sk_test_[A-Za-z0-9]{24,}|ya29\.[A-Za-z0-9_\-]{20,}|api[_-]?key\s*[:=]\s*(\S+))",
             ),
-            // 连接串内嵌凭据 (postgres://user:pass@host, mongodb://user:pass@, redis://:pass@)。
-            // 组 1 = user:pass (机密), 协议 + @host 保留可见。
+            // Credentials embedded in connection strings (postgres://user:pass@host,
+            // mongodb://user:pass@, redis://:pass@).
+            // Group 1 = user:pass (the secret); protocol + @host stay visible.
             (
                 "conn_string",
                 r"(?i)(?:postgres(?:ql)?|mongodb(?:\+srv)?|redis|mysql|amqp|ftp|sftp)://[^/\s:@]+:([^@/\s]+)@",
@@ -148,8 +163,10 @@ impl Redactor {
                 ValidatorTag::None,
                 r"(?i)(?:postgres(?:ql)?|mongodb(?:\+srv)?|redis|mysql|amqp|ftp|sftp)://[^/\s:@]+:([^@/\s]+)@",
             ),
-            // 凭据键值模式 —— 带显式标签 (password=/secret=/KEY=val), 标签证明机密意图, 优先于裸数字。
-            // password/passwd/pwd 键值 —— 组 1 = 值 (值可含数字, 须先于 id_number/credit_card 免被吞)。
+            // Credential key-value patterns — explicit labels (password=/secret=/KEY=val) prove
+            // secret intent; they take priority over bare digits.
+            // password/passwd/pwd key-value — group 1 = value (the value may contain digits, so it
+            // must precede id_number/credit_card to avoid being swallowed).
             (
                 "password",
                 r#"(?i)(?:password|passwd|pwd)\s*["']?\s*[:=]\s*["']?([^\s"']+)"#,
@@ -157,7 +174,8 @@ impl Redactor {
                 ValidatorTag::None,
                 r#"(?i)(?:password|passwd|pwd)\s*["']?\s*[:=]\s*["']?([^\s"']+)"#,
             ),
-            // secret/token 通用键值 (JSON/ENV/配置) —— 组 1 = 值。补 PRD §8 "敏感字段" 语义泛化。
+            // secret/token generic key-value (JSON/ENV/config) — group 1 = value. Generalizes the
+            // PRD §8 "sensitive field" semantics.
             (
                 "secret_kv",
                 r#"(?i)(?:secret|token|access[_-]?token)["']?\s*[:=]\s*["']?([^\s"']{6,})"#,
@@ -165,7 +183,8 @@ impl Redactor {
                 ValidatorTag::None,
                 r#"(?i)(?:secret|token|access[_-]?token)["']?\s*[:=]\s*["']?([^\s"']{6,})"#,
             ),
-            // .env 风格泛化 KEY=value (大写下划线键名 = 配置/凭据惯例) —— 组 1 = 值, 键名保留可见。
+            // .env-style generic KEY=value (uppercase underscore key names = config/credential
+            // convention) — group 1 = value, key name stays visible.
             (
                 "env_kv",
                 r"(?m)^[A-Z][A-Z0-9_]{2,}=(\S+)",
@@ -173,7 +192,7 @@ impl Redactor {
                 ValidatorTag::None,
                 r"(?m)^[A-Z][A-Z0-9_]{2,}=(\S+)",
             ),
-            // .netrc 风格 password XXX —— 组 1 = 值。
+            // .netrc-style `password XXX` — group 1 = value.
             (
                 "netrc",
                 r"(?i)password\s+(\S+)",
@@ -181,8 +200,10 @@ impl Redactor {
                 ValidatorTag::None,
                 r"(?i)password\s+(\S+)",
             ),
-            // PII: email (issue #2) —— 放凭据模式之后: 连接串 user:pass@host 的 pass@host 会被 email 吞,
-            //   故须让 conn_string 先吃 (先到先拒重叠)。非数字, 与下游 id_number/phone 无重叠。
+            // PII: email (issue #2) — placed after credential patterns: the pass@host part of a
+            //   connection string user:pass@host would be swallowed by email, so conn_string must
+            //   consume it first (first accepted wins on overlap). Non-digit, no overlap with
+            //   downstream id_number/phone.
             (
                 "email",
                 r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -190,7 +211,8 @@ impl Redactor {
                 ValidatorTag::None,
                 r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
             ),
-            // PII: ipv4 (issue #2) —— \b 词边界 + validator (每段 ≤255, 边界非数字/点)。
+            // PII: ipv4 (issue #2) — \b word boundaries + validator (each octet ≤255, boundary not
+            // digit/dot).
             (
                 "ipv4",
                 r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
@@ -198,9 +220,11 @@ impl Redactor {
                 ValidatorTag::Ipv4,
                 r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
             ),
-            // AWS Secret Access Key —— 40 字符 base64 集 (A-Za-z0-9/+=), 无 AKIA 前缀 (那是 access key id,
-            // 已归 api_key)。validator 排除全同字符 (aaaa…) 防误报 + 边界校验 (regex crate 不支持
-            // lookaround, 边界由 valid_aws_secret(content,s,e) 检查前后非 base64 字符)。
+            // AWS Secret Access Key — 40 chars from the base64 set (A-Za-z0-9/+=), no AKIA prefix
+            // (that is the access key id, already covered by api_key). The validator rejects
+            // all-identical characters (aaaa…) to prevent false positives + boundary checks (the
+            // regex crate has no lookaround; valid_aws_secret(content,s,e) checks that the
+            // surrounding chars are not base64).
             (
                 "aws_secret",
                 r"[A-Za-z0-9/+=]{40}",
@@ -208,10 +232,13 @@ impl Redactor {
                 ValidatorTag::AwsSecret,
                 r"[A-Za-z0-9/+=]{40}",
             ),
-            // 身份证号 \d{17}[\dXx] —— issue #13 缺陷 1+2 修复: 加 GB 11643-1999 mod-11 校验 (valid_id_card),
-            // 且排 credit_card 之前 (先到先拒重叠)。原排最后 + 无校验 → (缺陷 2) 任意 18 位数字串
-            // (订单号/时间戳) 误吞; (缺陷 1) credit_card \d{13,19}+Luhn 先吞 17 位前导数字, 剩尾 X 悬空
-            // (...credit_card]X)。现 GB 校验通过者先吃全 18 字符 → id_number 标签, 无悬空。
+            // ID number \d{17}[\dXx] — issue #13 defect 1+2 fix: adds GB 11643-1999 mod-11
+            // validation (valid_id_card) and moves it before credit_card (first accepted wins on
+            // overlap). Previously it was last + unvalidated, so (defect 2) any 18-digit string
+            // (order numbers/timestamps) was swallowed; (defect 1) credit_card \d{13,19}+Luhn ate
+            // the 17-digit leading part first, leaving a dangling X (...credit_card]X). Now entries
+            // passing the GB check consume the full 18 chars first under the id_number tag — no
+            // dangling tail.
             (
                 "id_number",
                 r"\d{17}[\dXx]",
@@ -219,10 +246,13 @@ impl Redactor {
                 ValidatorTag::IdCard,
                 r"\d{17}[\dXx]",
             ),
-            // 信用卡号 \d{13,19} —— validator Luhn 校验 + 边界 (regex crate 不支持 lookaround,
-            // 边界由 valid_luhn(content,s,e) 检查前后非数字, 防吞 id_number/phone 子串)。
-            // issue #13: id_number 现排前, 合法身份证 (18 字符, GB 通过) 先被 id_number 吞, credit_card
-            // 不再吃其 17 位前导数字 (重叠拒) —— 消悬空 X 尾。Luhn 边界拒仍防独立 16-17 位数字串误判。
+            // Credit card number \d{13,19} — validator runs Luhn + boundary checks (the regex crate
+            // has no lookaround; valid_luhn(content,s,e) checks that surrounding chars are not
+            // digits, preventing swallowing of id_number/phone substrings).
+            // issue #13: id_number now precedes it, so a valid ID (18 chars, GB pass) is consumed
+            // by id_number first and credit_card no longer eats its 17-digit leading part
+            // (overlap rejected) — removing the dangling X tail. Luhn boundary rejection still
+            // prevents misjudging standalone 16-17 digit strings.
             (
                 "credit_card",
                 r"\d{13,19}",
@@ -230,10 +260,14 @@ impl Redactor {
                 ValidatorTag::Luhn,
                 r"\d{13,19}",
             ),
-            // 手机号 (中国大陆, issue #13 接受 +86/0086 国际前缀) —— validator 边界校验 (前后非数字)。
-            // 原 1[3-9]\d{9} 拒 +86/0086 前缀 (缺陷 3); 现 (?:\+86|0086)? 可选前缀。新 span 含前缀,
-            // valid_phone 边界检查 span 前一字符 (+86 的 '+' / 0086 的 '0' 前一字符) —— 若前缀前为数字
-            // (如 "20086139…", span 从 idx1 '0086' 起, start-1='2' 数字) → 边界拒, 不误吞更长数字子段。
+            // Phone number (mainland China; issue #13 accepts +86/0086 international prefixes) —
+            // validator boundary checks (surrounding chars not digits).
+            // The original 1[3-9]\d{9} rejected +86/0086 prefixes (defect 3); now the optional
+            // (?:\+86|0086)? prefix is included. The new span includes the prefix, and valid_phone
+            // checks the char before the span (the char before '+' of +86 / '0' of 0086) — if the
+            // char before the prefix is a digit (e.g. "20086139…", span starts at idx1 '0086',
+            // start-1='2' is a digit), the boundary check rejects it, avoiding swallowing a longer
+            // digit segment by mistake.
             (
                 "phone",
                 r"(?:\+86|0086)?1[3-9]\d{9}",
@@ -255,9 +289,11 @@ impl Redactor {
         Ok(Self { patterns })
     }
 
-    // issue #7: 暴露 15 redaction pattern 定义的可序列化 dump (guard.redact.patterns.dump)。
-    // 消费方 (fusion-gateway PII SSOT) 拉取代 vendoring, 消手动 lockstep。按 defs 优先序 (先到先拒
-    // 重叠, 长凭据先于 id_number), name+regex 逐字, validator tag 枚举。只读, 不改 redaction 行为。
+    // issue #7: exposes a serializable dump of the 15 redaction pattern definitions
+    // (guard.redact.patterns.dump). Consumers (fusion-gateway PII SSOT) fetch it instead of
+    // vendoring, eliminating manual lockstep. Ordered by defs priority (first accepted wins on
+    // overlap, long credentials before id_number), name+regex verbatim, validator tags as enums.
+    // Read-only; no change to redaction behavior.
     pub fn pattern_defs(&self) -> Vec<PatternDefDump> {
         self.patterns
             .iter()
@@ -269,8 +305,9 @@ impl Redactor {
             .collect()
     }
 
-    // P0-8: 按字符边界取末4字符, 非字节切片。原 s[n-4..] 在 CJK (3字节/字)/emoji (4字节)
-    // 上 panic (byte index not char boundary) → redact_irreversible panic → worker 崩溃。
+    // P0-8: take the last 4 characters on char boundaries, not byte slicing. The original
+    // s[n-4..] panicked on CJK (3 bytes/char) and emoji (4 bytes) (byte index not char boundary)
+    // → redact_irreversible panic → worker crash.
     fn last4(s: &str) -> String {
         let chars: Vec<char> = s.chars().collect();
         let n = chars.len();
@@ -281,9 +318,11 @@ impl Redactor {
         }
     }
 
-    // C19: 组 1 (若有) = 敏感值, 其前为可见标签前缀 (password:/api_key=)。
-    // 脱敏仅替换值, 保留前缀 (DLP 惯例: 字段名可见, 机密脱敏)。
-    // 无组 1 (PEM 块/OpenSSH/JWK) → 前缀空, 值=全匹配。
+    // C19: group 1 (if present) = sensitive value, preceded by a visible label prefix
+    // (password:/api_key=).
+    // Redaction replaces only the value, keeping the prefix (DLP convention: field name visible,
+    // secret redacted).
+    // Without group 1 (PEM blocks/OpenSSH/JWK) → empty prefix, value = full match.
     fn split_value(c: &regex::Captures) -> (String, String) {
         let full = c.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         if full.is_empty() {
@@ -300,13 +339,19 @@ impl Redactor {
         }
     }
 
-    // L6 span 追踪核心: 在原内容上一次收集所有模式命中 (带字节偏移), 拒重叠 span,
-    // 末到首单 pass 重建。原顺序 replace_all 在已脱敏文本上跑 —— id_number 匹配先前模式写入
-    // 的 tok_<32hex> 占位符内 17 位数字子串 → 腐蚀原占位符 → extract_placeholders 找不到 →
-    // reveal 撞 H6 → 可逆脱敏静默降级为不可逆。span 追踪消此 (占位符永不写回原内容, 单趟构建)。
-    // accepted span 集合; 新命中与任一已接受 span 重叠即跳过 (首个模式优先, 防 id_number 吞 api_key)。
-    // issue #10: pred 按模式名过滤 (true=全集 = 原 redact 语义; 凭据子集 = redact_credentials)。
-    // 顺序 (defs 优先序) 不变 —— 子集只跳过不匹配模式, 重叠 first-accept 逻辑同。
+    // L6 span-tracking core: collect all pattern hits on the original content in one pass (with
+    // byte offsets), reject overlapping spans, rebuild end-to-start in a single pass. The original
+    // sequential replace_all ran over already-redacted text — id_number matched 17-digit
+    // substrings inside tok_<32hex> placeholders written by earlier patterns → corrupted the
+    // original placeholder → extract_placeholders found nothing → reveal hit H6 → reversible
+    // redaction silently degraded to irreversible. Span tracking removes this (placeholders are
+    // never written back into the original content; single-pass rebuild).
+    // Accepted span set; a new hit overlapping any accepted span is skipped (first pattern wins,
+    // preventing id_number from swallowing api_key).
+    // issue #10: pred filters by pattern name (true = full set = original redact semantics;
+    // credential subset = redact_credentials).
+    // Order (defs priority) is unchanged — the subset only skips non-matching patterns; the
+    // first-accept overlap logic is the same.
     fn collect_spans_filtered<P: Fn(&str) -> bool>(
         &self,
         content: &str,
@@ -324,7 +369,8 @@ impl Redactor {
                     None => continue,
                 };
                 let (_prefix, value) = Self::split_value(&c);
-                // 命中 span = 值 (组1) 区间; 无组1 → 全匹配区间。脱敏只替换值, 前缀保留原位。
+                // Hit span = value (group 1) range; without group 1 → full-match range. Redaction
+                // replaces only the value; the prefix stays in place.
                 let (s, e) = match c.get(1) {
                     Some(vm) if !vm.as_str().is_empty() => (vm.start(), vm.end()),
                     _ => (full.start(), full.end()),
@@ -332,14 +378,16 @@ impl Redactor {
                 if s >= e {
                     continue;
                 }
-                // P1-1: validator (Luhn/字符多样性/数字边界) 拒假阳性候选。validator 接收
-                // (content, span起, span止) —— 边界校验需 span 在原文中的前后字符 (regex 无 lookaround)。
+                // P1-1: validator (Luhn/char diversity/digit boundaries) rejects false-positive
+                // candidates. The validator receives (content, span start, span end) — boundary
+                // checks need the chars adjacent to the span in the original text (regex has no
+                // lookaround).
                 if let Some(check) = pd.validator {
                     if !check(content, s, e) {
                         continue;
                     }
                 }
-                // 拒重叠: 任一已接受 span 与 [s,e) 相交即跳过此命中。
+                // Reject overlap: skip this hit if any accepted span intersects [s,e).
                 let overlaps = accepted.iter().any(|a| s < a.end && e > a.start);
                 if overlaps {
                     continue;
@@ -355,8 +403,9 @@ impl Redactor {
         accepted
     }
 
-    // 原语义: 全模式收集 (pred 恒 true)。保所有现存调用点 (redact/redact_counted/
-    // redact_irreversible/redact_reversible/has_sensitive 经此或等价内联) 行为不变。
+    // Original semantics: collect across all patterns (pred always true). Preserves behavior for
+    // all existing call sites (redact/redact_counted/redact_irreversible/redact_reversible/
+    // has_sensitive go through this or equivalent inlined logic).
     fn collect_spans(&self, content: &str) -> Vec<AcceptedMatch> {
         self.collect_spans_filtered(content, |_| true)
     }
@@ -366,29 +415,36 @@ impl Redactor {
         if spans.is_empty() {
             return content.to_string();
         }
-        // 末到首排序: 重建从高偏移起替换, 低偏移位置不受影响。
+        // Sort end-to-start: rebuild replaces from high offsets first, so lower offset positions
+        // are unaffected.
         let mut ordered = spans;
         ordered.sort_by_key(|m| Reverse(m.start));
         let mut out = content.to_string();
         for m in &ordered {
-            // span = group1 (值) 区间, 前缀 (group0..group1) 已在原位保留, 仅替换值。
+            // span = group 1 (value) range; the prefix (group0..group1) is already preserved in
+            // place, only the value is replaced.
             let repl = format!("[REDACTED:{}]", m.name_tag);
             out.replace_range(m.start..m.end, &repl);
         }
         out
     }
 
-    // issue #10/#13: 仅脱敏凭据子集 (CREDENTIAL_PATTERNS), 跳过 PII (email/ipv4/credit_card/
-    // phone/id_number)。issue #13 前消费方 (fusion-memory) 因 fg-redact PII 3 缺陷 (idcard 被
-    // credit_card 错吞 / id_number 误吞长数字 / +86 phone 被拒) 自带本地 PII 脱敏, 只取凭据子集。
-    // issue #13 修复后 PII 行为正确, 消费方可退役本地 PII 逻辑改路由 fg-redact; 本方法仍供仅需
-    // 凭据子集的场景。同 collect_spans 优先序+重叠语义, 子集只跳过 PII 模式。无 redact() 行为变更。
+    // issue #10/#13: redact only the credential subset (CREDENTIAL_PATTERNS), skipping PII
+    // (email/ipv4/credit_card/phone/id_number). Before issue #13, consumers (fusion-memory) kept
+    // their own local PII redaction and took only the credential subset because of the 3 fg-redact
+    // PII defects (idcard wrongly swallowed by credit_card / id_number swallowing long digit
+    // strings / +86 phone rejected).
+    // After the issue #13 fixes PII behavior is correct; consumers can retire their local PII
+    // logic and route through fg-redact. This method remains for scenarios needing only the
+    // credential subset. Same collect_spans priority + overlap semantics; the subset only skips
+    // PII patterns. No change to redact() behavior.
     pub fn redact_credentials(&self, content: &str) -> String {
         self.redact_with_patterns(content, CREDENTIAL_PATTERNS)
     }
 
-    // issue #10: 通用原语 —— 仅跑命名子集模式 (names 取自 pattern_defs())。未知名忽略,
-    // 顺序仍按 defs 优先序 (先到先拒重叠), 非调用方传入顺序。便于消费方按需选类。
+    // issue #10: generic primitive — runs only the named subset patterns (names from
+    // pattern_defs()). Unknown names are ignored; the order still follows defs priority (first
+    // accepted wins on overlap), not the caller's order. Lets consumers pick classes as needed.
     pub fn redact_with_patterns(&self, content: &str, names: &[&str]) -> String {
         let spans = self.collect_spans_filtered(content, |n| names.contains(&n));
         if spans.is_empty() {
@@ -404,8 +460,10 @@ impl Redactor {
         out
     }
 
-    // P2: redact 同时计命中数, evaluate 一次遍历取代 has_sensitive+redact 二扫。
-    // 返 (脱敏后内容, 命中数); 命中数>0 → 有敏感内容。语义与 redact+has_sensitive 等价但单趟。
+    // P2: redact also counts hits; evaluate does one pass instead of a has_sensitive+redact
+    // double scan.
+    // Returns (redacted content, hit count); hit count > 0 → sensitive content present.
+    // Semantically equivalent to redact+has_sensitive but in a single pass.
     pub fn redact_counted(&self, content: &str) -> (String, usize) {
         let spans = self.collect_spans(content);
         let total = spans.len();
@@ -442,7 +500,8 @@ impl Redactor {
         if spans.is_empty() {
             return (content.to_string(), Vec::new());
         }
-        // matches 按文本先后序 (caller 存首 token 为 token_map_id); 重建从高偏移起。
+        // matches in text order (caller stores the first token as token_map_id); rebuild from
+        // high offsets first.
         let mut by_pos: Vec<&AcceptedMatch> = spans.iter().collect();
         by_pos.sort_by_key(|m| m.start);
         let mut matches = Vec::with_capacity(by_pos.len());
@@ -455,7 +514,8 @@ impl Redactor {
                 original: m.value.clone(),
             });
         }
-        // 重建需 span desc; 同时按 by_pos 下标取对应 token (保证 token↔span 正确绑定)。
+        // Rebuild needs spans in descending order; take the matching token by by_pos index
+        // (guarantees correct token↔span binding).
         let mut idx_desc: Vec<usize> = (0..by_pos.len()).collect();
         idx_desc.sort_by_key(|&i| Reverse(by_pos[i].start));
         let mut out = content.to_string();
@@ -468,7 +528,8 @@ impl Redactor {
     }
 
     pub fn has_sensitive(&self, content: &str) -> bool {
-        // 与 collect_spans 语义对齐: validator (Luhn/多样性/边界) 拒的候选不计为敏感。
+        // Aligned with collect_spans semantics: candidates rejected by a validator (Luhn/diversity/
+        // boundary) do not count as sensitive.
         self.patterns.iter().any(|pd| {
             pd.re.captures_iter(content).any(|c| {
                 let full = match c.get(0) {
@@ -491,7 +552,8 @@ impl Redactor {
     }
 
     pub fn extract_placeholders(&self, content: &str) -> Vec<(String, String)> {
-        // M4: OnceLock 缓存, 非每次 Regex::new().unwrap() (编译失败 panic + 重复编译开销)。
+        // M4: OnceLock cache, not Regex::new().unwrap() per call (compile-failure panic + repeated
+        // compile overhead).
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
             Regex::new(r"\[REDACTED:([a-z_]+)#(tok_[0-9a-f]+)\]")
@@ -507,9 +569,11 @@ impl Redactor {
     }
 }
 
-// P1-1 (audit §1.10, 规则 5): 信用卡 Luhn 校验 + 数字边界 —— 正则只匹配长度 13-19 数字,
-// validator (a) 检查 span 前后非数字 (regex 无 lookaround, 边界用代码), 防吞 id_number/phone
-// 子段; (b) Luhn 算法确认是真实卡号非任意数字串 (降低假阳性: 13-19 位数字非支付语境频繁出现)。
+// P1-1 (audit §1.10, rule 5): credit card Luhn check + digit boundaries — the regex only matches
+// 13-19 digits; the validator (a) checks that the chars around the span are not digits (regex has
+// no lookaround, boundaries in code), preventing swallowing of id_number/phone substrings;
+// (b) confirms via the Luhn algorithm that it is a real card number, not an arbitrary digit string
+// (reduces false positives: 13-19 digit strings occur frequently outside payment contexts).
 fn valid_luhn(content: &str, start: usize, end: usize) -> bool {
     let bytes = content.as_bytes();
     if start > 0 && bytes[start - 1].is_ascii_digit() {
@@ -540,15 +604,19 @@ fn valid_luhn(content: &str, start: usize, end: usize) -> bool {
     sum.is_multiple_of(10)
 }
 
-// issue #13 缺陷 1+2 (规则 5: 确定性校验用代码): 身份证号 GB 11643-1999 mod-11 校验 + 数字边界。
-// 原因: \d{17}[\dXx] 无 validator → 任意 18 位数字串 (订单号/时间戳) 误吞 (缺陷 2); 且排 credit_card
-// 之后被 \d{13,19}+Luhn 吞 17 位前导数字剩悬空 X (缺陷 1)。加校验位算法确认真实身份证。
-// GB 11643-1999: 前 17 位各位 × 权重 [7,9,10,5,8,4,2,1,6,3,7,9,10,5,8,4,2] 求和, sum%11 映射
-// 校验码 ['1','0','X','9','8','7','6','5','4','3','2'], 末位 (0-9 或 X/x=10) 须匹配。
-// 例 (Python 验算): 110101199003077651 → 前缀 11010119900307765, sum=242, 242%11=0 → '1' == '1' ✓ 合法;
-//     11010119900307889X → 前缀 11010119900307889, sum=266, 266%11=2 → 'X' == 'X' ✓ 合法 (尾 X);
-//     110101199003077658 → sum=242 → '1' ≠ '8' 拒; 110101199003077654 → '1' ≠ '4' 拒 (旧测试 id)。
-//     订单号 999999999999999999 → sum=900, 900%11=9 → '3' ≠ '9' 拒 (缺陷 2 修复)。
+// issue #13 defects 1+2 (rule 5: deterministic checks in code): ID number GB 11643-1999 mod-11
+// checksum + digit boundaries.
+// Reason: \d{17}[\dXx] with no validator → any 18-digit string (order numbers/timestamps) wrongly
+// swallowed (defect 2); and when placed after credit_card, \d{13,19}+Luhn ate the 17-digit leading
+// part leaving a dangling X (defect 1). The checksum algorithm confirms a real ID.
+// GB 11643-1999: multiply each of the first 17 digits by weights [7,9,10,5,8,4,2,1,6,3,7,9,10,5,8,4,2]
+// and sum; sum%11 maps to the check chars ['1','0','X','9','8','7','6','5','4','3','2']; the last
+// char (0-9, or X/x=10) must match.
+// Examples (verified in Python): 110101199003077651 → prefix 11010119900307765, sum=242,
+//     242%11=0 → '1' == '1' ✓ valid;
+//     11010119900307889X → prefix 11010119900307889, sum=266, 266%11=2 → 'X' == 'X' ✓ valid (trailing X);
+//     110101199003077658 → sum=242 → '1' ≠ '8' reject; 110101199003077654 → '1' ≠ '4' reject (old test id).
+//     Order number 999999999999999999 → sum=900, 900%11=9 → '3' ≠ '9' reject (defect 2 fix).
 fn valid_id_card(content: &str, start: usize, end: usize) -> bool {
     let bytes = content.as_bytes();
     if start > 0 && bytes[start - 1].is_ascii_digit() {
@@ -582,9 +650,11 @@ fn valid_id_card(content: &str, start: usize, end: usize) -> bool {
     actual == expected
 }
 
-// P1-1 (audit §1.10, 规则 5): AWS Secret Access Key 假阳性防御 —— 40 字符 base64 集。validator
-// (a) span 前后非 base64 字符 (边界, 防 40 字符是更长串的子段); (b) 字符多样性 (≥6 distinct,
-// 排除 "aaaa…"/"////…" 全同静态串, 真实密钥必有多样性)。
+// P1-1 (audit §1.10, rule 5): AWS Secret Access Key false-positive defense — 40 chars from the
+// base64 set. The validator (a) requires the chars around the span to be non-base64 (boundary, so
+// the 40 chars are not a substring of a longer string); (b) requires character diversity
+// (≥6 distinct, excluding "aaaa…"/"////…" all-identical static strings — real keys always have
+// diversity).
 fn valid_aws_secret(content: &str, start: usize, end: usize) -> bool {
     let is_base64 = |b: u8| b.is_ascii_alphanumeric() || b == b'/' || b == b'+' || b == b'=';
     let bytes = content.as_bytes();
@@ -605,7 +675,8 @@ fn valid_aws_secret(content: &str, start: usize, end: usize) -> bool {
     distinct.len() >= 6
 }
 
-// P1-1 (audit §1.10): 手机号边界校验 —— span 前后非数字, 防吞入 id_number 等更长数字子段。
+// P1-1 (audit §1.10): phone boundary check — chars around the span must not be digits, preventing
+// swallowing by longer digit segments such as id_number.
 fn valid_phone(content: &str, start: usize, end: usize) -> bool {
     let bytes = content.as_bytes();
     if start > 0 && bytes[start - 1].is_ascii_digit() {
@@ -617,7 +688,8 @@ fn valid_phone(content: &str, start: usize, end: usize) -> bool {
     true
 }
 
-// issue #2: ipv4 每段 ≤ 255 (regex 只限 1-3 位, validator 拒 256+ 假阳性如 999.1.1.1)。
+// issue #2: ipv4 octets ≤ 255 (the regex only limits to 1-3 digits; the validator rejects 256+
+// false positives such as 999.1.1.1).
 fn valid_ipv4(content: &str, start: usize, end: usize) -> bool {
     let bytes = content.as_bytes();
     if start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
@@ -633,7 +705,8 @@ fn valid_ipv4(content: &str, start: usize, end: usize) -> bool {
 
 impl Default for Redactor {
     fn default() -> Self {
-        // M4: new() 返 Result; Default 兜底 panic (静态模式编译应永不失败, 仅测试用)。
+        // M4: new() returns Result; Default falls back to panic (static pattern compilation should
+        // never fail; tests only).
         Self::new().expect("redactor default: static regex compile failed")
     }
 }

@@ -1,12 +1,18 @@
-// soak_test.rs — 长跑并发压测 (商用阻塞点 #6)。
-// 验证生产形态: 持续高并发负载下延迟不退化、子进程内存不泄漏、fail-closed 不破。
+// soak_test.rs — long-running concurrency stress test (commercial blocker #6).
+// Verifies production shape: latency does not degrade under sustained high
+// concurrency, the child process does not leak memory, and fail-closed holds.
 //
-// 模型: spawn release daemon 子进程, N 并发 UDS 连接 × M 轮 guard.evaluate, 跑 ~10s。
-// 子进程模式 (非 in-process): RSS 量纯 server, 无客户端线程栈/malloc 污染, 无 debug 膨胀。
-// 每 2s 采子进程 RSS + DB 磁盘占用, 终态断言无退化。
+// Model: spawn a release daemon child process, N concurrent UDS connections x M
+// rounds of guard.evaluate, running ~10s.
+// Child-process mode (not in-process): RSS measures the pure server, free of
+// client thread stacks / malloc pollution and debug bloat.
+// Samples child RSS + DB disk usage every 2s; final-state assertions verify no
+// degradation.
 //
-// 依赖 target/release/fusion-guard (先 cargo build --release -p fg-bin)。缺失则 skip, 不挂全套 cargo test。
-// 隔离: 独立 SOCK + DATA_DIR + TOKEN_KEY + LOG_DIR, 不污染其他用例。
+// Depends on target/release/fusion-guard (build first: cargo build --release -p
+// fg-bin). Skips when missing, without failing the full cargo test run.
+// Isolation: dedicated SOCK + DATA_DIR + TOKEN_KEY + LOG_DIR, no pollution of
+// other cases.
 
 #![allow(clippy::needless_borrows_for_generic_args)]
 
@@ -19,30 +25,34 @@ use std::time::{Duration, Instant};
 
 const TEST_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-// 压测参数
-const SOAK_CONCURRENCY: usize = 48; // < MAX_CONNECTIONS(64) 留余量, 不触发 conn_sem 拒绝
+// Stress test parameters
+const SOAK_CONCURRENCY: usize = 48; // below MAX_CONNECTIONS(64), leaves headroom, avoids conn_sem rejection
 const SOAK_DURATION_SECS: u64 = 10;
 const SOAK_SAMPLE_INTERVAL_SECS: u64 = 2;
 
-// 延迟闸值 (ms) — 单请求含 spawn_blocking + SQLite WAL 写审计。
+// Latency gates (ms) — each request includes spawn_blocking + a SQLite WAL audit write.
 const P99_GATE_MS: u64 = 200;
 const P50_GATE_MS: u64 = 25;
 
-// DB 硬上限 (MB): audit.db/token.db/action.db 磁盘占用上限。超则真数据泄漏 (无限增长)。
-// 130k L1 行 × ~530B ≈ 69MB; 设 200MB 容突发。rotation (100MB) 生产兜底回收。
+// DB hard cap (MB): disk usage cap across audit.db/token.db/action.db. Exceeding it
+// means real data leakage (unbounded growth).
+// 130k L1 rows x ~530B ≈ 69MB; 200MB absorbs bursts. rotation (100MB) is the
+// production fallback reclaim.
 const DB_HARD_CAP_MB: u64 = 200;
 
-// RSS 硬上限 (MB): release daemon 持续负载 RSS 上限。短跑未达 rotation, 涨含 libmalloc
-// 不归还 OS + tokio blocking 池驻留 (非数据/逻辑泄漏)。设 1200MB 容 macOS allocator 行为。
+// RSS hard cap (MB): RSS cap for the release daemon under sustained load. Short runs
+// do not reach rotation; growth includes libmalloc not returning pages to the OS
+// plus tokio blocking pool residency (not data/logic leaks). 1200MB accommodates
+// macOS allocator behavior.
 const RSS_HARD_CAP_MB: u64 = 1200;
 
-// release 二进制路径: CARGO_MANIFEST_DIR(crates/fg-ipc) → ../../target/release/fusion-guard。
+// Release binary path: CARGO_MANIFEST_DIR(crates/fg-ipc) -> ../../target/release/fusion-guard.
 fn release_binary() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/fusion-guard");
     p.canonicalize().ok().filter(|c| c.exists())
 }
 
-// 隔离 env: 独立 SOCK + DATA_DIR + TOKEN_KEY + LOG_DIR。
+// Isolated env: dedicated SOCK + DATA_DIR + TOKEN_KEY + LOG_DIR.
 fn ensure_env() -> (PathBuf, PathBuf, PathBuf) {
     if std::env::var("FUSION_GUARD_TOKEN_KEY").is_err() {
         std::env::set_var("FUSION_GUARD_TOKEN_KEY", TEST_KEY_HEX);
@@ -66,7 +76,7 @@ fn ensure_env() -> (PathBuf, PathBuf, PathBuf) {
     (db, sock, log_dir)
 }
 
-// spawn release daemon 子进程。返 (Child, db, sock, data_dir)。
+// Spawn the release daemon child process. Returns (Child, db, sock, data_dir).
 fn spawn_daemon() -> (Child, PathBuf, PathBuf, PathBuf) {
     let bin =
         release_binary().expect("release binary missing — run: cargo build --release -p fg-bin");
@@ -91,7 +101,7 @@ fn spawn_daemon() -> (Child, PathBuf, PathBuf, PathBuf) {
     (child, db, sock, data_dir)
 }
 
-// 等子进程 sock 出现 (最多 5s)。超时则 kill 子进程并 panic。
+// Wait for the child's sock to appear (up to 5s). On timeout, kill the child and panic.
 fn wait_for_sock(child: &mut Child, sock: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -108,7 +118,8 @@ fn wait_for_sock(child: &mut Child, sock: &Path) {
     panic!("soak daemon sock never appeared: {}", sock.display());
 }
 
-// 线程安全延迟采样收集器 — 各 worker push 延迟 (us), 终态排序取分位。
+// Thread-safe latency sample collector — each worker pushes latency (us); final
+// state sorts and takes percentiles.
 #[derive(Default)]
 struct SoakStats {
     latencies_us: std::sync::Mutex<Vec<u64>>,
@@ -143,7 +154,7 @@ impl SoakStats {
     }
 }
 
-// 子进程 RSS (KB → bytes)。量纯 daemon, 不含客户端线程。
+// Child process RSS (KB -> bytes). Measures the pure daemon, excluding client threads.
 fn child_rss(pid: u32) -> u64 {
     let out = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -157,7 +168,7 @@ fn child_rss(pid: u32) -> u64 {
     }
 }
 
-// DB 磁盘占用: 遍历 data dir 累加 audit.db/token.db/action.db + -wal + -shm。
+// DB disk usage: walk the data dir summing audit.db/token.db/action.db + -wal + -shm.
 fn db_dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -172,7 +183,7 @@ fn db_dir_size(dir: &Path) -> u64 {
     total
 }
 
-// UDS 客户端单次 RPC: 发 NDJSON 请求, 读一行响应。返 (ok, latency_us)。
+// Single UDS client RPC: send an NDJSON request, read one response line. Returns (ok, latency_us).
 fn rpc_once(stream: &mut UnixStream, req: &str) -> (bool, u64) {
     use std::io::{Read, Write};
     let start = Instant::now();
@@ -206,7 +217,8 @@ fn rpc_once(stream: &mut UnixStream, req: &str) -> (bool, u64) {
     (has_result && !has_err_code, lat)
 }
 
-// worker: 持一条 UDS 连接循环发 evaluate, 记延迟, 直到 stop。
+// Worker: holds one UDS connection, sends evaluate in a loop, records latency,
+// until stop.
 fn soak_worker(
     sock: PathBuf,
     stats: Arc<SoakStats>,
@@ -236,7 +248,8 @@ fn soak_worker(
     }
 }
 
-// 驱动一轮 soak: spawn daemon, 跑 N worker SOAK_DURATION, 采子进程 RSS + DB size + settle RSS。
+// Drive one soak round: spawn daemon, run N workers for SOAK_DURATION, sample
+// child RSS + DB size + settle RSS.
 fn soak_run(content: &'static str) -> (Arc<SoakStats>, Vec<u64>, Vec<u64>, u64) {
     let (mut child, _db, sock, data_dir) = spawn_daemon();
     wait_for_sock(&mut child, &sock);
@@ -268,12 +281,15 @@ fn soak_run(content: &'static str) -> (Arc<SoakStats>, Vec<u64>, Vec<u64>, u64) 
         let _ = w.join();
     }
 
-    // 停打后 settle 采样: 等 2s 让 macOS allocator 回收 MADV_FREE 可回收页 + tokio blocking
-    // 池 idle 线程退出。若 settle RSS 显著低于峰值 → 涨是可回收驻留 (非真泄漏)。
+    // Post-load settle sampling: wait 2s so the macOS allocator reclaims MADV_FREE
+    // reclaimable pages and tokio blocking pool idle threads exit. If the settle RSS
+    // is significantly below the peak, the growth was reclaimable residency (not a
+    // real leak).
     std::thread::sleep(Duration::from_secs(2));
     let rss_settle = child_rss(pid);
 
-    // 清理: kill daemon, 收尸, 删 sock + data dir (只留日志? 全删, 过程数据不留)。
+    // Cleanup: kill daemon, reap it, remove sock + data dir (keep logs? delete all,
+    // no intermediate data left behind).
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&sock);
@@ -282,7 +298,8 @@ fn soak_run(content: &'static str) -> (Arc<SoakStats>, Vec<u64>, Vec<u64>, u64) 
     (stats, rss_samples, db_samples, rss_settle)
 }
 
-// 主 soak: 持续并发负载, 延迟不退化, 子进程内存不超硬上限, 无错误雪崩。
+// Main soak: sustained concurrent load, no latency degradation, child memory within
+// hard caps, no error avalanche.
 #[test]
 fn soak_concurrent_load_no_degradation() {
     if release_binary().is_none() {
@@ -323,23 +340,29 @@ fn soak_concurrent_load_no_degradation() {
         p99 <= P99_GATE_MS,
         "soak p99={p99}ms > {P99_GATE_MS}ms gate"
     );
-    // 数据有界: DB 磁盘占用不超上限 (证无行重复写/无限增长)。130k L1 行 × 530B ≈ 69MB。
+    // Bounded data: DB disk usage stays within the cap (proves no duplicate row
+    // writes / unbounded growth). 130k L1 rows x 530B ≈ 69MB.
     let max_db_mb = *db.iter().max().unwrap_or(&0) / 1024 / 1024;
     assert!(
         max_db_mb <= DB_HARD_CAP_MB,
         "soak DB={max_db_mb}MB > {DB_HARD_CAP_MB}MB cap (unbounded audit growth)"
     );
-    // 内存绝对上限: release daemon 持续 10s 高并发 RSS 不超此值。短跑未达 rotation 100MB 阈值,
-    // 涨含 macOS libmalloc 小对象 (tokio task/serde_json Value 高频 alloc) 不归还 OS + tokio
-    // blocking 池驻留 — 非数据泄漏 (DB 有界已证) 非 guard 逻辑泄漏 (延迟不退化已证)。
-    // drain→retention 缺口已修 (spawn_retention_monitor, 生产 wired), 长跑 rotation 兜底。
+    // Absolute memory cap: the release daemon's RSS over 10s of sustained high
+    // concurrency must stay below this value. Short runs do not reach the 100MB
+    // rotation threshold; growth includes macOS libmalloc small objects (tokio
+    // task/serde_json Value high-frequency allocs) not returned to the OS plus tokio
+    // blocking pool residency — not a data leak (bounded DB already proven) and not
+    // a guard logic leak (no latency degradation already proven).
+    // The drain->retention gap is fixed (spawn_retention_monitor, wired in
+    // production); long runs fall back to rotation.
     assert!(
         max_rss_mb <= RSS_HARD_CAP_MB,
         "soak daemon RSS={max_rss_mb}MB > {RSS_HARD_CAP_MB}MB cap (settle={settle_mb}MB)"
     );
 }
 
-// fail-closed soak: 高并发下 Block L4 路径仍正确放行 block, 不因负载误判 allow。
+// fail-closed soak: under high concurrency the Block L4 path still correctly
+// returns block, never misjudging as allow due to load.
 #[test]
 fn soak_fail_closed_under_load() {
     if release_binary().is_none() {

@@ -21,13 +21,15 @@ enum Cmd {
     Start {
         #[arg(long, env = "FUSION_GUARD_SOCK", default_value = DEFAULT_SOCK)]
         sock: PathBuf,
-        // P2-1 (audit §2.6): 显式放行 env key (release 用)。默认 false —— prod 强制 Keychain。
-        // 置位 = set FUSION_GUARD_ALLOW_ENV_KEY=1 (fg-store token_store 读), 告警级 warn。
+        // P2-1 (audit §2.6): explicit escape hatch for the env key (release builds). Default false — prod requires Keychain.
+        // When set, enables FUSION_GUARD_ALLOW_ENV_KEY=1 (read by fg-store token_store), logged at warn level.
         #[arg(long, default_value_t = false)]
         insecure_env_key: bool,
-        // H-C secret 侧: 显式放行 env shared secret (release 用)。默认 false —— prod 强制 Keychain。
-        // 置位 = set FUSION_GUARD_ALLOW_INSECURE_SECRET=1 (fg-ipc authorizer + gate 读), 告警级 warn。
-        // env secret = 同 UID 进程可读, 非推荐; prod 走 Keychain (security add-generic-password)。
+        // H-C secret side: explicit escape hatch for the env shared secret (release builds). Default false — prod requires Keychain.
+        // When set, enables FUSION_GUARD_ALLOW_INSECURE_SECRET=1 (read by the fg-ipc authorizer + gate), logged at
+        // warn level.
+        // An env secret is readable by any same-UID process, not recommended; prod uses Keychain
+        // (security add-generic-password).
         #[arg(long, default_value_t = false)]
         insecure_secret_env: bool,
     },
@@ -37,17 +39,19 @@ enum Cmd {
     },
 }
 
-// P1-2 (audit §P1-2): 滚动日志文件 (tracing-appender rolling, 按日切分)。
-// 旧码 OpenOptions append 单文件 fusion-guard.log 无限增长, 长跑 (launchd 常驻) 撑满磁盘。
-// 改 rolling: 按日轮转 fusion-guard.log.YYYY-MM-DD, 保留 N 份 (max_log_files), 旧文件自动删。
-// 返回 WorkerGuard 须存活到进程退出 (drop 时 flush 缓冲), main 持有非 _ 前缀变量保活。
+// P1-2 (audit §P1-2): rolling log files (tracing-appender rolling, split daily).
+// The old code used OpenOptions append on a single fusion-guard.log that grew without bound; long runs (launchd
+// resident) could fill the disk. Switched to rolling: daily rotation fusion-guard.log.YYYY-MM-DD, keep N files
+// (max_log_files), oldest files deleted automatically.
+// Returns a WorkerGuard that must stay alive until process exit (drop flushes buffered writes); main binds it to a
+// non-underscore variable to keep it alive.
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
-    // P1-2: rolling 按日切分, 保留 7 份 (一周日志)。文件名前缀 fusion-guard, 后缀 .log。
-    // rotation=Daily → 每日新文件 fusion-guard.YYYY-MM-DD.log; max_log_files=N 删最旧超 N 份。
+    // P1-2: rolling split daily, keep 7 files (one week of logs). Filename prefix fusion-guard, suffix .log.
+    // rotation=Daily → a new fusion-guard.YYYY-MM-DD.log each day; max_log_files=N deletes the oldest beyond N.
     let file_appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("fusion-guard")
@@ -57,7 +61,8 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let (writer, guard) = match file_appender {
         Ok(appender) => tracing_appender::non_blocking(appender),
         Err(e) => {
-            // 滚动构建失败 (目录不可写等) 回退 stderr, 不让日志初始化崩溃守护进程。
+            // Rolling appender build failure (unwritable dir etc.) falls back to stderr; log init must not crash
+            // the daemon.
             eprintln!("rolling log appender build failed: {e}, fallback stderr");
             let (w, g) = tracing_appender::non_blocking(std::io::stderr());
             (w, g)
@@ -92,13 +97,15 @@ fn data_dir() -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
-    // P1-2: guard 须存活到进程退出 (drop flush 缓冲 + 阻止提前轮换)。变量非 _ 前缀保活。
+    // P1-2: the guard must stay alive until process exit (drop flushes buffered writes + prevents early rotation).
+    // Keep the variable non-underscore prefixed.
     let _log_guard = init_tracing();
-    // soak/商用: 显式 runtime 限 blocking 线程池 + 栈大小。
-    // 默认 max_blocking_threads=512 × 2MB 栈 = 潜在 1GB, 高并发 evaluate 全走 spawn_blocking
-    // (SQLite Mutex + 链 hash 阻塞) 时池涨满占大量 RSS。64 线程 × 256KB 栈 = 16MB, 足够
-    // 16 req_sem 并发 (实际并发 handler ≤ MAX_CONCURRENT_REQS=16), 512 纯浪费。
-    // worker_threads=CPU 核数保持 (异步 IO); blocking 池独立给 spawn_blocking。
+    // soak/commercial: explicit runtime caps the blocking thread pool + stack size.
+    // Default max_blocking_threads=512 × 2MB stacks = potentially 1GB; under high-concurrency evaluate everything
+    // goes through spawn_blocking (SQLite Mutex + chain hash blocking) and the pool can fill up consuming large RSS.
+    // 64 threads × 256KB stacks = 16MB, enough for the 16 req_sem concurrency (actual concurrent handlers ≤
+    // MAX_CONCURRENT_REQS=16); 512 is pure waste.
+    // worker_threads=CPU core count kept (async IO); the blocking pool is reserved for spawn_blocking.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(64)
@@ -127,15 +134,16 @@ async fn run_server(
     insecure_secret_env: bool,
 ) -> anyhow::Result<()> {
     tracing::info!(sock = %sock.display(), "fusion-guard daemon starting");
-    // P2-1: CLI flag → env (token_store load_or_create_key 读)。flag 显式 = operator 知情放行。
+    // P2-1: CLI flag → env (read by token_store load_or_create_key). An explicit flag means the operator knowingly allows it.
     if insecure_env_key {
         std::env::set_var("FUSION_GUARD_ALLOW_ENV_KEY", "1");
         tracing::warn!(
             "--insecure-env-key set (P2-1): master key may load from env in release build"
         );
     }
-    // H-C secret 侧: CLI flag → env (fg-ipc authorizer + require_shared_secret_for_release 读)。
-    // flag 显式 = operator 知情放行 env shared secret (同 UID 可读, 非推荐); prod 走 Keychain。
+    // H-C secret side: CLI flag → env (read by the fg-ipc authorizer + require_shared_secret_for_release).
+    // An explicit flag means the operator knowingly allows the env shared secret (same-UID readable, not
+    // recommended); prod uses Keychain.
     if insecure_secret_env {
         std::env::set_var("FUSION_GUARD_ALLOW_INSECURE_SECRET", "1");
         tracing::warn!(
@@ -143,14 +151,16 @@ async fn run_server(
              same-UID visible, prod should use Keychain (security add-generic-password -s fusion-guard -a shared-secret)"
         );
     }
-    // H-C (product-audit §5): release 构建必须设共享 secret (第二鉴权因子, 超越 peercred)。
-    // dev 跳过; release 未设 → 拒启动 (防仅 peercred 兜底被同 uid 被攻陷进程全权调用)。
-    // 应急: FUSION_GUARD_ALLOW_NO_SECRET=1 放行 (运维知情, 非 prod)。
+    // H-C (product-audit §5): release builds must have a shared secret set (second auth factor beyond peercred).
+    // dev skips; release without one → refuse to start (prevents the peercred-only fallback being fully callable by
+    // a compromised same-uid process).
+    // Emergency: FUSION_GUARD_ALLOW_NO_SECRET=1 allows it (operator-informed, not for prod).
     require_shared_secret_for_release().map_err(|e| anyhow::anyhow!(e))?;
     let db_path = data_dir().join("guard.db");
     let audit = Arc::new(AuditStore::open(&db_path)?);
-    // soak/商用: 周期 retention 监控覆盖 drain 低风险路径 (drain 只插不触 rotation)。
-    // 5s 间隔 —— 高频 L1 流量下 DB 涨快, 60s 太慢 (突发已超 rotation 阈值)。
+    // soak/commercial: periodic retention monitor covers the drain low-risk path (drain only inserts, never rotates).
+    // 5s interval — under high-frequency L1 traffic the DB grows fast; 60s is too slow (bursts already exceed the
+    // rotation threshold).
     audit.spawn_retention_monitor(5);
     let engine = AuditEngine::new(audit.clone())?;
     let server = IpcServer::new(engine, audit);
@@ -161,25 +171,27 @@ async fn run_server(
         }
     });
 
-    // P1-1 (audit §P1-1): 优雅关闭。旧码仅 tokio::signal::ctrl_c() (SIGINT), launchd/start.sh
-    // 发 SIGTERM 被默认动作直接杀 (SIGTERM 无 handler → 进程退出但 audit drain 线程的 L1/L2
-    // 在途批次可能未 flush, synchronous=NORMAL 非每提交 fsync)。补 SIGTERM handler:
-    // 收 SIGINT/SIGTERM → 停 accept (abort server_task) → drain grace 让在途低风险批次落库
-    // → 退出 (AuditStore drop 触发 SQLite 连接关闭 = WAL checkpoint)。
-    // 高风险行 synchronous=FULL 每提交已 fsync, 无丢失; 低风险 drain 短 grace 兜底。
+    // P1-1 (audit §P1-1): graceful shutdown. The old code only handled tokio::signal::ctrl_c() (SIGINT); SIGTERM
+    // from launchd/start.sh killed the process via the default action (no SIGTERM handler → the process exits but
+    // the audit drain thread's in-flight L1/L2 batch may not be flushed; synchronous=NORMAL does not fsync every
+    // commit). Added a SIGTERM handler:
+    // SIGINT/SIGTERM → stop accept (abort server_task) → drain grace lets in-flight low-risk batches persist
+    // → exit (AuditStore drop closes the SQLite connections = WAL checkpoint).
+    // High-risk rows already fsync every commit (synchronous=FULL), no loss; the low-risk drain gets a short grace window.
     shutdown_signal().await;
     tracing::info!("shutdown signal received, stopping accept loop (P1-1 graceful)");
     server_task.abort();
-    // P1-1 drain grace: 给 drain 线程在途低风险批次落库窗口 (sync_channel batch insert)。
-    // 500ms 足够单批次 (drain 收一条即插, 或小批), 不显著拖慢停止; 长 drain 卡顿不阻塞退出。
+    // P1-1 drain grace: gives the drain thread a window to persist in-flight low-risk batches (sync_channel batch
+    // insert). 500ms is enough for a single batch (drain inserts as it receives, or small batches) without slowing
+    // shutdown much; a long drain stall does not block exit.
     tracing::info!("drain grace window (500ms) — flushing in-flight low-risk audit batch (P1-1)");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     tracing::info!("fusion-guard daemon stopped (audit connections drop → WAL checkpoint)");
     Ok(())
 }
 
-// P1-1: 等待 SIGINT 或 SIGTERM, 任一到即返回 (触发优雅关闭)。
-// tokio::signal::ctrl_c() 仅 SIGINT; SIGTERM 需 unix signal adapter。launchd/kill -TERM 走此。
+// P1-1: wait for SIGINT or SIGTERM, return on whichever arrives first (triggers graceful shutdown).
+// tokio::signal::ctrl_c() only covers SIGINT; SIGTERM needs the unix signal adapter. launchd/kill -TERM lands here.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

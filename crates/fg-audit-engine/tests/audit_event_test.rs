@@ -1,8 +1,9 @@
-// Issue #1/#3 (PRD §6.7 / D-10, fusion-event 冻结契约): guard.audit 入站 RPC 的引擎层。
-// audit_event 把 fusion-event trigger 字段拼成 content, 复用 evaluate, 映射 verdict→decision 三态。
-// pass: 干净 trigger; block: target_path 含 rm -rf; challenge: L3 requires_approval。
-// audit_id 来自 append_event 落链; trigger_id 原样回声。
-// 需 FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore 加载密钥)。
+// Issue #1/#3 (PRD §6.7 / D-10, frozen fusion-event contract): engine layer of the inbound guard.audit RPC.
+// audit_event concatenates fusion-event trigger fields into content, reuses evaluate, and maps the verdict to the
+// three-state decision.
+// pass: clean trigger; block: target_path contains rm -rf; challenge: L3 requires_approval.
+// audit_id comes from the append_event chain row; trigger_id echoed verbatim.
+// Requires FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore loads the key).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,7 +129,7 @@ async fn audit_event_pii_payload_passes_redacted() {
         .unwrap();
     assert_eq!(
         d.decision, "pass",
-        "敏感 payload → Redact L2 归 pass (DLP 脱敏非权限拒): {d:?}"
+        "sensitive payload → Redact L2 maps to pass (DLP masking, not a permission denial): {d:?}"
     );
     assert_eq!(d.risk_level, 1, "Redact → L2 rank 1");
     cleanup(&dir);

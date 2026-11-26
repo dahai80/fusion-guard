@@ -1,9 +1,9 @@
 pub use serde::{Deserialize, Serialize};
 
-// C11/P0-G7 (E5): 契约要求 lowercase 序列化 ("block"/"l4" 非 "Block"/"L4")。
-// 服务端 to_value 与客户端 parse 端到端对齐, 否则 caller 按 "block" 匹配失败 → Block 静默变 allow。
-// M6: 显式 repr(u8) + 判别式, 不再依赖隐式变体序。Ord 显式 impl 锁 L4>L3>L2>L1,
-// max_by_key 用 rank() 确定性比较 (L11 平局消除依赖)。
+// C11/P0-G7 (E5): contract requires lowercase serialization ("block"/"l4" not "Block"/"L4").
+// Server to_value and client parse aligned end-to-end, otherwise a caller matching on "block" fails → Block silently becomes allow.
+// M6: explicit repr(u8) + discriminants, no longer relying on implicit variant order. Ord explicitly impl'd to lock L4>L3>L2>L1,
+// max_by_key uses rank() for deterministic comparison (L11 tie-breaking dependency).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[repr(u8)]
@@ -32,8 +32,8 @@ impl Ord for RiskLevel {
     }
 }
 
-// M6: SafetyAction 显式严重度序 (Block > Redact > Preview > Allow)。
-// verdict_from_hits (L11) 按动作严重度取 head, 不再依赖 push 顺序。
+// M6: SafetyAction explicit severity order (Block > Redact > Preview > Allow).
+// verdict_from_hits (L11) takes head by action severity, no longer relying on push order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SafetyAction {
@@ -83,13 +83,13 @@ pub enum RuleScope {
     Filesystem,
 }
 
-// P0-2 (audit §1.7/§1.8): guard.evaluate 按 content_type 分派扫描阶段。
-//   Shell  → Stage1 regex + Stage2 tokenizer (AST)。shell_words 解析 argv。
-//   Code   → Stage1 regex + Stage3 semantic (tree-sitter 多 grammar)。跳 tokenizer
-//            (代码非 shell 语法, tokenizer 会把 import os 当非白名单 binary 假阳)。
-//   Json/Yaml/Text → 仅 Stage1 regex。跳 tokenizer + semantic (结构化/自由文本非可执行)。
-// 默认 Shell (向后兼容: 现有 caller 不传 content_type 当 shell)。Default 派生取首变体 Shell。
-// Unknown → 按 Shell 处理 (fail-open 仅对扫描阶段选择; 命中规则照常 Block, 不降低安全)。
+// P0-2 (audit §1.7/§1.8): guard.evaluate dispatches scan stages by content_type.
+//   Shell  → Stage1 regex + Stage2 tokenizer (AST). shell_words parses argv.
+//   Code   → Stage1 regex + Stage3 semantic (tree-sitter multi-grammar). Skips the tokenizer
+//            (code is not shell syntax; the tokenizer would false-positive on import os as a non-whitelisted binary).
+//   Json/Yaml/Text → Stage1 regex only. Skips tokenizer + semantic (structured/free text is not executable).
+// Default Shell (backward compatible: existing callers not passing content_type are treated as shell). Default derive takes first variant Shell.
+// Unknown → handled as Shell (fail-open applies only to scan-stage selection; rule hits still Block, no security reduction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
@@ -102,15 +102,15 @@ pub enum ContentType {
 }
 
 impl ContentType {
-    // tokenizer (Stage2 AST) 仅对 Shell 内容跑。
+    // tokenizer (Stage2 AST) runs only for Shell content.
     pub fn run_tokenizer(self) -> bool {
         matches!(self, ContentType::Shell)
     }
-    // semantic (Stage3 tree-sitter) 仅对 Code 内容跑。
+    // semantic (Stage3 tree-sitter) runs only for Code content.
     pub fn run_semantic(self) -> bool {
         matches!(self, ContentType::Code)
     }
-    // 从 IPC 字符串解析, 未知值 → Shell (默认, fail-open 仅对扫描阶段; 规则命中仍 Block)。
+    // Parse from IPC string, unknown value → Shell (default, fail-open only for scan stage; rule hits still Block).
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "code" => ContentType::Code,
@@ -135,10 +135,10 @@ pub struct GuardVerdict {
     pub verdict_epoch: u64,
     pub verdict_ttl_secs: u32,
     pub inferred_category: String,
-    // P2-6 (audit §3.2/F6, PRD §6.3 H9): 调用方传入的 category_hint。
-    // guard 从 content 推断 category 权威 (inferred_category), hint 仅作风险地板
-    // (max(推断, 命中, hint)) —— hint 抬高等级, 永不压低 (防自证降级绕过)。
-    // None = 调用方未传 (默认, 向后兼容)。serde default 关让旧 verdict JSON 缺此字段仍可解。
+    // P2-6 (audit §3.2/F6, PRD §6.3 H9): category_hint passed in by the caller.
+    // guard infers category from content as the authority (inferred_category); hint is only a risk floor
+    // (max(inferred, hit, hint)) — hint raises the level, never lowers it (prevents self-attested downgrade bypass).
+    // None = caller did not pass one (default, backward compatible). serde default so old verdict JSON missing this field still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_hint: Option<String>,
 }
@@ -157,18 +157,18 @@ pub enum GuardError {
     Io(#[from] std::io::Error),
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
-    // L8/M2/P1: JSON-RPC 标准码 — 参数错误 (-32602) 与方法未找到 (-32601)。
-    // Display 不含内部细节 (M1: 不转发 SQLite schema/路径/方法名到 wire)。
+    // L8/M2/P1: JSON-RPC standard codes — invalid params (-32602) and method not found (-32601).
+    // Display carries no internal details (M1: no SQLite schema/paths/method names forwarded onto the wire).
     #[error("invalid params")]
     InvalidParams,
     #[error("method not found")]
     MethodNotFound,
-    // P2-3 (audit §3.4): JSON-RPC 协议版本非 "2.0" → -32600 (Invalid Request)。
-    // 防 caller 用非标协议绕过/污染审计 (旧码解析 jsonrpc 字段但不校验值)。
+    // P2-3 (audit §3.4): JSON-RPC protocol version not "2.0" → -32600 (Invalid Request).
+    // Prevents callers bypassing/polluting audit with a non-standard protocol (old code parsed the jsonrpc field but did not validate its value).
     #[error("invalid request: jsonrpc must be \"2.0\"")]
     InvalidRequest,
-    // H-B (product-audit §5): 规则突变方法 (add/update/remove) 仅 admin (root) 可调。
-    // 非 admin 调规则突变 → 拒 (-32001, 与 Unauthorized 同码 wire 不区分但日志区分)。
+    // H-B (product-audit §5): rule mutation methods (add/update/remove) callable only by admin (root).
+    // Non-admin rule mutation → rejected (-32001, same wire code as Unauthorized but distinguished in logs).
     #[error("forbidden: rule mutation requires admin")]
     Forbidden,
 }

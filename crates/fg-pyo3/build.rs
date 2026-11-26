@@ -1,14 +1,14 @@
-// fg-pyo3 build.rs — 注入 git_sha + build_time 到编译环境变量
-// Python __init__.py 经 _native.version_info() 读 __version__ 元信息
-// git_sha: `git rev-parse --short=8 HEAD` (无 git 或失败 → "unknown", 不阻断构建)
-// build_time: 编译机 epoch 秒 (workflow 内 Date::now 不可用, build.rs 正常)
+// fg-pyo3 build.rs — injects git_sha + build_time into the compile-time env vars
+// Python __init__.py reads the __version__ metadata via _native.version_info()
+// git_sha: `git rev-parse --short=8 HEAD` (no git or failure → "unknown", never blocks the build)
+// build_time: build machine epoch seconds (Date::now is unavailable inside the workflow; build.rs is the right place)
 use std::process::Command;
 
 fn main() {
-    // M5: rerun-if-changed 须覆盖同分支新提交, 非仅分支切换。
-    // 原 仅 .git/HEAD —— HEAD 存当前分支名 (非 commit hash), 同分支新提交不改 HEAD 文件内容
-    // → FG_GIT_SHA 增量构建陈旧。补 .git/refs (含 refs/heads/<branch>, 新提交更新该文件) +
-    // .git/packed-refs (pack 后 ref 索引)。无对应路径 cargo 忽略, 不阻断构建。
+    // M5: rerun-if-changed must cover new commits on the same branch, not just branch switches.
+    // Originally only .git/HEAD — HEAD stores the current branch name (not the commit hash), so a new commit on the same branch does not change the HEAD file contents
+    // → FG_GIT_SHA went stale across incremental builds. Add .git/refs (includes refs/heads/<branch>, updated on each new commit) +
+    // .git/packed-refs (ref index after packing). cargo ignores missing paths, never blocking the build.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs");
     println!("cargo:rerun-if-changed=../../.git/packed-refs");

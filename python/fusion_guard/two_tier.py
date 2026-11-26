@@ -100,7 +100,9 @@ class TwoTierGuard:
         logger.info(
             "two-tier escalate to full guard evaluation | precheck_latency=%.2fms | "
             "precheck_blocked=%s | precheck_fallback=%s",
-            pre.latency_ms, pre.blocked, pre.fallback,
+            pre.latency_ms,
+            pre.blocked,
+            pre.fallback,
         )
         full = self.full_evaluate(prompt)
         total = (time.perf_counter() - start) * 1000.0
@@ -123,7 +125,8 @@ class TwoTierGuard:
             self.stats["truncated_prompts"] += 1
             logger.debug(
                 "pre-check prompt truncated %d -> %d chars (laya max_len bound)",
-                len(precheck_prompt), LAYA_MAX_PROMPT_CHARS,
+                len(precheck_prompt),
+                LAYA_MAX_PROMPT_CHARS,
             )
             precheck_prompt = precheck_prompt[:LAYA_MAX_PROMPT_CHARS]
         pre = self.laya.evaluate(precheck_prompt)
@@ -143,9 +146,10 @@ class TwoTierGuard:
             total = (time.perf_counter() - start) * 1000.0
             self.stats["fast_allow"] += 1
             logger.info(
-                "two-tier FAST ALLOW (full evaluation skipped) | precheck_latency=%.2fms | "
-                "total=%.2fms | topic=%s",
-                pre.latency_ms, total, pre.topic,
+                "two-tier FAST ALLOW (full evaluation skipped) | precheck_latency=%.2fms | total=%.2fms | topic=%s",
+                pre.latency_ms,
+                total,
+                pre.topic,
             )
             return TwoTierResult(
                 tier="fast_allow",
@@ -191,7 +195,10 @@ class TwoTierGuard:
         }
         logger.info(
             "two-tier agreement validation | sampled=%d agreed=%d disagreed=%d rate=%.4f",
-            total, agreed, disagreed, rate,
+            total,
+            agreed,
+            disagreed,
+            rate,
         )
         return result
 

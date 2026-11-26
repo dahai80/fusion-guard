@@ -1,12 +1,12 @@
-// H-C secret 侧: shared secret 来源决策纯函数 (resolve_shared_secret) + 生成格式单测。
-// 不触真实 Keychain (非确定性, CI 无用户 Keychain) —— 决策逻辑用纯函数验证 (规则 5)。
-// Keychain I/O 由 authorizer 集成测试 + 部署文档覆盖 (security find-generic-password 实测)。
+// H-C secret side: pure decision function for the shared-secret source (resolve_shared_secret) + generation format unit tests.
+// Does not touch the real Keychain (non-deterministic; CI has no user Keychain) — decision logic verified via pure functions (Rule 5).
+// Keychain I/O is covered by the authorizer integration tests + deployment docs (live-tested with security find-generic-password).
 
 use fg_store::secret_store::{generate_shared_secret, resolve_shared_secret, SharedSecretSource};
 
 #[test]
 fn resolve_keychain_when_no_env() {
-    // env 未提供 → Keychain (prod 路径; Keychain 缺由调用方再判 None)。
+    // env not provided -> Keychain (prod path; a missing Keychain entry is the caller's None decision).
     assert_eq!(
         resolve_shared_secret(true, false, false),
         SharedSecretSource::Keychain
@@ -19,7 +19,7 @@ fn resolve_keychain_when_no_env() {
 
 #[test]
 fn resolve_env_debug_when_env_present_debug_build() {
-    // dev 构建容 env (EnvDebug, info 姿态)。
+    // dev builds tolerate env (EnvDebug, info posture).
     assert_eq!(
         resolve_shared_secret(true, false, true),
         SharedSecretSource::EnvDebug
@@ -28,7 +28,7 @@ fn resolve_env_debug_when_env_present_debug_build() {
 
 #[test]
 fn resolve_env_insecure_when_env_present_release_with_flag() {
-    // release + env + 显式放行 flag → EnvInsecure (warn 告警)。
+    // release + env + explicit bypass flag -> EnvInsecure (warning emitted).
     assert_eq!(
         resolve_shared_secret(false, true, true),
         SharedSecretSource::EnvInsecure
@@ -37,7 +37,7 @@ fn resolve_env_insecure_when_env_present_release_with_flag() {
 
 #[test]
 fn resolve_keychain_when_env_present_release_no_flag() {
-    // release + env 但未放行 → Keychain (不静默用 env, 防漏 flag 降级)。
+    // release + env but no bypass flag -> Keychain (never silently uses env, preventing a missed-flag downgrade).
     assert_eq!(
         resolve_shared_secret(false, false, true),
         SharedSecretSource::Keychain
@@ -46,19 +46,19 @@ fn resolve_keychain_when_env_present_release_no_flag() {
 
 #[test]
 fn generate_shared_secret_is_hex_64_chars() {
-    // 生成 32 字节 hex = 64 字符, 纯 hex (可作 security add-generic-password -w 值)。
+    // Generates 32 bytes of hex = 64 chars, pure hex (usable as a security add-generic-password -w value).
     let s = generate_shared_secret();
-    assert_eq!(s.len(), 64, "shared secret 须 32 字节 hex = 64 字符");
+    assert_eq!(s.len(), 64, "shared secret must be 32-byte hex = 64 chars");
     assert!(
         s.chars().all(|c| c.is_ascii_hexdigit()),
-        "shared secret 须纯 hex"
+        "shared secret must be pure hex"
     );
 }
 
 #[test]
 fn generate_shared_secret_is_random() {
-    // 两次生成不同 (非固定值)。
+    // Two generations differ (not a fixed value).
     let a = generate_shared_secret();
     let b = generate_shared_secret();
-    assert_ne!(a, b, "生成须随机非固定");
+    assert_ne!(a, b, "generation must be random, not fixed");
 }

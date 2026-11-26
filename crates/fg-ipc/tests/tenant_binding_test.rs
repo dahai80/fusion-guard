@@ -1,7 +1,10 @@
-// P0-1 (audit §1.1): peercred→tenant 绑定验证。wire tenant_id 自声明漏洞修复 —
-// 非 admin caller 传未授权 tenant_id 到 evaluate/redact/reveal/confirm/audit.list/
-// audit.verify → -32001 拒。同 uid 守护进程仅授权 DEFAULT_TENANT (IpcServer::new bootstrap)。
-// admin (uid=0) 跳过 (root 全租户)。本机测试 uid != 0 → 走非 admin 路径。
+// P0-1 (audit §1.1): peercred->tenant binding verification. Fixes the wire
+// tenant_id self-declaration vulnerability —
+// a non-admin caller passing an unauthorized tenant_id to
+// evaluate/redact/reveal/confirm/audit.list/audit.verify is rejected with -32001.
+// A same-uid daemon only authorizes DEFAULT_TENANT (IpcServer::new bootstrap).
+// admin (uid=0) is skipped (root spans all tenants). Local test uid != 0 -> takes
+// the non-admin path.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -74,12 +77,14 @@ fn raw_call(sock: &std::path::Path, req: &str) -> serde_json::Value {
 }
 
 fn is_root() -> bool {
-    // 用 fg-peercred 安全 our_uid (crate 本身 unsafe_code=allow), 避免测试触发 workspace deny。
+    // Use fg-peercred's safe our_uid (the crate itself is unsafe_code=allow) so the
+    // test does not trip the workspace deny.
     fg_peercred::our_uid() == 0
 }
 
-// 非 admin caller: evaluate 传未授权 tenant_id "evil-corp" → -32001。
-// 守护进程 IpcServer::new 已绑 daemon_uid → DEFAULT_TENANT。本机 uid 非 root 仅授权 DEFAULT。
+// Non-admin caller: evaluate with unauthorized tenant_id "evil-corp" -> -32001.
+// The daemon's IpcServer::new already bound daemon_uid -> DEFAULT_TENANT. Local uid
+// is not root, so only DEFAULT is authorized.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluate_cross_tenant_denied() {
     if is_root() {
@@ -97,7 +102,7 @@ async fn evaluate_cross_tenant_denied() {
         .expect("cross-tenant must error, not result");
     assert_eq!(
         err["code"], -32001,
-        "P0-1: 未授权 tenant 须 -32001, got: {}",
+        "P0-1: an unauthorized tenant must get -32001, got: {}",
         err
     );
 
@@ -105,7 +110,7 @@ async fn evaluate_cross_tenant_denied() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// 非 admin caller: evaluate 传授权 DEFAULT_TENANT → 正常 result (非拒)。
+// Non-admin caller: evaluate with the authorized DEFAULT_TENANT -> normal result (not rejected).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluate_authorized_tenant_allowed() {
     let (db, sock) = ensure_env();
@@ -124,7 +129,7 @@ async fn evaluate_authorized_tenant_allowed() {
     let resp = raw_call(&sock, &req);
     assert!(
         resp.get("result").is_some(),
-        "P0-1: 授权 tenant 须正常返回 result, 非 error. resp: {}",
+        "P0-1: an authorized tenant must return a normal result, not an error. resp: {}",
         resp
     );
 
@@ -132,7 +137,7 @@ async fn evaluate_authorized_tenant_allowed() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// 非 admin: audit.list 传未授权 tenant_id → -32001 (斩跨租户枚举外泄链)。
+// Non-admin: audit.list with unauthorized tenant_id -> -32001 (cuts the cross-tenant enumeration exfiltration chain).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_list_cross_tenant_denied() {
     if is_root() {
@@ -150,7 +155,7 @@ async fn audit_list_cross_tenant_denied() {
         .expect("cross-tenant audit.list must error");
     assert_eq!(
         err["code"], -32001,
-        "P0-1: audit.list 未授权 tenant 须 -32001, got: {}",
+        "P0-1: audit.list with an unauthorized tenant must get -32001, got: {}",
         err
     );
 
@@ -158,7 +163,7 @@ async fn audit_list_cross_tenant_denied() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// 非 admin: audit.verify 传未授权 tenant_id → -32001 (斩跨租户行数外泄)。
+// Non-admin: audit.verify with unauthorized tenant_id -> -32001 (cuts cross-tenant row-count exfiltration).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_verify_cross_tenant_denied() {
     if is_root() {
@@ -176,7 +181,7 @@ async fn audit_verify_cross_tenant_denied() {
         .expect("cross-tenant audit.verify must error");
     assert_eq!(
         err["code"], -32001,
-        "P0-1: audit.verify 未授权 tenant 须 -32001, got: {}",
+        "P0-1: audit.verify with an unauthorized tenant must get -32001, got: {}",
         err
     );
 
@@ -184,8 +189,9 @@ async fn audit_verify_cross_tenant_denied() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// 非 admin: audit.verify 不传 tenant_id → scope 默认取授权集中首个 (DEFAULT_TENANT),
-// 正常返回 (非拒)。total_rows=0 空库。验证默认作用域不崩。
+// Non-admin: audit.verify without tenant_id -> scope defaults to the first entry of
+// the authorized set (DEFAULT_TENANT), returning normally (not rejected).
+// total_rows=0 on an empty store. Verifies the default scope does not crash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_verify_default_scope_allowed() {
     let (db, sock) = ensure_env();
@@ -196,7 +202,7 @@ async fn audit_verify_default_scope_allowed() {
     let resp = raw_call(&sock, req);
     assert!(
         resp.get("result").is_some(),
-        "P0-1: 不传 tenant_id 须用授权默认 scope 正常返回, 非 error. resp: {}",
+        "P0-1: omitting tenant_id must use the authorized default scope and return normally, not an error. resp: {}",
         resp
     );
 

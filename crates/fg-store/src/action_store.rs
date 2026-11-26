@@ -54,7 +54,7 @@ impl ActionStore {
             CREATE INDEX IF NOT EXISTS idx_pending_ts ON pending_actions(created_ts);
             ",
         )?;
-        // C20 旧库迁移: 加 tenant_id 列 (幂等)
+        // C20 legacy DB migration: add tenant_id column (idempotent)
         let _ = conn.execute(
             "ALTER TABLE pending_actions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
             [],
@@ -87,16 +87,20 @@ impl ActionStore {
         Ok(())
     }
 
-    // G6/L2+A8/C9/C20: 原子 confirm —— consume UPDATE 与 confirm 审计 INSERT 在
-    // 同一临界区 (单 audit_writer 锁全程), 顺序 audit-then-consume (审计成功才标消费)。
-    // P0-6 (audit §2.1): 双锁消除。旧码 action_db 锁全程 + 嵌套 audit_writer 锁 → 突发负载活锁,
-    // 改单 audit_writer 锁: SELECT pending_actions + INSERT audit_events + UPDATE consumed 同锁内。
-    // P1-7 (audit §3.5): 物理分库后 pending_actions 在 action.db, audit_writer 连接 ATTACH action.db
-    // 为 `action` schema (open 时建), 故引用改 `action.pending_actions`。跨库事务 (main.audit_events
-    // + action.pending_actions) 协调提交保 H4 原子, action.db 独立 WAL 不并入 audit.db WAL。
-    // ActionStore 自身连接 (put/evict_expired) 未 ATTACH, 仍走 main.pending_actions。
-    // C9: H8 查 risk_level 列 (ground truth) 非 verdict_json blob; 交叉校验列与 JSON 一致。
-    // C20: 校验 caller tenant_id == stored tenant_id (斩跨租户 confirm)。
+    // G6/L2+A8/C9/C20: atomic confirm — the consume UPDATE and the confirm audit INSERT run in
+    // the same critical section (single audit_writer lock held throughout), ordered audit-then-consume
+    // (consumed is marked only after the audit insert succeeds).
+    // P0-6 (audit §2.1): double-lock elimination. Old code held the action_db lock throughout plus a
+    // nested audit_writer lock → livelock under bursty load; switched to a single audit_writer lock:
+    // SELECT pending_actions + INSERT audit_events + UPDATE consumed inside one lock.
+    // P1-7 (audit §3.5): after the physical DB split, pending_actions lives in action.db and the
+    // audit_writer connection ATTACHes action.db as the `action` schema (created at open), so references
+    // became `action.pending_actions`. The cross-db transaction (main.audit_events +
+    // action.pending_actions) commits coordinately to keep H4 atomic; action.db keeps its own WAL,
+    // not merged into audit.db's WAL.
+    // ActionStore's own connection (put/evict_expired) does not ATTACH and still uses main.pending_actions.
+    // C9: H8 checks the risk_level column (ground truth), not the verdict_json blob; cross-checks column vs JSON consistency.
+    // C20: verifies caller tenant_id == stored tenant_id (kills cross-tenant confirm).
     #[allow(clippy::too_many_arguments)]
     pub fn confirm_atomic(
         &self,
@@ -108,17 +112,20 @@ impl ActionStore {
         chain_key: &Zeroizing<[u8; 32]>,
         key_version: i64,
     ) -> Result<GuardVerdict, ActionError> {
-        // P0-6: 单 audit_writer 锁全程 (pending_actions + audit_events 同连接可见, P1-7 经 ATTACH)。
+        // P0-6: single audit_writer lock held throughout (pending_actions + audit_events visible on the same connection, P1-7 via ATTACH).
         let mut w = recover_lock!(
             audit_writer.lock(),
             "audit writer (confirm single-lock P0-6)"
         );
-        // H-D (product-audit §5): 跨库事务。原实现 SELECT+INSERT+UPDATE 各在 autocommit 独立提交,
-        // 崩溃窗口 (audit INSERT 已提交, UPDATE consumed 未提交) → 重启后 action_id 仍 consumed=0 →
-        // 可再次 confirm = 双确认重放, 违反 H4 一次性。BEGIN IMMEDIATE 跨 ATTACH 库 (audit_writer
-        // ATTACH action.db 为 `action` schema) 给跨库原子: 三步同事务, commit 全成或全回滚, 崩溃恢复
-        // 级 H4 原子达成。BEGIN IMMEDIATE 立即取 audit.db 写锁 + action.db 协调锁 (ATTACH 下多库事务
-        // 各库锁顺序一致, 无死锁)。事务内 SELECT 见已持写锁, 他连接不可插队改 consumed。
+        // H-D (product-audit §5): cross-db transaction. The old implementation committed SELECT+INSERT+UPDATE
+        // independently under autocommit — a crash window (audit INSERT committed, UPDATE consumed not committed)
+        // left action_id with consumed=0 after restart → confirm possible again = double-confirm replay,
+        // violating H4 one-time. BEGIN IMMEDIATE across ATTACHed databases (audit_writer ATTACHes action.db
+        // as the `action` schema) gives cross-db atomicity: all three steps in one transaction, commit succeeds
+        // fully or rolls back fully, achieving crash-recovery-grade H4 atomicity. BEGIN IMMEDIATE immediately takes
+        // the audit.db write lock + action.db coordinated lock (under ATTACH, multi-db transactions take locks in a
+        // consistent per-db order, no deadlock). SELECTs inside the transaction see the held write lock; other
+        // connections cannot jump in and change consumed.
         let tx = w.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row = tx
             .query_row(
@@ -140,7 +147,7 @@ impl ActionStore {
             row.ok_or_else(|| ActionError::NotFound(action_id.to_string()))?;
         let mut verdict: GuardVerdict = serde_json::from_str(&j)?;
 
-        // C9: H8 查 risk_level 列 (权威 ground truth, put 时写), 非 JSON blob。
+        // C9: H8 checks the risk_level column (authoritative ground truth, written at put), not the JSON blob.
         if risk == RiskLevel::L4 as i64 {
             tracing::warn!(
                 action_id = action_id,
@@ -148,7 +155,7 @@ impl ActionStore {
             );
             return Err(ActionError::AbsoluteBlock(action_id.to_string()));
         }
-        // C9 交叉校验: 列 risk_level 必须与 verdict_json 反序列化值一致, 不一致即篡改 → 拒。
+        // C9 cross-check: the risk_level column must match the verdict_json deserialized value; a mismatch means tampering → refuse.
         if risk != verdict.risk_level as i64 {
             tracing::error!(
                 action_id = action_id,
@@ -161,7 +168,7 @@ impl ActionStore {
                 json: j,
             });
         }
-        // C20: 跨租户 confirm 拒绝 (action_id 泄露也不可被他租户消费)。
+        // C20: cross-tenant confirm rejected (even a leaked action_id cannot be consumed by another tenant).
         if stored_tenant != caller_tenant {
             tracing::warn!(
                 action_id = action_id,
@@ -184,7 +191,7 @@ impl ActionStore {
             return Err(ActionError::Expired(action_id.to_string()));
         }
 
-        // L12: 先存原始触发原因 (evaluate 时写入的规则名/触发理由), 再覆盖 reason。
+        // L12: save the original trigger reason (rule name/trigger reason written at evaluate) before overwriting reason.
         let original_trigger = verdict.reason.clone();
         if approved {
             verdict.action = fg_core::SafetyAction::Allow;
@@ -196,8 +203,9 @@ impl ActionStore {
             verdict.requires_approval = false;
         }
 
-        // L2+A8: 先写 confirm 审计 (同步高风险 H7), 成功才标 consumed。
-        // 审计失败 → 拒绝消费 (动作仍可重 confirm), 不留"已消费无审计"永久缺口。
+        // L2+A8: write the confirm audit first (sync high-risk H7); only mark consumed on success.
+        // Audit failure → refuse to consume (the action can still be re-confirmed), leaving no permanent
+        // "consumed without audit" gap.
         let outcome = if approved { "approved" } else { "rejected" };
         let ev = crate::AuditEvent {
             audit_id: uuid::Uuid::new_v4(),
@@ -219,10 +227,11 @@ impl ActionStore {
             return Err(ActionError::AuditFailed(e.to_string()));
         }
 
-        // 审计落库成功 → 标 consumed (一次性)。H-D: 与 audit INSERT 同一 BEGIN IMMEDIATE 事务,
-        // commit 原子 —— 崩溃在 INSERT 后 UPDATE 前, 事务未 commit 回滚, consumed 仍 0 但 audit
-        // 行也回滚 (无审计的消费) → 无双确认重放窗口。commit 全成 = 审计+consumed 同落。
-        // P1-7: pending_actions 在 action.db (audit_writer ATTACH 为 `action` schema)。
+        // Audit persisted → mark consumed (one-time). H-D: same BEGIN IMMEDIATE transaction as the audit
+        // INSERT, commit is atomic — a crash between INSERT and UPDATE rolls back the uncommitted transaction,
+        // consumed stays 0 but the audit row rolls back too (consumption without audit) → no double-confirm
+        // replay window. Full commit = audit + consumed land together.
+        // P1-7: pending_actions lives in action.db (audit_writer ATTACHes it as the `action` schema).
         tx.execute(
             "UPDATE action.pending_actions SET consumed = 1 WHERE action_id = ?1",
             params![action_id],

@@ -85,12 +85,15 @@ pub fn query_status() -> Vec<TccStatus> {
             authorized: fg_tcc_bridge::camera(),
             source: source.clone(),
         },
-        // P1-6 (audit §P1-6): AppleEvents 真实查询。
-        // Swift bridge fg_tcc_apple_events_status 恒返 0 —— guard 非 AppleEvents 自动化发起方,
-        // 无特定目标 app, 无法给单一布尔值 (TCC.db kTCCServiceAppleEvents 按 sender/target 粒度)。
-        // live 路径标 source "apple-events:unknown" (非 live), authorized=false —— 消费方见此知
-        // 该项未真实查询, 不误信为确定 false。真实 per-target 查询由自动化发起方 (agent-studio) 自报。
-        // stub 路径全桥为 stub, source 仍 tccutil:stub。
+        // P1-6 (audit §P1-6): AppleEvents honest query.
+        // The Swift bridge fg_tcc_apple_events_status always returns 0 — guard is not the
+        // AppleEvents automation initiator, has no specific target app, and cannot yield a single
+        // boolean (TCC.db kTCCServiceAppleEvents is scoped per sender/target).
+        // The live path tags source "apple-events:unknown" (not live), authorized=false —
+        // consumers seeing this know the item was not truly queried and do not mistake it for a
+        // definite false. Real per-target queries are self-reported by the automation initiator
+        // (agent-studio).
+        // On the stub path the whole bridge is a stub; source stays tccutil:stub.
         TccStatus {
             service: TccService::AppleEvents,
             authorized: fg_tcc_bridge::apple_events(),

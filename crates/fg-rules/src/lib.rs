@@ -7,8 +7,10 @@ use fg_core::{CheckStage, ContentType, GuardVerdict, RiskLevel, RuleScope, Safet
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
-// M3: 锁中毒 recover 非进程 panic。守护进程须存活, 内存态次新可接受 (rules 持久化 SQLite,
-// 原子性由 DB 保证)。EMERG 日志供运维感知。RwLock read/write lock result 通用 into_inner()。
+// M3: lock-poisoning recovery must not panic the process. The daemon must stay
+// alive; slightly stale in-memory state is acceptable (rules are persisted to
+// SQLite, atomicity guaranteed by the DB). EMERG log lets ops notice. RwLock
+// read/write lock results are uniformly handled via into_inner().
 macro_rules! recover_lock {
     ($lock:expr, $what:expr) => {
         match $lock {
@@ -158,15 +160,17 @@ impl RuleEngine {
         hits
     }
 
-    // P0-2 (audit §1.7/§1.8): 按 content_type 分派扫描阶段。
-    //   Shell  → regex + tokenizer (AST)。shell_words 解析 argv。
-    //   Code   → regex + semantic (tree-sitter)。跳 tokenizer (代码非 shell 语法,
-    //            tokenizer 会把 `import os` 当非白名单 binary 假阳)。
-    //   Json/Yaml/Text → 仅 regex。跳 tokenizer + semantic (结构化/自由文本非可执行,
-    //            tokenizer 假阳 + semantic 无对应 grammar)。
+    // P0-2 (audit §1.7/§1.8): dispatch scan stages by content_type.
+    //   Shell  -> regex + tokenizer (AST). shell_words parses argv.
+    //   Code   -> regex + semantic (tree-sitter). Skip tokenizer (code is not
+    //            shell syntax; the tokenizer would false-positive on `import os`
+    //            as a non-whitelisted binary).
+    //   Json/Yaml/Text -> regex only. Skip tokenizer + semantic (structured or
+    //            free text is not executable: tokenizer false-positives and
+    //            semantic has no matching grammar).
     pub fn evaluate_full_typed(&self, content: &str, content_type: ContentType) -> Vec<RuleHit> {
         let mut hits = self.evaluate(content);
-        // Stage 2 tokenizer: 仅 Shell 内容。
+        // Stage 2 tokenizer: Shell content only.
         if content_type.run_tokenizer() {
             for tok in tokenizer::tokenize_check(content) {
                 let risk = if tok.sensitive_target {
@@ -196,7 +200,7 @@ impl RuleEngine {
                 });
             }
         }
-        // Stage 3 语义分析: 仅 Code 内容 (feature=semantic 默认开)。
+        // Stage 3 semantic analysis: Code content only (feature=semantic on by default).
         #[cfg(feature = "semantic")]
         if content_type.run_semantic() {
             let sem_hits = semantic::semantic_check(content);
@@ -226,16 +230,22 @@ impl RuleEngine {
         hits
     }
 
-    // 向后兼容: 不传 content_type 当 Shell (现有 caller/单测默认 shell 路径)。
-    // 生产路径 (AuditEngine.evaluate) 调 evaluate_full_typed 传 IPC content_type。
+    // Backward compatibility: missing content_type is treated as Shell
+    // (existing callers/unit tests default to the shell path). The production
+    // path (AuditEngine.evaluate) calls evaluate_full_typed with the IPC
+    // content_type.
     pub fn evaluate_full(&self, content: &str) -> Vec<RuleHit> {
         self.evaluate_full_typed(content, ContentType::Shell)
     }
 
-    // L10: category 从实际 hit 派生 (非独立重复解析 + 固定 shell_exec fallback)。
-    // 原实现独立 split_chain+shell_words 重解析, 与 tokenize_check 分叉 (split Err 即 continue
-    // 跳段, tokenize_check 则 Block), 且 fallback "shell_exec" 对多数命令无意义 (cat/ls)。
-    // 新实现: 从 hits 取 category —— scope 命中决定 category, 无 hit → "clean"。
+    // L10: derive the category from actual hits (no independent re-parsing with
+    // a fixed shell_exec fallback). The old implementation re-parsed
+    // independently with split_chain+shell_words and diverged from
+    // tokenize_check (split Err -> continue skipping the segment, while
+    // tokenize_check Blocks), and the "shell_exec" fallback was meaningless for
+    // most commands (cat/ls).
+    // New implementation: take the category from hits — the top hit's scope
+    // decides the category; no hit -> "clean".
     pub fn infer_category_from_hits(hits: &[RuleHit]) -> String {
         if hits.is_empty() {
             return "clean".to_string();
@@ -270,8 +280,10 @@ impl RuleEngine {
         }
     }
 
-    // 保留 content-based 推断供 evaluate "clean" 路径补全 category (无 hit 但有敏感内容)。
-    // 仅在无 hit 时作 hint, 不再当权威 (权威由 infer_category_from_hits 从 hit 派生)。
+    // Keep content-based inference to fill in the category for the evaluate
+    // "clean" path (no hit but sensitive content present). Used only as a hint
+    // when there are no hits; no longer authoritative (the authoritative
+    // category is derived from hits by infer_category_from_hits).
     pub fn infer_category(content: &str) -> String {
         let trimmed = content.trim();
         if trimmed.is_empty() {
@@ -345,11 +357,14 @@ pub fn default_ruleset() -> RuleSet {
     }
 }
 
-// L11: 显式优先级 (非 max_by_key as u8 任意平局)。
-// 排序键: (动作严重度 desc, 风险等级 desc, stage rank desc)。确定性 head:
+// L11: explicit priority (not max_by_key with arbitrary as u8 tie-breaking).
+// Sort key: (action severity desc, risk level desc, stage rank desc). A
+// deterministic head looks like:
 //   Block L4 Regex > Block L4 Semantic > Block L4 Ast > ... > Allow
-// regex L4 rm-rf 与 semantic L4 os.system 平局时, stage rank 决定 (Regex 先报可信度高)。
-// 消除"末 hit 胜"导致的 verdict stage/reason 依赖 push 顺序的脆性。
+// When a regex L4 rm-rf ties with a semantic L4 os.system, the stage rank
+// decides (Regex reports first, higher confidence).
+// Removes the brittleness where the "last hit wins" made the verdict
+// stage/reason depend on push order.
 fn stage_rank(s: CheckStage) -> u8 {
     match s {
         CheckStage::Regex => 3,

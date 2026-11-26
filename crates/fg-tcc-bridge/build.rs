@@ -41,8 +41,8 @@ fn main() {
             )
             .expect("write stub");
             let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-            // M7: 勿吞 cc 编译失败 (原 let _ = status())。stub .o 缺失 → 后续 ar 打包空 → 链接期
-            // 报错不清晰 (符号未定义而非 build.rs 阶段)。编译失败即显式 build fail。
+            // M7: never swallow cc compile failures (originally let _ = status()). A missing stub .o → the later ar packs nothing → unclear
+            // link-stage errors (undefined symbols instead of failing at the build.rs stage). A compile failure is an explicit build failure.
             let cc_status = Command::new(&cc)
                 .args(["-c", "-o", obj.to_str().unwrap(), stub.to_str().unwrap()])
                 .status()
@@ -54,7 +54,7 @@ fn main() {
     }
 
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-    // M7: ar 打包失败显式 fail, 非静默吞 (静态库损坏 → 链接报错不清晰)。
+    // M7: fail explicitly on ar archive failure, never silently swallow it (a broken static lib → unclear link errors).
     let ar_status = Command::new(&ar)
         .args(["rcs", lib.to_str().unwrap(), obj.to_str().unwrap()])
         .status()

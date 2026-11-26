@@ -1,22 +1,27 @@
-// P1-5 (audit §3.1): Authorizer trait 单测 —— 鉴权纯逻辑独立于 I/O。
-// 旧码 peercred→身份 (handle_conn) 与 secret 校验 (dispatch_arc) 散在套接字路径,
-// 只能起真实 socket 集成测才覆盖。抽 trait 后单测直接喂 uid/secret 断言决策, 无需套接字/DB。
+// P1-5 (audit §3.1): Authorizer trait unit tests — pure authorization logic
+// independent of I/O.
+// The old code scattered peercred->identity (handle_conn) and secret validation
+// (dispatch_arc) across the socket path, so coverage required real-socket
+// integration tests. After extracting the trait, unit tests feed uid/secret
+// directly and assert decisions, no socket/DB needed.
 //
-// 覆盖:
-//   resolve_identity — admin(uid 0, 空租户集 + is_admin), 非admin(查 FakeLookup 租户),
-//                      peercred 拒绝(auth_ok=false)。
-//   authorize_method — ping 对任意对端开放 (即使 auth_ok=false 也 Allow),
-//                      非 ping + auth_ok=false → DenyPeercred,
-//                      非 ping + auth_ok + secret 未设(dev) → Allow,
-//                      非 ping + auth_ok + secret 错 → DenySecret,
-//                      非 ping + auth_ok + secret 对 → Allow。
-// 用 new_with_lookup (test-helpers) 注入 FakeLookup, 无 AuditStore/Keychain/env 依赖。
+// Coverage:
+//   resolve_identity — admin (uid 0, empty tenant set + is_admin),
+//                      non-admin (tenants via FakeLookup),
+//                      peercred denial (auth_ok=false).
+//   authorize_method — ping is open to any peer (Allow even when auth_ok=false),
+//                      non-ping + auth_ok=false -> DenyPeercred,
+//                      non-ping + auth_ok + secret unset (dev) -> Allow,
+//                      non-ping + auth_ok + wrong secret -> DenySecret,
+//                      non-ping + auth_ok + correct secret -> Allow.
+// Uses new_with_lookup (test-helpers) to inject FakeLookup; no
+// AuditStore/Keychain/env dependency.
 
 use std::sync::Arc;
 
 use fg_ipc::{AuthDecision, Authorizer, CallerIdentity, PeerAuthorizer, PeerUid, TenantLookup};
 
-// 假租户表: uid 1000 → ["t1","t2"], 其余空。
+// Fake tenant table: uid 1000 -> ["t1","t2"], empty otherwise.
 struct FakeLookup;
 impl TenantLookup for FakeLookup {
     fn tenants_for_uid(&self, uid: u32) -> Vec<String> {
@@ -37,13 +42,14 @@ fn auth_with(secret: Option<&str>) -> PeerAuthorizer {
 #[test]
 fn resolve_identity_admin_root_empty_tenants() {
     let auth = auth_with(None);
-    // 对端 uid 0 = root, allow_root → auth_ok, is_admin, 空 tenants (root 全权不查表)。
+    // Peer uid 0 = root; allow_root -> auth_ok, is_admin, empty tenants (root is
+    // fully privileged, no table lookup).
     let id = auth.resolve_identity(PeerUid::Resolved(0), 501);
     assert!(id.auth_ok);
     assert!(id.is_admin);
     assert!(
         id.tenants.is_empty(),
-        "admin tenants 须空 (root 全权, 不查表)"
+        "admin tenants must be empty (root is fully privileged, no table lookup)"
     );
     assert_eq!(id.uid, 0);
 }
@@ -51,7 +57,7 @@ fn resolve_identity_admin_root_empty_tenants() {
 #[test]
 fn resolve_identity_same_uid_non_admin_loads_tenants() {
     let auth = auth_with(None);
-    // 对端 uid == our_uid → peer_allowed → auth_ok, 非 admin → 查 FakeLookup。
+    // Peer uid == our_uid -> peer_allowed -> auth_ok; non-admin -> FakeLookup queried.
     let id = auth.resolve_identity(PeerUid::Resolved(1000), 1000);
     assert!(id.auth_ok);
     assert!(!id.is_admin);
@@ -62,48 +68,56 @@ fn resolve_identity_same_uid_non_admin_loads_tenants() {
 #[test]
 fn resolve_identity_peercred_denied_auth_ok_false() {
     let auth = auth_with(None);
-    // 对端 uid 999 != our 501 且非 root → peer_allowed false → auth_ok=false。
+    // Peer uid 999 != our 501 and not root -> peer_allowed false -> auth_ok=false.
     let id = auth.resolve_identity(PeerUid::Resolved(999), 501);
-    assert!(!id.auth_ok, "非同 uid 非 root 须 peercred 拒绝");
+    assert!(
+        !id.auth_ok,
+        "a non-matching non-root uid must be denied by peercred"
+    );
     assert!(!id.is_admin);
     assert!(id.tenants.is_empty());
     assert_eq!(id.uid, 999);
 }
 
-// P2-3 (audit §3.4): 系统调用失败 (SyscallFail) vs 跨 UID 拒绝 (Resolved other) 同 fail-closed 拒,
-// 但日志须分明 (区分「运维须诊断」与「跨 UID 攻击/误连」)。此测验证决策一致性 + uid 兜底。
+// P2-3 (audit §3.4): a syscall failure (SyscallFail) vs a cross-UID denial
+// (Resolved other) are both fail-closed denials, but the logs must clearly
+// distinguish them ("operator must diagnose" vs "cross-UID attack/misconnection").
+// This test verifies decision consistency + the uid fallback.
 #[test]
 fn p23_resolve_identity_syscall_fail_distinct_from_cross_uid() {
     let auth = auth_with(None);
-    // SyscallFail: 无凭证 → fail-closed 拒; resolved() = None → uid 兜底 u32::MAX。
+    // SyscallFail: no credentials -> fail-closed denial; resolved() = None -> uid
+    // falls back to u32::MAX.
     let id_fail = auth.resolve_identity(PeerUid::SyscallFail, 501);
     assert!(
         !id_fail.auth_ok,
-        "SyscallFail 须 auth_ok=false (fail-closed)"
+        "SyscallFail must have auth_ok=false (fail-closed)"
     );
     assert_eq!(
         id_fail.uid,
         u32::MAX,
-        "SyscallFail 无 resolved uid → 兜底 u32::MAX"
+        "SyscallFail has no resolved uid -> falls back to u32::MAX"
     );
     assert!(id_fail.tenants.is_empty());
 
-    // Unsupported 同理 fail-closed。
+    // Unsupported is likewise fail-closed.
     let id_unsup = auth.resolve_identity(PeerUid::Unsupported, 501);
-    assert!(!id_unsup.auth_ok, "Unsupported 须 auth_ok=false");
+    assert!(!id_unsup.auth_ok, "Unsupported must have auth_ok=false");
 
-    // 跨 UID (Resolved other) 同拒但 uid = 真实对端 uid (999, 非 u32::MAX) —— 与 SyscallFail 区分。
+    // Cross-UID (Resolved other) is denied the same way but keeps uid = the real
+    // peer uid (999, not u32::MAX) — distinguishing it from SyscallFail.
     let id_cross = auth.resolve_identity(PeerUid::Resolved(999), 501);
     assert!(!id_cross.auth_ok);
     assert_eq!(
         id_cross.uid, 999,
-        "跨 UID 拒绝保留真实对端 uid (非 u32::MAX 兜底)"
+        "cross-UID denial preserves the real peer uid (not the u32::MAX fallback)"
     );
 
-    // 两类同拒 (auth_ok 一致), 但 uid 字段区分: SyscallFail=u32::MAX, cross-UID=999。
+    // Both are denied (auth_ok agrees), but the uid field distinguishes them:
+    // SyscallFail=u32::MAX, cross-UID=999.
     assert_ne!(
         id_fail.uid, id_cross.uid,
-        "SyscallFail 与跨 UID 须 uid 可区分 (P2-3 §3.4)"
+        "SyscallFail and cross-UID must be distinguishable by uid (P2-3 §3.4)"
     );
 }
 
@@ -112,7 +126,8 @@ fn p23_resolve_identity_syscall_fail_distinct_from_cross_uid() {
 #[test]
 fn authorize_ping_open_to_all_even_denied_peer() {
     let auth = auth_with(None);
-    // peercred 拒绝身份, 但 ping 是健康探针对任意对端开放 → 仍 Allow。
+    // The identity is denied by peercred, but ping is a health probe open to any
+    // peer -> still Allow.
     let id = CallerIdentity {
         uid: 999,
         auth_ok: false,
@@ -120,7 +135,11 @@ fn authorize_ping_open_to_all_even_denied_peer() {
         tenants: Vec::new(),
     };
     let dec = auth.authorize_method(&id, "guard.ping", None);
-    assert_eq!(dec, AuthDecision::Allow, "ping 须对拒绝的对端也放行");
+    assert_eq!(
+        dec,
+        AuthDecision::Allow,
+        "ping must be allowed even for a denied peer"
+    );
 }
 
 #[test]
@@ -136,7 +155,7 @@ fn authorize_non_ping_denied_peer_deny_peercred() {
     assert_eq!(
         dec,
         AuthDecision::DenyPeercred,
-        "非 ping + auth_ok=false 须 DenyPeercred"
+        "non-ping + auth_ok=false must be DenyPeercred"
     );
 }
 
@@ -149,9 +168,13 @@ fn authorize_non_ping_dev_no_secret_allow() {
         is_admin: false,
         tenants: vec!["t1".to_string()],
     };
-    // secret 未设 (dev) → 跳过 secret 校验 → Allow。
+    // Secret unset (dev) -> skip secret validation -> Allow.
     let dec = auth.authorize_method(&id, "guard.evaluate", None);
-    assert_eq!(dec, AuthDecision::Allow, "dev 模式无 secret 须放行");
+    assert_eq!(
+        dec,
+        AuthDecision::Allow,
+        "dev mode without a secret must allow"
+    );
 }
 
 #[test]
@@ -167,7 +190,7 @@ fn authorize_non_ping_secret_mismatch_deny_secret() {
     assert_eq!(
         dec,
         AuthDecision::DenySecret,
-        "secret 错须 DenySecret (非 DenyPeercred)"
+        "a wrong secret must be DenySecret (not DenyPeercred)"
     );
 }
 
@@ -193,41 +216,41 @@ fn authorize_non_ping_secret_missing_when_required_deny_secret() {
         is_admin: false,
         tenants: vec!["t1".to_string()],
     };
-    // 设了 secret 但请求没带 → DenySecret (非 dev 跳过)。
+    // Secret set but the request carries none -> DenySecret (no dev skip).
     let dec = auth.authorize_method(&id, "guard.evaluate", None);
     assert_eq!(
         dec,
         AuthDecision::DenySecret,
-        "secret 已设但请求未带须 DenySecret"
+        "secret set but missing from the request must be DenySecret"
     );
 }
 
-// --- deny_resp 映射 wire 错误码 ---
+// --- deny_resp maps to wire error codes ---
 
 #[test]
 fn deny_resp_emits_32001_error_bytes() {
     let id = serde_json::Value::from(42);
     let peer = AuthDecision::DenyPeercred
         .deny_resp(&id)
-        .expect("Deny 须产响应");
+        .expect("Deny must produce a response");
     let peer_str = String::from_utf8_lossy(&peer);
     assert!(
         peer_str.contains(r#""code":-32001"#),
-        "DenyPeercred 须 -32001, got: {peer_str}"
+        "DenyPeercred must be -32001, got: {peer_str}"
     );
     assert!(peer_str.contains(r#""id":42"#));
 
     let secret = AuthDecision::DenySecret
         .deny_resp(&serde_json::Value::from(7))
-        .expect("Deny 须产响应");
+        .expect("Deny must produce a response");
     let secret_str = String::from_utf8_lossy(&secret);
     assert!(
         secret_str.contains(r#""code":-32001"#),
-        "DenySecret 须 -32001, got: {secret_str}"
+        "DenySecret must be -32001, got: {secret_str}"
     );
 
     assert!(
         AuthDecision::Allow.deny_resp(&id).is_none(),
-        "Allow 须无响应"
+        "Allow must produce no response"
     );
 }

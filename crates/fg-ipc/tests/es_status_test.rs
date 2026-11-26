@@ -1,5 +1,7 @@
-// P0-7 (audit §2.8): ES 监控接入验证。无 entitlement → IPC 必须如实回 degraded
-// (非假装 Active), 让运维知 ES 未生效、退回 TCC (PRD Q#3)。验证 dead-code 不复存在。
+// P0-7 (audit §2.8): ES monitor integration verification. Without an entitlement
+// the IPC must honestly report degraded (not pretend Active), so operators know
+// ES is not in effect and fall back to TCC (PRD Q#3). Verifies the dead-code path
+// no longer exists.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -84,21 +86,21 @@ async fn es_status_reports_honest_degraded() {
     wait_for_sock(&sock).await;
 
     let status = call(&sock, "guard.es.status");
-    // 无 entitlement → degraded (非 Active 假装可用)。
+    // No entitlement -> degraded (not pretending to be Active).
     assert_eq!(
         status["state"], "degraded",
-        "P0-7: ES 无 entitlement 须诚实报 degraded, 非假装 Active"
+        "P0-7: ES without an entitlement must honestly report degraded, not pretend Active"
     );
-    assert_eq!(status["entitlement"], false, "entitlement 须 false");
+    assert_eq!(status["entitlement"], false, "entitlement must be false");
     assert!(
         status["source"].as_str().unwrap().contains("stub"),
-        "source 须标 stub (来源可追溯): {}",
+        "source must be tagged stub (traceable origin): {}",
         status["source"]
     );
     assert_eq!(
         status["subscribed"].as_array().unwrap().len(),
         0,
-        "degraded 模式无订阅事件"
+        "degraded mode has no subscribed events"
     );
 
     handle.abort();
@@ -115,7 +117,7 @@ async fn es_events_empty_under_degraded() {
     let events = res["events"].as_array().unwrap();
     assert!(
         events.is_empty(),
-        "P0-7: degraded 模式事件流须空, 不伪造事件"
+        "P0-7: degraded mode event stream must be empty, no fabricated events"
     );
 
     handle.abort();

@@ -1,11 +1,12 @@
-// P1-3 (audit §2.5): pending action put fail-closed。
-// L3 判定 (requires_approval) 需 confirm 流, actions().put() 失败 → action_id 不可交付
-// (caller confirm 查无此行 → 永久死胡同)。put 失败拒评估, 不返带 action_id 的 verdict。
-// 与 H7 审计写 fail-closed 耐久语义一致 (两套写同一次 evaluate)。
+// P1-3 (audit §2.5): pending action put fail-closed.
+// An L3 verdict (requires_approval) needs the confirm flow; if actions().put() fails the action_id cannot be
+// delivered (the caller's confirm finds no row → permanent dead end). A put failure refuses the evaluation
+// instead of returning a verdict with an action_id.
+// Durability semantics consistent with the H7 audit-write fail-closed (both writes happen in the same evaluate).
 //
-// 故障注入: 删 pending_actions 表 → put 的 INSERT 报 SQLite 错。
-// 需要 FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore 加载密钥)。
-// test-helpers feature (透传 fg-store)。
+// Fault injection: drop the pending_actions table → the put's INSERT raises a SQLite error.
+// Requires FUSION_GUARD_TOKEN_KEY (AuditStore::open → TokenStore loads the key).
+// test-helpers feature (forwarded to fg-store).
 
 use std::path::PathBuf;
 
@@ -39,15 +40,15 @@ fn cleanup(dir: &std::path::Path) {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// L3 判定 + put 失败 → evaluate 返 Engine err, 不下发 action_id。
-// L3 触发: shell 内容含 $(...) 进程替换 → tokenizer Block L3 (requires_approval)。
+// L3 verdict + put failure → evaluate returns an Engine err, no action_id delivered.
+// L3 trigger: shell content with $(...) process substitution → tokenizer Block L3 (requires_approval).
 #[tokio::test]
 async fn l3_put_failure_refuses_evaluate() {
     let (db, dir) = temp_env();
     let store = Arc::new(AuditStore::open(&db).unwrap());
     let engine = AuditEngine::new(store.clone()).unwrap();
 
-    // baseline: 正常 L3 判定返带 action_id 的 verdict (put 成功)。
+    // baseline: a normal L3 verdict returns a verdict with action_id (put succeeds).
     let ok = engine
         .evaluate("echo $(whoami)", 0, "default", ContentType::Shell, None)
         .unwrap();
@@ -57,14 +58,14 @@ async fn l3_put_failure_refuses_evaluate() {
     );
     assert!(ok.action_id.is_some(), "baseline returns action_id");
 
-    // 故障注入: 删 pending_actions 表 → 后续 put INSERT 报错。
+    // fault injection: drop the pending_actions table → subsequent put INSERT errors.
     {
         let w = store.audit_writer_handle();
         let w = w.lock().unwrap();
         w.execute_batch("DROP TABLE pending_actions").unwrap();
     }
 
-    // put 失败 → evaluate fail-closed, 返 Engine err (非带 action_id verdict)。
+    // put failure → evaluate fail-closed, returns Engine err (not a verdict with action_id).
     let res = engine.evaluate("echo $(id)", 0, "default", ContentType::Shell, None);
     assert!(
         matches!(res, Err(GuardError::Engine(_))),
@@ -82,8 +83,8 @@ async fn l3_put_failure_refuses_evaluate() {
     cleanup(&dir);
 }
 
-// L4 Block + put 失败 → 同样 fail-closed (耐久语义一致, 非 L3 专属)。
-// L4 触发: rm -rf 敏感路径 → tokenizer Block L4。
+// L4 Block + put failure → also fail-closed (consistent durability semantics, not L3-specific).
+// L4 trigger: rm -rf on a sensitive path → tokenizer Block L4.
 #[tokio::test]
 async fn l4_put_failure_refuses_evaluate() {
     let (db, dir) = temp_env();
@@ -105,7 +106,7 @@ async fn l4_put_failure_refuses_evaluate() {
     let res = engine.evaluate("rm -rf /etc", 0, "default", ContentType::Shell, None);
     assert!(
         matches!(res, Err(GuardError::Engine(_))),
-        "L4 put failure must fail-closed (P1-3, H7 耐久一致), got {:?}",
+        "L4 put failure must fail-closed (P1-3, H7 durable consistency), got {:?}",
         res
     );
 

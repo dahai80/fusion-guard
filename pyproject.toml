@@ -21,6 +21,14 @@ build-backend = "maturin"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["python", "tests", "ci"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
 [tool.maturin]
 manifest-path = "crates/fg-pyo3/Cargo.toml"
 python-source = "python"

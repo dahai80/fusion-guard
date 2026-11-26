@@ -12,28 +12,31 @@ const KEYCHAIN_ACCOUNT: &str = "token-key";
 const TOKEN_TTL_SECS: i64 = 300;
 const KEY_LEN: usize = 32;
 
-// P1-2 (audit §1.6): HKDF 域分离 + 版本化派生 key。master key (Keychain/env) 为 PRK,
-// 经不同 info label 派生独立 chain-HMAC key 与 token-AES-GCM key —— 单点泄露不双失守。
-// version 嵌入 info label: 轮换 = bump version (新派生 key); 旧 key_version 行用旧派生 key 验/解。
-// 派生确定 (master 不变 → 同 version 永同 key), 故 DB 只存 key_version INT, 不存密钥材料。
+// P1-2 (audit §1.6): HKDF domain separation + versioned key derivation. The master key (Keychain/env)
+// is the PRK; different info labels derive an independent chain-HMAC key and token-AES-GCM key —
+// a single-point leak does not compromise both.
+// version is embedded in the info label: rotation = bump version (new derived key); rows with an old
+// key_version verify/decrypt with the old derived key.
+// Derivation is deterministic (master unchanged → same version always yields the same key), so the DB
+// stores only key_version INT, never key material.
 const CHAIN_INFO_PREFIX: &[u8] = b"fusion-guard/audit-chain-hmac/v";
 const TOKEN_INFO_PREFIX: &[u8] = b"fusion-guard/token-aes-gcm/v";
 
-// H-E (product-audit §5 item d): 每版本验签锚点。mint/rotate 时存 key_versions.key_anchor
-// = HMAC(canonical_msg, derive_chain_key(master, version))。verify 遇 HMAC 不匹配行时,
-// 查该行 key_version 的锚点, 用当前 master 重算锚点比较:
-//   锚点匹配 → 当前 master 能派生该 version → 真篡改 (tampered=true)
-//   锚点不匹配 → 当前 master 无法派生该 version → 密钥丢失 (key_version_unknown_rows++)
-//   锚点 NULL (旧迁移行) → fail-closed 当篡改 (攻击者删锚点无法隐藏)
-// canonical_msg 固定, 仅作版本可派生性探针, 非密钥材料。
+// H-E (product-audit §5 item d): per-version verification anchor. On mint/rotate, key_versions.key_anchor
+// stores HMAC(canonical_msg, derive_chain_key(master, version)). When verify hits a row with an HMAC
+// mismatch, it looks up the anchor for that row's key_version and recomputes it with the current master:
+//   anchor matches → current master can derive that version → genuine tampering (tampered=true)
+//   anchor mismatch → current master cannot derive that version → key loss (key_version_unknown_rows++)
+//   anchor NULL (legacy migrated row) → fail-closed as tampering (an attacker cannot hide by deleting anchors)
+// canonical_msg is fixed and serves only as a version derivability probe, not key material.
 const KEY_ANCHOR_MSG: &[u8] = b"fusion-guard/key-anchor/v1";
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct TokenStore {
     db: Mutex<Connection>,
     key: Zeroizing<[u8; KEY_LEN]>,
-    // P1-2: 当前 key 版本 (新写入用此)。open 时从 key_versions 表读最大 version, 无则 1。
-    // AtomicI64: AuditStore 持 Arc<TokenStore>, rotate_key 经 &self bump (无 &mut)。
+    // P1-2: current key version (used for new writes). At open, read the max version from key_versions, default 1.
+    // AtomicI64: AuditStore holds Arc<TokenStore>, so rotate_key bumps via &self (no &mut).
     current_version: std::sync::atomic::AtomicI64,
 }
 
@@ -59,18 +62,22 @@ pub enum TokenError {
 
 impl TokenStore {
     pub fn open(conn: Connection) -> Result<Self, TokenError> {
-        // H-E (product-audit §5): allow_mint = token.db 是否全新 (无 token 行 + key_versions
-        // 仅种子 v1)。非全新 (已有加密 token) 而 Keychain 主密钥丢失 → 拒启动明确报错,
-        // 非静默生成新主密钥致全量历史 token 不可恢复 + 历史校验失效。
+        // H-E (product-audit §5): allow_mint = whether token.db is virgin (no token rows + key_versions
+        // only has the seed v1). Non-virgin (encrypted tokens exist) with a lost Keychain master key →
+        // refuse to start with a clear error, instead of silently minting a new master key that would make
+        // all historical tokens unrecoverable and invalidate historical verification.
         let allow_mint = token_db_is_virgin(&conn);
         Self::open_checked(conn, allow_mint)
     }
 
-    // H-E: AuditStore.open 调此 —— allow_mint 由审计行存在性传入 (audit.db 有行 = 历史已用主密钥,
-    // 丢失不可静默重生成)。再叠加 token.db 自身存在性: 两库任一非全新 → allow_mint=false。
-    // token.db 全新但 audit.db 有行 (写入审计但尚无可逆脱敏 token) 也须拒绝; 反之亦然。
+    // H-E: called by AuditStore.open — allow_mint is passed in based on audit row existence (rows in
+    // audit.db = the master key was used historically; a lost key must not be silently regenerated).
+    // Then combined with token.db's own state: either DB non-virgin → allow_mint=false.
+    // token.db virgin but audit.db has rows (audits written but no reversible redact tokens yet) must also
+    // refuse; and vice versa.
     pub(crate) fn open_checked(conn: Connection, allow_mint: bool) -> Result<Self, TokenError> {
-        // H-E: token.db 自身非全新 → 强制 allow_mint=false (审计侧传入的 true 仅在 token 侧也全新时生效)。
+        // H-E: token.db itself non-virgin → force allow_mint=false (a true passed from the audit side only
+        // applies when the token side is also virgin).
         let allow_mint = allow_mint && token_db_is_virgin(&conn);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tokens (
@@ -91,22 +98,26 @@ impl TokenStore {
             INSERT OR IGNORE INTO key_versions (version, created_ts) VALUES (1, 0);
             ",
         )?;
-        // H-E (item d): 旧库 key_versions 无 key_anchor 列 → 幂等补列 (NULL = 旧迁移行, verify fail-closed 当篡改)。
+        // H-E (item d): legacy DB key_versions lacks the key_anchor column → idempotent column add
+        // (NULL = legacy migrated row, verify fail-closed as tampering).
         let _ = conn.execute("ALTER TABLE key_versions ADD COLUMN key_anchor TEXT", []);
-        // C2 旧库迁移: 加 tenant_id 列 (幂等)
+        // C2 legacy DB migration: add tenant_id column (idempotent)
         let _ = conn.execute(
             "ALTER TABLE tokens ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
             [],
         );
-        // P1-2 (audit §1.6): token 加密记 key_version, reveal 用对应版本派生 key 解密
-        // (旧 token 用旧 key, 新 token 用新 key)。默认 1 = 历史库无此列时兜底。
+        // P1-2 (audit §1.6): token encryption records key_version; reveal decrypts with the key derived for
+        // that version (old tokens use the old key, new tokens the new key). Default 1 = fallback for legacy
+        // DBs without this column.
         let _ = conn.execute(
             "ALTER TABLE tokens ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1",
             [],
         );
         let key = load_or_create_key(allow_mint)?;
-        // H-E (item d): 为所有 NULL 锚点的版本回填 (仅缺锚点的旧行; 已有锚点永覆写 —— 锚点不可变,
-        // 派生确定, 重算必同值, 故回填 = 补缺, 非改写)。新库种子 v1 行也在此首次写入锚点。
+        // H-E (item d): backfill anchors for all versions with NULL anchors (only legacy rows missing an
+        // anchor; existing anchors are never overwritten — anchors are immutable, derivation is deterministic,
+        // recomputation yields the same value, so backfill fills gaps rather than rewriting). The new-DB seed
+        // v1 row also gets its anchor written here for the first time.
         backfill_key_anchors(&conn, &key)?;
         let current_version = max_key_version(&conn);
         Ok(Self {
@@ -120,14 +131,14 @@ impl TokenStore {
         self.put_tenant(token_id, plaintext, "default")
     }
 
-    // C2 跨租户外泄链: token 落库时绑定租户, reveal 校验归属。
+    // C2 cross-tenant exfiltration chain: tokens are tenant-bound at put; reveal verifies ownership.
     pub fn put_tenant(
         &self,
         token_id: &str,
         plaintext: &str,
         tenant_id: &str,
     ) -> Result<(), TokenError> {
-        // P1-2: 用当前版本派生的 token key 加密, 落库记 key_version。
+        // P1-2: encrypt with the token key derived from the current version; record key_version on the row.
         let cv = self
             .current_version
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -158,7 +169,8 @@ impl TokenStore {
         self.get_tenant(token_id, "default")
     }
 
-    // C2: reveal 校验 token 归属租户。跨租户 → NotFound (拒绝解密, H6 fallback 由调用方处理)。
+    // C2: reveal verifies the token belongs to the calling tenant. Cross-tenant → NotFound (refuse to
+    // decrypt; H6 fallback is handled by the caller).
     pub fn get_tenant(&self, token_id: &str, tenant_id: &str) -> Result<String, TokenError> {
         let g = recover_lock!(self.db.lock(), "token db");
         let row = g
@@ -196,7 +208,7 @@ impl TokenStore {
             );
             return Err(TokenError::Expired(token_id.to_string()));
         }
-        // P1-2: 用该 token 落库时的 key_version 派生 key 解密 (旧 token 用旧版本 key)。
+        // P1-2: decrypt with the key derived from the key_version recorded at put (old tokens use old-version keys).
         let dkey = derive_token_key(&self.key, kv);
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dkey[..]));
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -230,27 +242,29 @@ impl TokenStore {
         Ok(n)
     }
 
-    // P1-2: master key 原始引用 (Keychain/env 32B), 供 AuditStore 持有 + 按行版本派生。
-    // 不跨进程暴露 — 仅 fg-store 同 crate。
+    // P1-2: raw master key reference (Keychain/env 32B), held by AuditStore for per-row version derivation.
+    // Never exposed across processes — fg-store same-crate only.
     pub(crate) fn master_key(&self) -> &[u8; KEY_LEN] {
         &self.key
     }
 
-    // P1-2: 当前 key 版本 (新审计行/新 token 用此)。AuditStore 写入时记此 version 到行。
+    // P1-2: current key version (used for new audit rows / new tokens). AuditStore records this version on each row it writes.
     pub(crate) fn current_key_version(&self) -> i64 {
         self.current_version
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    // P1-2: 轮换 key —— bump current_version + 落 key_versions 表 (审计追溯轮换时刻)。
-    // 新写入用新派生 key; 旧行保留旧 version, 验/解用旧派生 key (派生确定, master 不变)。
-    // 返回新 version。
+    // P1-2: rotate the key — bump current_version + persist to key_versions (auditable rotation timestamp).
+    // New writes use the newly derived key; old rows keep their old version and verify/decrypt with the old
+    // derived key (derivation deterministic, master unchanged).
+    // Returns the new version.
     pub fn rotate_key(&self) -> Result<i64, TokenError> {
         let new_version = self
             .current_version
             .load(std::sync::atomic::Ordering::Relaxed)
             + 1;
-        // H-E (item d): 新版本落锚点 (当前 master 派生), 供 verify 区分后续真篡改 vs 密钥丢失。
+        // H-E (item d): write the anchor for the new version (derived from the current master) so verify can
+        // later distinguish genuine tampering from key loss.
         let anchor = key_anchor_for_version(&self.key, new_version);
         let g = recover_lock!(self.db.lock(), "token db");
         g.execute(
@@ -267,9 +281,10 @@ impl TokenStore {
         Ok(new_version)
     }
 
-    // H-E (item d): 查指定版本锚点。verify 路径用 —— 行 HMAC 不匹配时, 取该行 key_version
-    // 的锚点与当前 master 重算锚点比较, 区分真篡改 (锚点匹配) vs 密钥丢失 (锚点不匹配)。
-    // 返回 None = 旧迁移行无锚点 (verify fail-closed 当篡改)。
+    // H-E (item d): look up the anchor for a given version. Used by the verify path — when a row's HMAC
+    // mismatches, compare that row's key_version anchor (recomputed with the current master) to distinguish
+    // genuine tampering (anchor matches) from key loss (anchor mismatches).
+    // Returns None = legacy migrated row without an anchor (verify fail-closed as tampering).
     #[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
     pub(crate) fn key_anchor(&self, version: i64) -> Result<Option<String>, TokenError> {
         let g = recover_lock!(self.db.lock(), "token db");
@@ -294,10 +309,11 @@ fn generate_nonce() -> [u8; 12] {
     n
 }
 
-// P1-2 (audit §1.6): HKDF-Expand(master=PRK, info=label, 32B)。
-// master key 是 Keychain/env 32B 高熵 → 直接作 PRK (跳过 Extract, RFC5869 §3.3)。
-// 不同 info label → 独立派生 key: chain-HMAC key ≠ token-AES-GCM key (域分离)。
-// version 嵌 info: v1/v2… → 同 master 派生不同 key (轮换), 派生确定可重算 (验旧链/解旧 token)。
+// P1-2 (audit §1.6): HKDF-Expand(master=PRK, info=label, 32B).
+// The master key is 32B high-entropy from Keychain/env → used directly as PRK (skipping Extract, RFC5869 §3.3).
+// Different info labels → independently derived keys: chain-HMAC key ≠ token-AES-GCM key (domain separation).
+// version embedded in info: v1/v2… → same master derives different keys (rotation); derivation is
+// deterministic and recomputable (verify old chains / decrypt old tokens).
 fn hkdf_expand(
     master: &Zeroizing<[u8; KEY_LEN]>,
     info_prefix: &[u8],
@@ -313,8 +329,8 @@ fn hkdf_expand(
     okm
 }
 
-// P1-2: 链 HMAC 派生 key。pub(crate): fg-store::lib compute_event_hmac 调 (同 crate)。
-// test-helpers: 测试断言域分离 (chain key != token key) 直接调派生。
+// P1-2: chain HMAC derived key. pub(crate): called by fg-store::lib compute_event_hmac (same crate).
+// test-helpers: tests asserting domain separation (chain key != token key) call the derivation directly.
 #[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
 pub fn derive_chain_key(
     master: &Zeroizing<[u8; KEY_LEN]>,
@@ -323,7 +339,7 @@ pub fn derive_chain_key(
     hkdf_expand(master, CHAIN_INFO_PREFIX, version)
 }
 
-// P1-2: token AES-GCM 派生 key。
+// P1-2: token AES-GCM derived key.
 #[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
 pub fn derive_token_key(
     master: &Zeroizing<[u8; KEY_LEN]>,
@@ -332,7 +348,7 @@ pub fn derive_token_key(
     hkdf_expand(master, TOKEN_INFO_PREFIX, version)
 }
 
-// P1-2: 读 key_versions 表最大 version (无表/空 → 1)。
+// P1-2: read the max version from key_versions (missing table/empty → 1).
 fn max_key_version(conn: &Connection) -> i64 {
     conn.query_row("SELECT MAX(version) FROM key_versions", [], |r| {
         r.get::<_, Option<i64>>(0)
@@ -342,9 +358,9 @@ fn max_key_version(conn: &Connection) -> i64 {
     .unwrap_or(1)
 }
 
-// H-E (item d): 计算指定版本的验签锚点 = HMAC(KEY_ANCHOR_MSG, derive_chain_key(master, version))。
-// 用 chain 派生 key (非 token key) —— 锚点探针链路派生可派生性, 与审计 HMAC 同域。
-// pub(crate): fg-store::lib verify 路径调 (按行 key_version 比对当前 master 重算锚点)。
+// H-E (item d): compute the verification anchor for a version = HMAC(KEY_ANCHOR_MSG, derive_chain_key(master, version)).
+// Uses the chain derived key (not the token key) — the anchor probe tests chain-path derivability, same domain as the audit HMAC.
+// pub(crate): called by fg-store::lib verify path (compares per-row key_version anchor recomputed with the current master).
 pub(crate) fn key_anchor_for_version(master: &Zeroizing<[u8; KEY_LEN]>, version: i64) -> String {
     let dkey = derive_chain_key(master, version);
     let mut mac =
@@ -353,9 +369,11 @@ pub(crate) fn key_anchor_for_version(master: &Zeroizing<[u8; KEY_LEN]>, version:
     hex::encode(mac.finalize().into_bytes())
 }
 
-// H-E (item d): 为所有 NULL 锚点的版本回填。锚点不可变 (派生确定 → 重算同值), 故回填 = 补缺非改写。
-// 仅 UPDATE WHERE key_anchor IS NULL: 已有锚点的版本 (含旧 master 写的) 永不覆写 ——
-// 旧 master 锚点保留, 用新 master 重算不匹配 → verify 判密钥丢失, 非误判篡改。
+// H-E (item d): backfill anchors for all versions with NULL anchors. Anchors are immutable (deterministic
+// derivation → recomputation yields the same value), so backfill fills gaps rather than rewriting.
+// Only UPDATE WHERE key_anchor IS NULL: versions that already have an anchor (including ones written by an
+// old master) are never overwritten — the old master's anchor is preserved; recomputing with a new master
+// mismatches → verify reports key loss, not a false tampering verdict.
 fn backfill_key_anchors(
     conn: &Connection,
     master: &Zeroizing<[u8; KEY_LEN]>,
@@ -382,10 +400,12 @@ fn backfill_key_anchors(
     Ok(())
 }
 
-// P2-1 (audit §2.6): env key 门控 + 告警决策。纯函数 (规则 5: 决策用代码非 token, 可测)。
-// cfg(debug_assertions) = dev 放行 env (EnvDebug, info 姿态); release 仅 FUSION_GUARD_ALLOW_ENV_KEY=1
-// 或 --insecure-env-key CLI flag (经 fg-bin set_var) 放行 (EnvInsecure, warn 告警 —— prod 不应用)。
-// env 不放行或缺 → KeychainRequired (macOS 走 Keychain, 非 macOS err)。
+// P2-1 (audit §2.6): env key gating + warning decision. Pure function (rule 5: decide with code, not
+// tokens; testable).
+// cfg(debug_assertions) = dev allows env (EnvDebug, info posture); release only allows via
+// FUSION_GUARD_ALLOW_ENV_KEY=1 or the --insecure-env-key CLI flag (set via fg-bin set_var)
+// (EnvInsecure, warn alert — not for prod).
+// env not authorized or absent → KeychainRequired (macOS uses Keychain, non-macOS errors).
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum KeySource {
     EnvDebug,
@@ -412,9 +432,11 @@ fn allow_env_flag_set() -> bool {
         .unwrap_or(false)
 }
 
-// H-E (product-audit §5): allow_mint=false 时, Keychain 主密钥缺失 → 拒启动明确报错,
-// 非静默生成新主密钥。allow_mint=true 仅首次启动 (DB 全新) 允许生成 + 存 Keychain。
-// env key 路径不受 allow_mint 影响 —— env 显式提供即视为运维知晓密钥 (dev/CI 姿态)。
+// H-E (product-audit §5): when allow_mint=false, a missing Keychain master key → refuse to start with a
+// clear error, not silently mint a new master key. allow_mint=true only permits generation + Keychain store
+// on first start (virgin DB).
+// The env key path is unaffected by allow_mint — an explicitly provided env means ops knowingly supplied the
+// key (dev/CI posture).
 fn load_or_create_key(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
     let env_present = std::env::var("FUSION_GUARD_TOKEN_KEY").is_ok();
     match resolve_key_source(cfg!(debug_assertions), allow_env_flag_set(), env_present) {
@@ -427,9 +449,10 @@ fn load_or_create_key(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, Toke
         }
         KeySource::EnvInsecure => {
             let key = decode_env_key()?;
-            // P2-1 告警: prod (release) 用 env key = 主密钥进进程环境, 同 UID 进程可读
-            // (ps eww / lsof / launchctl), 跨租户可逆脱敏 token 全可解 + 审计链可伪造。
-            // 此路径仅 dev/CI 便利, prod MUST 用 Keychain。warn 级让运维审计可见。
+            // P2-1 warning: prod (release) using an env key = master key in process environment, readable by
+            // same-UID processes (ps eww / lsof / launchctl); all cross-tenant reversible redact tokens become
+            // decryptable + audit chains forgeable.
+            // This path is dev/CI convenience only; prod MUST use Keychain. warn level keeps it visible to ops audits.
             tracing::warn!(
                 "INSECURE (P2-1): master key loaded from FUSION_GUARD_TOKEN_KEY env in release build — \
                  visible to any same-UID process; prod MUST use Keychain (FUSION_GUARD_ALLOW_ENV_KEY=1 or --insecure-env-key was set)"
@@ -440,8 +463,9 @@ fn load_or_create_key(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, Toke
     }
 }
 
-// H-E: token.db 是否全新 (无 token 行 + key_versions 仅种子 v1)。全新 → 允许首次生成主密钥;
-// 非全新 (已有加密 token) → Keychain 缺密钥 = 密钥丢失, 拒静默重生成。
+// H-E: whether token.db is virgin (no token rows + key_versions only has the seed v1). Virgin → allow
+// first-time master key generation; non-virgin (encrypted tokens exist) → missing Keychain key = key loss,
+// refuse silent regeneration.
 fn token_db_is_virgin(conn: &Connection) -> bool {
     let token_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0))
@@ -449,7 +473,7 @@ fn token_db_is_virgin(conn: &Connection) -> bool {
     if token_count > 0 {
         return false;
     }
-    // key_versions 仅种子 (1,0) = 从未轮换 = 全新。有 v2+ 或 created_ts>0 → 历史用过密钥。
+    // key_versions only has the seed (1,0) = never rotated = virgin. A v2+ row or created_ts>0 → key used historically.
     let kv_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM key_versions WHERE version > 1 OR created_ts > 0",
@@ -460,22 +484,25 @@ fn token_db_is_virgin(conn: &Connection) -> bool {
     kv_count == 0
 }
 
-// H-E test-helpers: 暴露 virgin 检测 + allow_mint 决策供单元测试验证密钥丢失门控逻辑。
+// H-E test-helpers: expose the virgin check + allow_mint decision so unit tests can verify key-loss gating logic.
 #[cfg(feature = "test-helpers")]
 pub fn test_token_db_is_virgin(conn: &Connection) -> bool {
     token_db_is_virgin(conn)
 }
 
-// H-E test-helpers: 模拟 Keychain 缺密钥时 allow_mint=false 的拒绝决策 (不触真实 Keychain)。
-// 返回 Err 表示会拒启动, Ok 表示会静默生成。env 路径不受 allow_mint 影响 (env 显式提供即放行)。
-// env_present 显式传入 (非读 env) —— 避免测试修改进程级 env 干扰并行测试 (store_test/token_test
-// 依赖 FUSION_GUARD_TOKEN_KEY 防 Keychain 挂起)。
+// H-E test-helpers: simulate the allow_mint=false refusal decision when the Keychain key is missing
+// (without touching the real Keychain).
+// Err = would refuse to start; Ok = would silently generate. The env path ignores allow_mint (an explicit
+// env is allowed through).
+// env_present is passed explicitly (not read from env) — avoids tests mutating process-level env and
+// interfering with parallel tests (store_test/token_test rely on FUSION_GUARD_TOKEN_KEY to keep Keychain
+// from hanging).
 #[cfg(feature = "test-helpers")]
 pub fn test_key_loss_refuses(allow_mint: bool, env_present: bool) -> Result<(), &'static str> {
     if env_present {
-        return Ok(()); // env 路径绕过 allow_mint (dev/CI 姿态)
+        return Ok(()); // env path bypasses allow_mint (dev/CI posture)
     }
-    // KeychainRequired 路径: allow_mint=false → 拒; true → 生成 (首次启动)。
+    // KeychainRequired path: allow_mint=false → refuse; true → generate (first start).
     if allow_mint {
         Ok(())
     } else {
@@ -508,9 +535,10 @@ fn load_keychain_or_err(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, To
         }
         return Err(TokenError::KeyInit("keychain key not 32 bytes".to_string()));
     }
-    // H-E (product-audit §5): Keychain 主密钥缺失。allow_mint=false (DB 已有历史数据) = 密钥丢失,
-    // 拒启动明确报错 —— 非静默生成新主密钥 (新 key 解密全历史 token 失败 + verify 全链报篡改,
-    // 且无法区分真篡改 vs 密钥丢失)。allow_mint=true (DB 全新首次启动) → 生成 + 存 Keychain。
+    // H-E (product-audit §5): Keychain master key missing. allow_mint=false (DB has historical data) =
+    // key loss, refuse to start with a clear error — not silently minting a new master key (a new key fails
+    // to decrypt all historical tokens + verify reports tampering on every chain, with no way to distinguish
+    // genuine tampering from key loss). allow_mint=true (virgin DB, first start) → generate + store to Keychain.
     if !allow_mint {
         tracing::error!(
             "H-E: Keychain master key missing but data exists — refusing to start \
@@ -535,8 +563,8 @@ fn load_keychain_or_err(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, To
 
 #[cfg(not(target_os = "macos"))]
 fn load_keychain_or_err(allow_mint: bool) -> Result<Zeroizing<[u8; KEY_LEN]>, TokenError> {
-    // P2-1: 非 macOS 无 Keychain, env key 未放行 → 拒启动 (fail-closed, 不回退弱密钥)。
-    // H-E: allow_mint 此分支无关 (非 macOS 无 Keychain 路径, 永不可 mint)。
+    // P2-1: non-macOS has no Keychain; env key not authorized → refuse to start (fail-closed, no weak-key fallback).
+    // H-E: allow_mint is irrelevant in this branch (non-macOS has no Keychain path, can never mint).
     let _ = allow_mint;
     Err(TokenError::KeyInit(
         "non-macOS requires FUSION_GUARD_TOKEN_KEY env (debug build, or FUSION_GUARD_ALLOW_ENV_KEY=1, or --insecure-env-key)"

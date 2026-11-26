@@ -97,13 +97,13 @@ async fn tenant_isolation() {
     std::fs::remove_file(&path).ok();
 }
 
-// P0-3 (audit §1.2): 高风险 audit_writer synchronous=FULL (fsync on commit, 断电不丢 H7 行);
-// 低风险 low_writer synchronous=NORMAL (性能换耐久分级, L1/L2 异步批量可丢)。
+// P0-3 (audit §1.2): high-risk audit_writer uses synchronous=FULL (fsync on commit, no H7 rows lost on power loss);
+// low-risk low_writer uses synchronous=NORMAL (durability tiered for performance, L1/L2 async batch may be lost).
 #[test]
 fn p0_3_tiered_synchronous_pragma() {
     let path = temp_db();
     let store = AuditStore::open(&path).unwrap();
-    // SQLite PRAGMA synchronous: 2=FULL, 1=NORMAL (整数回读)。
+    // SQLite PRAGMA synchronous: 2=FULL, 1=NORMAL (read back as integer).
     let high = store.writer_sync_pragma(true);
     let low = store.writer_sync_pragma(false);
     assert_eq!(

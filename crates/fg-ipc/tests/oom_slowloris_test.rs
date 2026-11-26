@@ -1,6 +1,7 @@
-// fg-ipc 对抗性负向测试 — C17 (OOM) + A6 (slowloris)
-// 验证: 超长无换行请求 → 服务端断连 (非缓冲 500MB); 响应端不回正常帧。
-// 隔离 env: 独立 SOCK + DATA_DIR + TOKEN_KEY。
+// fg-ipc adversarial negative tests — C17 (OOM) + A6 (slowloris)
+// Verifies: an overlong request with no newline -> the server disconnects (not a
+// 500MB buffer); the response side never returns a normal frame.
+// Isolated env: dedicated SOCK + DATA_DIR + TOKEN_KEY.
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -56,8 +57,10 @@ async fn wait_for_sock(sock: &std::path::Path) {
     panic!("server sock never appeared: {}", sock.display());
 }
 
-// C17: 发 MAX_LINE_BYTES + 64KiB 无换行垃圾 → 服务端必须断连 (take 截断后查超限),
-// 不能缓冲到内存峰值。断连后客户端 read 返 0 (EOF) 或连接重置。
+// C17: sending MAX_LINE_BYTES + 64KiB of newline-free garbage -> the server must
+// disconnect (take truncates first, then the limit is checked); it must not buffer
+// to a memory peak. After disconnect the client read returns 0 (EOF) or the
+// connection is reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversize_request_disconnects_not_buffers() {
     let (db, sock) = ensure_env();
@@ -67,11 +70,13 @@ async fn oversize_request_disconnects_not_buffers() {
     let mut stream = UnixStream::connect(&sock).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
-    // MAX_LINE_BYTES = 1MiB. 发 1MiB + 64KiB 'A' 无换行。
+    // MAX_LINE_BYTES = 1MiB. Send 1MiB + 64KiB of 'A' with no newline.
     let payload: Vec<u8> = vec![b'A'; (1024 * 1024) + (64 * 1024)];
     use std::io::Write;
-    // write_all 可能因服务端中途断连返 EPIPE (BrokenPipe) — 这正是 C17 防御生效,
-    // 服务端在缓冲到超限前就断连。EPIPE 视为断连通过; 写入成功则要求后续读得 EOF。
+    // write_all may return EPIPE (BrokenPipe) because the server disconnects
+    // mid-write — that is exactly the C17 defense working: the server disconnects
+    // before buffering past the limit. EPIPE counts as a disconnect (pass); if the
+    // write succeeds, the subsequent read must return EOF.
     let write_err = stream.write_all(&payload).err();
     let _ = stream.flush();
     let pipe_broken = matches!(
@@ -92,10 +97,14 @@ async fn oversize_request_disconnects_not_buffers() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// A6 slowloris: 占满连接后, 新连接仍可被 accept (conn_sem 在 deadline 超时释放)。
-// 这里验证单连接 deadline: 慢速不发换行, 服务端 CONN_DEADLINE 到期断连。
-// 不实测 30s 全程 (太慢); 验证断连行为 — 发一截无换行数据, 短期内不回响应,
-// 但服务端不会因 read_until 阻塞挂死 (take 截断路径已由上一用例覆盖)。
+// A6 slowloris: after slots are filled, new connections can still be accepted
+// (conn_sem permits are released when the deadline expires).
+// Here we verify the per-connection deadline: a slow client sends no newline, and
+// the server disconnects when CONN_DEADLINE expires.
+// The full 30s window is not measured (too slow); we verify the disconnect
+// behavior — send a partial newline-free payload, expect no response in the short
+// term, but the server must not hang blocked in read_until (the take-truncation
+// path is already covered by the previous case).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_request_no_frame_does_not_respond() {
     let (db, sock) = ensure_env();
@@ -105,18 +114,20 @@ async fn partial_request_no_frame_does_not_respond() {
     let mut stream = UnixStream::connect(&sock).unwrap();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
 
-    // 发部分 JSON 无换行 → 服务端 take/缓冲中, 未完成帧不回响应。
+    // Send partial JSON with no newline -> the server is still in take/buffering;
+    // an incomplete frame gets no response.
     use std::io::Write;
     stream
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"guard.ping\"")
         .unwrap();
     stream.flush().unwrap();
 
-    // 短读: 无完整帧 → 不应收到正常 ping 响应。
+    // Short read: no complete frame -> a normal ping response must not arrive.
     use std::io::Read;
     let mut got = [0u8; 64];
     let res = stream.read(&mut got);
-    // 0 (EOF/断连) 或超时均算正常 (服务端未回完整 ping 帧)。关键是没拿到 "pong"。
+    // 0 (EOF/disconnect) or a timeout are both fine (the server never returned a
+    // complete ping frame). The key point: no "pong" was received.
     if let Ok(n) = res {
         if n > 0 {
             let s = String::from_utf8_lossy(&got[..n]);
@@ -131,9 +142,11 @@ async fn partial_request_no_frame_does_not_respond() {
     let _ = std::fs::remove_file(&sock);
 }
 
-// A5 (P0-G9): socket 路径被目录蹲守 → serve 必须拒 bind (不启动), 防本地 DoS。
-// 旧码 `let _ = remove_file` 吞目录删除失败 → bind 失败启动退出 (被动);
-// 新码 symlink_metadata 查存在 → 主动报错拒绝。
+// A5 (P0-G9): the socket path is squatted by a directory -> serve must refuse to
+// bind (not start), preventing a local DoS.
+// The old code `let _ = remove_file` swallowed the directory-removal failure ->
+// bind failed and startup exited (passive); the new code checks existence via
+// symlink_metadata -> actively errors and refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_dir_squat_refuses_bind() {
     let (db, _sock) = ensure_env();
