@@ -7,8 +7,8 @@ doc_type: changelog
 title: {zh: "fusion-guard 变更日志", en: "fusion-guard Changelog"}
 audience: engineer
 status: draft
-version: 0.2.0-rc.13
-updated: 2026-11-18
+version: 0.2.0-rc.14
+updated: 2026-11-26
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -19,6 +19,16 @@ source_of_truth:
 All notable changes to fusion-guard are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), semver versioning.
 
 ## [Unreleased]
+
+## [0.2.0-rc.14] — 2026-11-26 (patch)
+
+English-only source batch 2 + ruff lint gate — closes issues #49 and #48.
+
+### Changed
+- English-only source remediation batch 2 (refs dahai80/fusion#9): 2342 unmarked CJK lines across 63 `.py`/`.rs` source and test files translated to English — comments, doc comments, log/error/panic/assert message literals, build.rs output strings, CLI help. Test assertions mirroring translated strings synced in the same change. Load-bearing CJK fixtures kept with `i18n: user-facing` markers (fg-redact p0_8 char-boundary test, validate_docs FORBIDDEN_ZH list). No code semantics, identifiers, or wire formats changed.
+
+### Added
+- `[tool.ruff]` config in `pyproject.toml` (issue #48): target-version py311, line-length 120, E/F/W/I rules; existing violations fixed, lint + format clean.
 
 ## [0.2.0-rc.13] — 2026-11-18 (patch)
 
